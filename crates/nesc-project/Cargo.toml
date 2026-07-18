@@ -1,0 +1,19 @@
+[package]
+name = "nesc-project"
+description = "NesC project manifests and starter-project generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+nesc-diagnostics = { path = "../nesc-diagnostics" }
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
