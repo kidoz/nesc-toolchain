@@ -1,5 +1,9 @@
 # nesc-toolchain
 
+[![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)](https://www.rust-lang.org/)
+![Rust edition: 2024](https://img.shields.io/badge/Rust%20edition-2024-dea584.svg)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An optimizing compiler and ROM-development toolkit for NES-compatible hardware.
 
 `nesc-toolchain` compiles **NesC**, a restricted freestanding C-like language,
