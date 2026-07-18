@@ -1,0 +1,11 @@
+[package]
+name = "nesc-object"
+description = "NOBJ relocatable object format for NesC and 6502 assembly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

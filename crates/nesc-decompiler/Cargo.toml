@@ -1,0 +1,11 @@
+[package]
+name = "nesc-decompiler"
+description = "6502 semantic lifting and NesC or Rust decompilation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

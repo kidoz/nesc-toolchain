@@ -1,0 +1,11 @@
+[package]
+name = "nesc-runtime"
+description = "NES startup and compiler runtime support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
