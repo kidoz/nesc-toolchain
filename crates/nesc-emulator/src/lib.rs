@@ -192,6 +192,18 @@ impl Machine {
                 self.set_nz(self.x);
                 2
             }
+            0xa4..=0xa6 => {
+                let address = u16::from(self.fetch()?);
+                let value = self.read(address)?;
+                match opcode {
+                    0xa5 => self.a = value,
+                    0xa6 => self.x = value,
+                    0xa4 => self.y = value,
+                    _ => unreachable!(),
+                }
+                self.set_nz(value);
+                3
+            }
             0xad => {
                 let address = self.fetch_word()?;
                 self.a = self.read(address)?;
@@ -219,6 +231,22 @@ impl Machine {
                 let address = self.fetch_word()?;
                 self.write(address, self.x)?;
                 4
+            }
+            0x8c => {
+                let address = self.fetch_word()?;
+                self.write(address, self.y)?;
+                4
+            }
+            0x84..=0x86 => {
+                let address = u16::from(self.fetch()?);
+                let value = match opcode {
+                    0x85 => self.a,
+                    0x86 => self.x,
+                    0x84 => self.y,
+                    _ => unreachable!(),
+                };
+                self.write(address, value)?;
+                3
             }
             0x9a => {
                 self.sp = self.x;
@@ -270,6 +298,29 @@ impl Machine {
                 }
                 4
             }
+            0x65 | 0xe5 | 0x25 | 0x05 | 0x45 | 0xc5 => {
+                let address = u16::from(self.fetch()?);
+                let value = self.read(address)?;
+                match opcode {
+                    0x65 => self.adc(value),
+                    0xe5 => self.sbc(value),
+                    0x25 => {
+                        self.a &= value;
+                        self.set_nz(self.a);
+                    }
+                    0x05 => {
+                        self.a |= value;
+                        self.set_nz(self.a);
+                    }
+                    0x45 => {
+                        self.a ^= value;
+                        self.set_nz(self.a);
+                    }
+                    0xc5 => self.compare(self.a, value),
+                    _ => unreachable!(),
+                }
+                3
+            }
             0x2c => {
                 let address = self.fetch_word()?;
                 let value = self.read(address)?;
@@ -305,10 +356,11 @@ impl Machine {
                 self.set_nz(self.a);
                 4
             }
-            0x10 | 0xf0 | 0xd0 | 0x90 | 0xb0 => {
+            0x10 | 0x30 | 0xf0 | 0xd0 | 0x90 | 0xb0 => {
                 let displacement = self.fetch()? as i8;
                 let taken = match opcode {
                     0x10 => self.status & 0x80 == 0,
+                    0x30 => self.status & 0x80 != 0,
                     0xf0 => self.status & 0x02 != 0,
                     0xd0 => self.status & 0x02 == 0,
                     0x90 => self.status & 1 == 0,
@@ -467,5 +519,38 @@ impl Machine {
             cycle: self.cycles,
             trace: self.trace.iter().cloned().collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nesc_rom::Mapper;
+
+    use super::Machine;
+
+    #[test]
+    fn executes_codegen_zero_page_and_register_sequences() {
+        let program = [
+            0xa9, 0x80, 0x85, 0x10, 0xa2, 0x22, 0x86, 0x11, 0xa4, 0x10, 0x84, 0x12, 0x8c, 0x00,
+            0x02, 0xa6, 0x11, 0xa5, 0x10, 0x18, 0x65, 0x11, 0x38, 0xe5, 0x11, 0x25, 0x12, 0x05,
+            0x11, 0x45, 0x11, 0xc5, 0x10, 0xa5, 0x10, 0x30, 0x02, 0xa9, 0x00, 0xa9, 0x01, 0x8d,
+            0x01, 0x02,
+        ];
+        let mut prg = vec![0; 32 * 1024];
+        prg[..program.len()].copy_from_slice(&program);
+        let mapper = Mapper::new(0, prg.len(), 0).expect("NROM mapper");
+        let mut machine = Machine::new(prg, mapper);
+        machine.pc = 0x8000;
+
+        for _ in 0..21 {
+            machine.step().expect("supported instruction");
+        }
+
+        assert_eq!(machine.a, 1);
+        assert_eq!(machine.x, 0x22);
+        assert_eq!(machine.y, 0x80);
+        assert_eq!(machine.ram[0x12], 0x80);
+        assert_eq!(machine.ram[0x200], 0x80);
+        assert_eq!(machine.ram[0x201], 1);
     }
 }
