@@ -195,23 +195,33 @@ dependencies = [
  "nesc-compiler",
  "nesc-diagnostics",
  "nesc-project",
+ "nesc-rom",
  "tempfile",
 ]
 
 [[package]]
 name = "nesc-codegen-6502"
 version = "0.1.0"
+dependencies = [
+ "nesc-mir",
+ "nesc-object",
+]
 
 [[package]]
 name = "nesc-compiler"
 version = "0.1.0"
 dependencies = [
+ "nesc-codegen-6502",
  "nesc-diagnostics",
+ "nesc-emulator",
  "nesc-frontend",
  "nesc-hir",
+ "nesc-linker",
  "nesc-mir",
  "nesc-opt",
  "nesc-project",
+ "nesc-rom",
+ "nesc-runtime",
  "tempfile",
 ]
 
@@ -238,6 +248,9 @@ version = "0.1.0"
 [[package]]
 name = "nesc-emulator"
 version = "0.1.0"
+dependencies = [
+ "nesc-rom",
+]
 
 [[package]]
 name = "nesc-frontend"
@@ -258,6 +271,11 @@ dependencies = [
 [[package]]
 name = "nesc-linker"
 version = "0.1.0"
+dependencies = [
+ "nesc-object",
+ "nesc-rom",
+ "nesc-runtime",
+]
 
 [[package]]
 name = "nesc-mir"
@@ -296,6 +314,9 @@ version = "0.1.0"
 [[package]]
 name = "nesc-runtime"
 version = "0.1.0"
+dependencies = [
+ "nesc-object",
+]
 
 [[package]]
 name = "once_cell"

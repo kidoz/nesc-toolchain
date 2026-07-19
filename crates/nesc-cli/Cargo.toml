@@ -12,6 +12,7 @@ clap.workspace = true
 nesc-compiler = { path = "../nesc-compiler" }
 nesc-diagnostics = { path = "../nesc-diagnostics" }
 nesc-project = { path = "../nesc-project" }
+nesc-rom = { path = "../nesc-rom" }
 
 [dev-dependencies]
 tempfile.workspace = true

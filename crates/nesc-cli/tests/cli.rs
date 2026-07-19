@@ -87,3 +87,43 @@ fn check_reports_source_diagnostics() {
     assert!(stderr.contains("error[E1204]"), "{stderr}");
     assert!(stderr.contains("src/main.c:2:"), "{stderr}");
 }
+
+#[test]
+fn build_and_inspect_generated_project() {
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "rom-demo"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("rom-demo");
+
+    let built = nesc()
+        .current_dir(&project)
+        .arg("build")
+        .output()
+        .expect("run nesc build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    for extension in ["nes", "asm", "map", "sym", "source-map"] {
+        assert!(
+            project
+                .join(format!("target/rom-demo.{extension}"))
+                .is_file()
+        );
+    }
+
+    let inspected = nesc()
+        .current_dir(&project)
+        .args(["inspect", "target/rom-demo.nes"])
+        .output()
+        .expect("run nesc inspect");
+    assert!(inspected.status.success());
+    let stdout = String::from_utf8_lossy(&inspected.stdout);
+    assert!(stdout.contains("Mapper 0"), "{stdout}");
+    assert!(stdout.contains("32 KiB PRG"), "{stdout}");
+}

@@ -1,10 +1,11 @@
 //! Top-level orchestration for the NesC compilation pipeline.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use nesc_diagnostics::Diagnostic;
 use nesc_frontend::{CheckedProgram, FrontendConfig};
-use nesc_project::{Optimization, Project};
+use nesc_project::{Mirroring, Optimization, Project, Region, RomFormat};
 
 /// Compiler settings that are independent of a project manifest.
 #[derive(Clone, Debug)]
@@ -54,6 +55,23 @@ pub struct CheckedProject {
     pub mir: nesc_mir::Module,
     /// Counts from the selected optimization pipeline.
     pub optimization: nesc_opt::OptimizationReport,
+}
+
+/// Complete in-memory build artifacts.
+#[derive(Clone, Debug)]
+pub struct BuildArtifacts {
+    /// Containerized NES ROM bytes.
+    pub rom: Vec<u8>,
+    /// Symbolic 6502 assembly.
+    pub assembly: String,
+    /// Section and bank placement report.
+    pub map: String,
+    /// Global symbol table.
+    pub symbols: String,
+    /// Source-to-symbol mapping.
+    pub source_map: String,
+    /// Resolved global addresses for tooling and boot verification.
+    pub symbol_addresses: BTreeMap<String, u16>,
 }
 
 /// Validates and type-checks a project.
@@ -106,13 +124,112 @@ pub fn check_project(
     })
 }
 
+/// Compiles and links a project into Mapper 0 artifacts.
+///
+/// # Errors
+///
+/// Returns frontend, instruction-selection, relocation, or cartridge-layout
+/// diagnostics.
+pub fn build_project(
+    project: &Project,
+    config: &CompilerConfig,
+) -> Result<BuildArtifacts, Vec<Diagnostic>> {
+    let checked = check_project(project, config)?;
+    let generated = nesc_codegen_6502::generate(&checked.mir).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| match error.span {
+                Some(span) => checked.hir.sources.error(
+                    "E3000",
+                    error.message,
+                    span,
+                    "cannot select a legal 6502 instruction sequence",
+                ),
+                None => Diagnostic::error("E3000", error.message),
+            })
+            .collect::<Vec<_>>()
+    })?;
+    let runtime = nesc_runtime::build();
+    let link_config = linker_config(project)?;
+    let linked = nesc_linker::link(
+        &[runtime.object.clone(), generated.object.clone()],
+        link_config,
+    )
+    .map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| Diagnostic::error("E3001", error.to_string()))
+            .collect::<Vec<_>>()
+    })?;
+    let symbols = linked
+        .symbols
+        .iter()
+        .map(|(name, address)| format!("{address:04X} {name}\n"))
+        .collect::<String>();
+    let mut source_map = String::new();
+    for function in &checked.hir.functions {
+        let Some(address) = linked.symbols.get(&function.name) else {
+            continue;
+        };
+        if let Some(source) = checked.hir.sources.get(function.span.source) {
+            source_map.push_str(&format!(
+                "{address:04X} {}:{}:{} {}\n",
+                source.path().display(),
+                function.span.start,
+                function.span.len,
+                function.name
+            ));
+        }
+    }
+    Ok(BuildArtifacts {
+        rom: linked.rom,
+        assembly: format!("{}\n{}", runtime.assembly, generated.assembly),
+        map: linked.map,
+        symbols,
+        source_map,
+        symbol_addresses: linked.symbols,
+    })
+}
+
+fn linker_config(project: &Project) -> Result<nesc_linker::LinkConfig, Vec<Diagnostic>> {
+    let cartridge = &project.manifest().cartridge;
+    let mirroring = match cartridge.mirroring {
+        Mirroring::Horizontal => nesc_rom::Mirroring::Horizontal,
+        Mirroring::Vertical => nesc_rom::Mirroring::Vertical,
+        Mirroring::FourScreen => nesc_rom::Mirroring::FourScreen,
+        Mirroring::SingleScreenLower | Mirroring::SingleScreenUpper => {
+            return Err(vec![Diagnostic::error(
+                "E3002",
+                "Mapper 0 does not support single-screen mirroring",
+            )]);
+        }
+    };
+    Ok(nesc_linker::LinkConfig {
+        format: match project.manifest().build.format {
+            RomFormat::Ines => nesc_rom::Format::Ines,
+            RomFormat::Nes2 => nesc_rom::Format::Nes2,
+        },
+        prg_rom_len: cartridge.prg_rom_kib as usize * 1024,
+        chr_rom_len: cartridge.chr_rom_kib as usize * 1024,
+        mirroring,
+        battery: cartridge.battery,
+        region: match project.manifest().build.region {
+            Region::Ntsc => nesc_rom::Region::Ntsc,
+            Region::Pal => nesc_rom::Region::Pal,
+            Region::Dendy => nesc_rom::Region::Dendy,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use nesc_project::{Project, create_project};
 
-    use super::{CompilerConfig, check_project};
+    use super::{CompilerConfig, build_project, check_project};
 
     #[test]
     fn checks_generated_project_through_frontend() {
@@ -125,5 +242,45 @@ mod tests {
         assert!(checked.frontend.symbols.contains_key("main"));
         assert!(checked.frontend.symbols.contains_key("nes_wait_frame"));
         assert!(!checked.mir.functions.is_empty());
+    }
+
+    #[test]
+    fn builds_generated_project_into_nrom() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("demo");
+        create_project("demo", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+static u8 color;
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    color = 0x21;
+    nes_set_background_color(color);
+    while (true) {
+        nes_wait_frame();
+    }
+}
+"#,
+        )
+        .expect("milestone source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        let rom = nesc_rom::parse(&artifacts.rom).expect("parse generated ROM");
+        assert_eq!(rom.metadata.mapper, 0);
+        assert!(artifacts.symbols.contains("main"));
+        assert!(artifacts.assembly.contains("__nesc_reset:"));
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x21,
+            200_000,
+        )
+        .expect("boot oracle");
+        assert_eq!(boot.background_color, 0x21);
+        assert!(boot.frames >= 2);
     }
 }
