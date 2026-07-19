@@ -1,0 +1,418 @@
+use std::cmp::Reverse;
+use std::collections::HashMap;
+
+use nesc_mir::{FunctionId, GlobalId, InstructionKind, LocalId, Module, Terminator, Type, ValueId};
+
+use crate::CodegenError;
+
+/// Inclusive zero-page address range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZeroPageRange {
+    /// First address.
+    pub start: u8,
+    /// Last address.
+    pub end: u8,
+}
+
+/// Zero-page allocation priority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZeroPageStrategy {
+    /// Allocate stable objects before temporary values.
+    Frequency,
+    /// Allocate temporary values before stable objects.
+    Cycles,
+}
+
+/// Target resource settings for code generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendConfig {
+    /// Addresses the compiler may allocate.
+    pub zero_page_available: Vec<ZeroPageRange>,
+    /// Addresses excluded even when they overlap an available range.
+    pub zero_page_reserved: Vec<ZeroPageRange>,
+    /// Allocation priority.
+    pub zero_page_strategy: ZeroPageStrategy,
+    /// Maximum hardware-stack use in bytes.
+    pub stack_limit: u16,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            zero_page_available: vec![ZeroPageRange {
+                start: 0x00,
+                end: 0xef,
+            }],
+            zero_page_reserved: vec![ZeroPageRange {
+                start: 0xf0,
+                end: 0xff,
+            }],
+            zero_page_strategy: ZeroPageStrategy::Frequency,
+            stack_limit: 192,
+        }
+    }
+}
+
+/// Allocated byte-addressed storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Location {
+    /// First byte address.
+    pub address: u16,
+    /// Storage width in bytes.
+    pub size: u16,
+    /// Whether the address uses zero-page encoding.
+    pub zero_page: bool,
+}
+
+/// One allocation report entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocationEntry {
+    /// Diagnostic storage name.
+    pub name: String,
+    /// Assigned location.
+    pub location: Location,
+}
+
+/// Complete deterministic storage allocation.
+#[derive(Clone, Debug)]
+pub(crate) struct Allocation {
+    pub globals: Vec<Location>,
+    pub locals: HashMap<(FunctionId, LocalId), Location>,
+    pub values: HashMap<(FunctionId, ValueId), Location>,
+    pub entries: Vec<AllocationEntry>,
+    pub zero_page_used: usize,
+    pub zero_page_free: usize,
+}
+
+enum RequestKey {
+    Global(GlobalId),
+    Local(FunctionId, LocalId),
+    Value(FunctionId, ValueId),
+}
+
+struct Request {
+    key: RequestKey,
+    name: String,
+    size: u16,
+    accesses: u32,
+}
+
+struct AccessCounts {
+    globals: HashMap<GlobalId, u32>,
+    locals: HashMap<(FunctionId, LocalId), u32>,
+    values: HashMap<(FunctionId, ValueId), u32>,
+}
+
+pub(crate) fn allocate(
+    module: &Module,
+    config: &BackendConfig,
+) -> Result<Allocation, Vec<CodegenError>> {
+    for range in config
+        .zero_page_available
+        .iter()
+        .chain(&config.zero_page_reserved)
+    {
+        if range.start > range.end {
+            return Err(vec![CodegenError {
+                message: format!(
+                    "invalid zero-page range ${:02X}..${:02X}",
+                    range.start, range.end
+                ),
+                span: None,
+            }]);
+        }
+    }
+    let access_counts = access_counts(module);
+    let mut requests = Vec::new();
+    for (index, ty) in module.globals.iter().enumerate() {
+        requests.push(Request {
+            key: RequestKey::Global(GlobalId(index as u32)),
+            name: format!("global.{index}"),
+            size: type_size(ty),
+            accesses: access_counts
+                .globals
+                .get(&GlobalId(index as u32))
+                .copied()
+                .unwrap_or(0),
+        });
+    }
+    for function in &module.functions {
+        if function.blocks.is_empty() {
+            continue;
+        }
+        for local in &function.locals {
+            requests.push(Request {
+                key: RequestKey::Local(function.id, local.id),
+                name: format!("{}.local.{}", function.name, local.name),
+                size: type_size(&local.ty),
+                accesses: access_counts
+                    .locals
+                    .get(&(function.id, local.id))
+                    .copied()
+                    .unwrap_or(0),
+            });
+        }
+        for (index, ty) in function.value_types.iter().enumerate() {
+            requests.push(Request {
+                key: RequestKey::Value(function.id, ValueId(index as u32)),
+                name: format!("{}.value.{index}", function.name),
+                size: type_size(ty),
+                accesses: access_counts
+                    .values
+                    .get(&(function.id, ValueId(index as u32)))
+                    .copied()
+                    .unwrap_or(0),
+            });
+        }
+    }
+    match config.zero_page_strategy {
+        ZeroPageStrategy::Frequency => {
+            requests.sort_by_key(|request| Reverse(request.accesses));
+        }
+        ZeroPageStrategy::Cycles => {
+            requests.sort_by_key(|request| {
+                Reverse(u64::from(request.accesses) * u64::from(request.size))
+            });
+        }
+    }
+
+    let mut available = [false; 256];
+    for range in &config.zero_page_available {
+        for address in range.start..=range.end {
+            available[usize::from(address)] = true;
+        }
+    }
+    for range in &config.zero_page_reserved {
+        for address in range.start..=range.end {
+            available[usize::from(address)] = false;
+        }
+    }
+    available[0xf0..=0xff].fill(false);
+    let total_available = available.iter().filter(|slot| **slot).count();
+    let mut internal_cursor = 0x0200_u16;
+    let mut globals = vec![
+        Location {
+            address: 0,
+            size: 0,
+            zero_page: false,
+        };
+        module.globals.len()
+    ];
+    let mut locals = HashMap::new();
+    let mut values = HashMap::new();
+    let mut entries = Vec::new();
+    let mut zero_page_used = 0;
+
+    for request in requests {
+        let location = find_zero_page(&available, request.size).map_or_else(
+            || {
+                let location = Location {
+                    address: internal_cursor,
+                    size: request.size,
+                    zero_page: false,
+                };
+                internal_cursor = internal_cursor.saturating_add(request.size);
+                location
+            },
+            |start| {
+                available[start..start + usize::from(request.size)].fill(false);
+                zero_page_used += usize::from(request.size);
+                Location {
+                    address: start as u16,
+                    size: request.size,
+                    zero_page: true,
+                }
+            },
+        );
+        if location.address.saturating_add(location.size) > 0x0800 {
+            return Err(vec![CodegenError {
+                message: "compiler storage exceeds the 2 KiB internal RAM capacity".to_owned(),
+                span: None,
+            }]);
+        }
+        match request.key {
+            RequestKey::Global(global) => globals[global.0 as usize] = location,
+            RequestKey::Local(function, local) => {
+                locals.insert((function, local), location);
+            }
+            RequestKey::Value(function, value) => {
+                values.insert((function, value), location);
+            }
+        }
+        entries.push(AllocationEntry {
+            name: request.name,
+            location,
+        });
+    }
+
+    Ok(Allocation {
+        globals,
+        locals,
+        values,
+        entries,
+        zero_page_used,
+        zero_page_free: total_available.saturating_sub(zero_page_used),
+    })
+}
+
+fn access_counts(module: &Module) -> AccessCounts {
+    let mut globals = HashMap::new();
+    let mut locals = HashMap::new();
+    let mut values = HashMap::new();
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                if let Some(result) = instruction.result {
+                    bump(&mut values, (function.id, result));
+                }
+                match &instruction.kind {
+                    InstructionKind::Constant(_) => {}
+                    InstructionKind::LoadLocal(local) => {
+                        bump(&mut locals, (function.id, *local));
+                    }
+                    InstructionKind::StoreLocal { local, value } => {
+                        bump(&mut locals, (function.id, *local));
+                        bump(&mut values, (function.id, *value));
+                    }
+                    InstructionKind::LoadGlobal(global) => bump(&mut globals, *global),
+                    InstructionKind::StoreGlobal { global, value } => {
+                        bump(&mut globals, *global);
+                        bump(&mut values, (function.id, *value));
+                    }
+                    InstructionKind::Unary { operand, .. } => {
+                        bump(&mut values, (function.id, *operand));
+                    }
+                    InstructionKind::Binary { left, right, .. } => {
+                        bump(&mut values, (function.id, *left));
+                        bump(&mut values, (function.id, *right));
+                    }
+                    InstructionKind::Cast { value, .. } => {
+                        bump(&mut values, (function.id, *value));
+                    }
+                    InstructionKind::Call { arguments, .. } => {
+                        for argument in arguments {
+                            bump(&mut values, (function.id, *argument));
+                        }
+                    }
+                }
+            }
+            match &block.terminator {
+                Some(Terminator::Branch { condition, .. }) => {
+                    bump(&mut values, (function.id, *condition));
+                }
+                Some(Terminator::Return(Some(value))) => {
+                    bump(&mut values, (function.id, *value));
+                }
+                _ => {}
+            }
+        }
+    }
+    AccessCounts {
+        globals,
+        locals,
+        values,
+    }
+}
+
+fn bump<Key: Eq + std::hash::Hash>(counts: &mut HashMap<Key, u32>, key: Key) {
+    let count = counts.entry(key).or_default();
+    *count = count.saturating_add(1);
+}
+
+pub(crate) fn type_size(ty: &Type) -> u16 {
+    let element_size = if ty.pointer_depth > 0 {
+        2
+    } else {
+        u16::from(ty.integer_width().unwrap_or(0).div_ceil(8).max(1))
+    };
+    ty.array_lengths.iter().fold(element_size, |size, length| {
+        size.saturating_mul(u16::try_from(*length).unwrap_or(u16::MAX))
+    })
+}
+
+fn find_zero_page(available: &[bool; 256], size: u16) -> Option<usize> {
+    let size = usize::from(size);
+    if size == 0 || size > available.len() {
+        return None;
+    }
+    (0..=available.len() - size)
+        .find(|start| available[*start..*start + size].iter().all(|slot| *slot))
+}
+
+pub(crate) fn render_report(allocation: &Allocation) -> String {
+    let mut report = String::from("Zero-page allocation\n--------------------\n");
+    for entry in allocation
+        .entries
+        .iter()
+        .filter(|entry| entry.location.zero_page)
+    {
+        let end = entry.location.address + entry.location.size - 1;
+        if end == entry.location.address {
+            report.push_str(&format!(
+                "${:02X}      {}\n",
+                entry.location.address, entry.name
+            ));
+        } else {
+            report.push_str(&format!(
+                "${:02X}-${end:02X} {}\n",
+                entry.location.address, entry.name
+            ));
+        }
+    }
+    report.push_str(&format!(
+        "\nUsed: {} bytes\nFree: {} bytes\n",
+        allocation.zero_page_used, allocation.zero_page_free
+    ));
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use nesc_mir::{Module, Type, TypeKind};
+
+    use super::{BackendConfig, ZeroPageRange, allocate};
+
+    #[test]
+    fn respects_available_and_reserved_ranges() {
+        let module = Module {
+            functions: Vec::new(),
+            globals: vec![
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U16)),
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
+            ],
+        };
+        let config = BackendConfig {
+            zero_page_available: vec![ZeroPageRange { start: 2, end: 7 }],
+            zero_page_reserved: vec![ZeroPageRange { start: 3, end: 3 }],
+            ..BackendConfig::default()
+        };
+        let allocation = allocate(&module, &config).expect("allocation");
+        assert_eq!(allocation.globals[0].address, 4);
+        assert_eq!(allocation.globals[1].address, 2);
+    }
+
+    #[test]
+    fn reserves_complete_array_storage() {
+        let mut array = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U16));
+        array.array_lengths.push(32);
+        let module = Module {
+            functions: Vec::new(),
+            globals: vec![
+                array,
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
+            ],
+        };
+        let config = BackendConfig {
+            zero_page_available: vec![ZeroPageRange {
+                start: 0xf0,
+                end: 0xff,
+            }],
+            zero_page_reserved: Vec::new(),
+            ..BackendConfig::default()
+        };
+        let allocation = allocate(&module, &config).expect("allocation");
+        assert_eq!(allocation.globals[0].address, 0x0200);
+        assert_eq!(allocation.globals[0].size, 64);
+        assert_eq!(allocation.globals[1].address, 0x0240);
+    }
+}

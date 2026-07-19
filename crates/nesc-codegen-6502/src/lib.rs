@@ -1,16 +1,27 @@
 //! Ricoh 2A03/2A07 code generation for verified NesC MIR.
 
+mod abi;
+mod allocation;
+mod stack;
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
 use nesc_mir::{
     BinaryOperator, BlockId, Function, Instruction, InstructionKind, Module, SourceSpan,
-    Terminator, UnaryOperator, ValueId,
+    Terminator, TypeKind, UnaryOperator, ValueId,
 };
 use nesc_object::{
     Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SymbolId, SymbolKind,
 };
+
+pub use abi::{
+    ARGUMENT_SPILL_BASE, ARGUMENT_SPILL_LEN, AbiLocation, RETURN_SPILL_BASE, RETURN_SPILL_LEN,
+    argument_location, return_location,
+};
+pub use allocation::{AllocationEntry, BackendConfig, Location, ZeroPageRange, ZeroPageStrategy};
+pub use stack::StackReport;
 
 /// Result of 6502 instruction selection.
 #[derive(Clone, Debug)]
@@ -19,6 +30,12 @@ pub struct GeneratedCode {
     pub object: Object,
     /// Symbolic assembly listing.
     pub assembly: String,
+    /// Deterministic zero-page placement report.
+    pub zero_page_report: String,
+    /// Deterministic hardware-stack report.
+    pub stack_report: String,
+    /// Structured hardware-stack analysis.
+    pub stack: StackReport,
 }
 
 /// Source-backed instruction-selection failure.
@@ -40,15 +57,33 @@ impl Error for CodegenError {}
 
 /// Lowers verified MIR to a relocatable 6502 code section.
 ///
-/// The initial public `nescall` subset passes up to three 8-bit arguments in
-/// A, X, and Y and returns an 8-bit scalar in A.
+/// `nescall` flattens scalar values into little-endian bytes. The first three
+/// argument and return bytes use A, X, and Y; remaining bytes use reserved
+/// zero-page ABI slots.
 ///
 /// # Errors
 ///
 /// Returns failures for unsupported wide operations, address expressions, or
 /// exhausted static temporary storage.
 pub fn generate(module: &Module) -> Result<GeneratedCode, Vec<CodegenError>> {
-    let mut emitter = Emitter::new(module)?;
+    generate_with_config(module, &BackendConfig::default())
+}
+
+/// Lowers verified MIR using explicit target resource settings.
+///
+/// # Errors
+///
+/// Returns failures for invalid allocation ranges, exhausted RAM, stack-limit
+/// violations, and unsupported machine operations.
+pub fn generate_with_config(
+    module: &Module,
+    config: &BackendConfig,
+) -> Result<GeneratedCode, Vec<CodegenError>> {
+    let allocation = allocation::allocate(module, config)?;
+    let stack = stack::analyze(module, config.stack_limit)?;
+    let zero_page_report = allocation::render_report(&allocation);
+    let stack_report = stack::render_report(&stack);
+    let mut emitter = Emitter::new(module, allocation)?;
     for function in &module.functions {
         if !function.blocks.is_empty() {
             emitter.function(function);
@@ -67,6 +102,9 @@ pub fn generate(module: &Module) -> Result<GeneratedCode, Vec<CodegenError>> {
         Ok(GeneratedCode {
             object: emitter.object,
             assembly: emitter.assembly,
+            zero_page_report,
+            stack_report,
+            stack,
         })
     } else {
         Err(emitter.errors)
@@ -78,14 +116,14 @@ struct Emitter {
     code: SectionId,
     function_symbols: Vec<SymbolId>,
     block_symbols: HashMap<(u32, u32), SymbolId>,
-    frame_indices: HashMap<u32, u16>,
+    allocation: allocation::Allocation,
     assembly: String,
     label_counter: u32,
     errors: Vec<CodegenError>,
 }
 
 impl Emitter {
-    fn new(module: &Module) -> Result<Self, Vec<CodegenError>> {
+    fn new(module: &Module, allocation: allocation::Allocation) -> Result<Self, Vec<CodegenError>> {
         let mut object = Object::default();
         let code = object
             .add_section(".text", SectionKind::Code, 1)
@@ -115,25 +153,7 @@ impl Emitter {
             function_symbols.push(symbol);
         }
         let mut block_symbols = HashMap::new();
-        let mut frame_indices = HashMap::new();
         for function in &module.functions {
-            if !function.blocks.is_empty() {
-                let index = u16::try_from(frame_indices.len()).map_err(|_| {
-                    vec![CodegenError {
-                        message: "too many defined functions for static frame allocation"
-                            .to_owned(),
-                        span: None,
-                    }]
-                })?;
-                if index >= 12 {
-                    return Err(vec![CodegenError {
-                        message: "initial backend supports at most 12 static function frames"
-                            .to_owned(),
-                        span: None,
-                    }]);
-                }
-                frame_indices.insert(function.id.0, index);
-            }
             for block in &function.blocks {
                 let symbol = object
                     .add_symbol(
@@ -157,7 +177,7 @@ impl Emitter {
             code,
             function_symbols,
             block_symbols,
-            frame_indices,
+            allocation,
             assembly: ".segment \"CODE\"\n".to_owned(),
             label_counter: 0,
             errors: Vec::new(),
@@ -165,22 +185,13 @@ impl Emitter {
     }
 
     fn function(&mut self, function: &Function) {
-        if function.locals.len() > 16 {
-            self.errors.push(CodegenError {
-                message: format!(
-                    "function `{}` requires more than 16 static local slots",
-                    function.name
-                ),
-                span: None,
-            });
-            return;
-        }
         let function_symbol = self.function_symbols[function.id.0 as usize];
         self.define(function_symbol);
         self.assembly.push_str(&format!(
             "\n.export {}\n{}:\n",
             function.name, function.name
         ));
+        self.parameter_prologue(function);
         for block in &function.blocks {
             let block_symbol = self.block_symbols[&(function.id.0, block.id.0)];
             self.define(block_symbol);
@@ -198,24 +209,38 @@ impl Emitter {
     fn instruction(&mut self, function: &Function, instruction: &Instruction) {
         match &instruction.kind {
             InstructionKind::Constant(value) => {
-                self.lda_immediate(*value as u8);
-                self.store_result(function, instruction);
+                if let Some(result) = instruction.result {
+                    let destination = self.value_location(function, result);
+                    self.write_constant(destination, *value);
+                }
             }
             InstructionKind::LoadLocal(local) => {
-                self.lda_absolute(self.local_address(function, local.0));
-                self.store_result(function, instruction);
+                if let Some(result) = instruction.result {
+                    self.copy_location(
+                        self.local_location(function, *local),
+                        self.value_location(function, result),
+                    );
+                }
             }
             InstructionKind::StoreLocal { local, value } => {
-                self.lda_absolute(self.value_address(function, *value));
-                self.sta_absolute(self.local_address(function, local.0));
+                self.copy_location(
+                    self.value_location(function, *value),
+                    self.local_location(function, *local),
+                );
             }
             InstructionKind::LoadGlobal(global) => {
-                self.lda_absolute(global_address(global.0));
-                self.store_result(function, instruction);
+                if let Some(result) = instruction.result {
+                    self.copy_location(
+                        self.global_location(*global),
+                        self.value_location(function, result),
+                    );
+                }
             }
             InstructionKind::StoreGlobal { global, value } => {
-                self.lda_absolute(self.value_address(function, *value));
-                self.sta_absolute(global_address(global.0));
+                self.copy_location(
+                    self.value_location(function, *value),
+                    self.global_location(*global),
+                );
             }
             InstructionKind::Unary { operator, operand } => {
                 self.unary(function, instruction, *operator, *operand);
@@ -225,32 +250,182 @@ impl Emitter {
                 left,
                 right,
             } => self.binary(function, instruction, *operator, *left, *right),
-            InstructionKind::Cast { value, .. } => {
-                self.lda_absolute(self.value_address(function, *value));
-                self.store_result(function, instruction);
-            }
+            InstructionKind::Cast { value, .. } => self.cast(function, instruction, *value),
             InstructionKind::Call {
                 function: callee,
                 arguments,
             } => {
-                if arguments.len() > 3 {
+                self.call(function, instruction, *callee, arguments);
+            }
+        }
+    }
+
+    fn parameter_prologue(&mut self, function: &Function) {
+        let mut byte_index = 0;
+        for parameter in &function.parameters {
+            let destination = self.local_location(function, *parameter);
+            for offset in 0..destination.size {
+                match argument_location(byte_index) {
+                    Some(AbiLocation::A) => self.sta_location(destination, offset),
+                    Some(AbiLocation::X) => self.stx_location(destination, offset),
+                    Some(AbiLocation::Y) => self.sty_location(destination, offset),
+                    Some(AbiLocation::ZeroPage(address)) => {
+                        self.lda_zero_page(address);
+                        self.sta_location(destination, offset);
+                    }
+                    None => {
+                        self.errors.push(CodegenError {
+                            message: format!(
+                                "function `{}` needs more than {} argument bytes supported by nescall",
+                                function.name,
+                                3 + ARGUMENT_SPILL_LEN
+                            ),
+                            span: None,
+                        });
+                        return;
+                    }
+                }
+                byte_index += 1;
+            }
+        }
+    }
+
+    fn write_constant(&mut self, destination: Location, value: u64) {
+        for offset in 0..destination.size {
+            let byte = if offset < 8 {
+                (value >> (u32::from(offset) * 8)) as u8
+            } else {
+                0
+            };
+            self.lda_immediate(byte);
+            self.sta_location(destination, offset);
+        }
+    }
+
+    fn copy_location(&mut self, source: Location, destination: Location) {
+        let copied = source.size.min(destination.size);
+        for offset in 0..copied {
+            self.lda_location(source, offset);
+            self.sta_location(destination, offset);
+        }
+        for offset in copied..destination.size {
+            self.lda_immediate(0);
+            self.sta_location(destination, offset);
+        }
+    }
+
+    fn cast(&mut self, function: &Function, instruction: &Instruction, value: ValueId) {
+        let Some(result) = instruction.result else {
+            return;
+        };
+        let source = self.value_location(function, value);
+        let destination = self.value_location(function, result);
+        let copied = source.size.min(destination.size);
+        for offset in 0..copied {
+            self.lda_location(source, offset);
+            self.sta_location(destination, offset);
+        }
+        if destination.size <= copied {
+            return;
+        }
+
+        let source_type = &function.value_types[value.0 as usize];
+        let signed = source_type.pointer_depth == 0
+            && matches!(
+                source_type.kind,
+                TypeKind::Integer(integer) if integer.is_signed()
+            );
+        if !signed {
+            for offset in copied..destination.size {
+                self.lda_immediate(0);
+                self.sta_location(destination, offset);
+            }
+            return;
+        }
+
+        let negative_name = self.fresh_label("cast_negative");
+        let fill_name = self.fresh_label("cast_fill");
+        let negative_symbol = self.local_symbol(&negative_name);
+        let fill_symbol = self.local_symbol(&fill_name);
+        self.lda_location(source, source.size - 1);
+        self.relative_symbol(0x30, "bmi", negative_symbol);
+        self.lda_immediate(0);
+        self.absolute_symbol(0x4c, "jmp", fill_symbol);
+        self.define(negative_symbol);
+        self.assembly.push_str(&format!("{negative_name}:\n"));
+        self.lda_immediate(0xff);
+        self.define(fill_symbol);
+        self.assembly.push_str(&format!("{fill_name}:\n"));
+        for offset in copied..destination.size {
+            self.sta_location(destination, offset);
+        }
+    }
+
+    fn call(
+        &mut self,
+        function: &Function,
+        instruction: &Instruction,
+        callee: nesc_mir::FunctionId,
+        arguments: &[ValueId],
+    ) {
+        let bytes = arguments
+            .iter()
+            .flat_map(|argument| {
+                let location = self.value_location(function, *argument);
+                (0..location.size).map(move |offset| (location, offset))
+            })
+            .collect::<Vec<_>>();
+        if bytes.len() > 3 + ARGUMENT_SPILL_LEN {
+            self.error(
+                format!(
+                    "call needs {} argument bytes, but nescall supports at most {}",
+                    bytes.len(),
+                    3 + ARGUMENT_SPILL_LEN
+                ),
+                instruction.span,
+            );
+            return;
+        }
+
+        for (index, (location, offset)) in bytes.iter().enumerate().skip(3) {
+            let Some(AbiLocation::ZeroPage(address)) = argument_location(index) else {
+                unreachable!("argument byte count was checked")
+            };
+            self.lda_location(*location, *offset);
+            self.sta_zero_page(address);
+        }
+        if let Some((location, offset)) = bytes.get(2) {
+            self.ldy_location(*location, *offset);
+        }
+        if let Some((location, offset)) = bytes.get(1) {
+            self.ldx_location(*location, *offset);
+        }
+        if let Some((location, offset)) = bytes.first() {
+            self.lda_location(*location, *offset);
+        }
+        self.absolute_symbol(0x20, "jsr", self.function_symbols[callee.0 as usize]);
+
+        if let Some(result) = instruction.result {
+            let destination = self.value_location(function, result);
+            for offset in 0..destination.size.min(3) {
+                match return_location(usize::from(offset)) {
+                    Some(AbiLocation::A) => self.sta_location(destination, offset),
+                    Some(AbiLocation::X) => self.stx_location(destination, offset),
+                    Some(AbiLocation::Y) => self.sty_location(destination, offset),
+                    _ => unreachable!("first three return bytes use registers"),
+                }
+            }
+            for offset in 3..destination.size {
+                let Some(AbiLocation::ZeroPage(address)) = return_location(usize::from(offset))
+                else {
                     self.error(
-                        "nescall currently supports at most three register arguments",
+                        "return value is wider than the nescall ABI supports",
                         instruction.span,
                     );
                     return;
-                }
-                if let Some(value) = arguments.first() {
-                    self.lda_absolute(self.value_address(function, *value));
-                }
-                if let Some(value) = arguments.get(1) {
-                    self.ldx_absolute(self.value_address(function, *value));
-                }
-                if let Some(value) = arguments.get(2) {
-                    self.ldy_absolute(self.value_address(function, *value));
-                }
-                self.absolute_symbol(0x20, "jsr", self.function_symbols[callee.0 as usize]);
-                self.store_result(function, instruction);
+                };
+                self.lda_zero_page(address);
+                self.sta_location(destination, offset);
             }
         }
     }
@@ -262,30 +437,41 @@ impl Emitter {
         operator: UnaryOperator,
         operand: ValueId,
     ) {
-        self.lda_absolute(self.value_address(function, operand));
+        let source = self.value_location(function, operand);
+        let Some(result) = instruction.result else {
+            return;
+        };
+        let destination = self.value_location(function, result);
         match operator {
-            UnaryOperator::Plus => {}
+            UnaryOperator::Plus => self.copy_location(source, destination),
             UnaryOperator::Negate => {
-                self.emit_byte(0x49, "eor #$ff");
-                self.emit_byte(0xff, "");
                 self.emit_byte(0x18, "clc");
-                self.emit_byte(0x69, "adc #$01");
-                self.emit_byte(0x01, "");
+                for offset in 0..destination.size {
+                    self.lda_location(source, offset);
+                    self.immediate(0x49, "eor", 0xff);
+                    self.immediate(0x69, "adc", u8::from(offset == 0));
+                    self.sta_location(destination, offset);
+                }
             }
-            UnaryOperator::LogicalNot => self.boolean_from_branch(0xf0, "beq"),
+            UnaryOperator::LogicalNot => {
+                self.reduce_location(source);
+                self.boolean_from_branch(0xf0, "beq");
+                self.store_boolean(destination);
+            }
             UnaryOperator::BitwiseNot => {
-                self.emit_byte(0x49, "eor #$ff");
-                self.emit_byte(0xff, "");
+                for offset in 0..destination.size {
+                    self.lda_location(source, offset);
+                    self.immediate(0x49, "eor", 0xff);
+                    self.sta_location(destination, offset);
+                }
             }
             _ => {
                 self.error(
                     "pointer and update unary operations require prior MIR lowering",
                     instruction.span,
                 );
-                return;
             }
         }
-        self.store_result(function, instruction);
     }
 
     fn binary(
@@ -296,47 +482,95 @@ impl Emitter {
         left: ValueId,
         right: ValueId,
     ) {
-        let left_address = self.value_address(function, left);
-        let right_address = self.value_address(function, right);
-        self.lda_absolute(left_address);
+        let left_location = self.value_location(function, left);
+        let right_location = self.value_location(function, right);
+        let Some(result) = instruction.result else {
+            return;
+        };
+        let destination = self.value_location(function, result);
         match operator {
             BinaryOperator::Add => {
                 self.emit_byte(0x18, "clc");
-                self.absolute_address(0x6d, "adc", right_address);
+                for offset in 0..destination.size {
+                    self.lda_location(left_location, offset);
+                    self.memory_operation(0x65, 0x6d, "adc", right_location, offset);
+                    self.sta_location(destination, offset);
+                }
             }
             BinaryOperator::Subtract => {
                 self.emit_byte(0x38, "sec");
-                self.absolute_address(0xed, "sbc", right_address);
+                for offset in 0..destination.size {
+                    self.lda_location(left_location, offset);
+                    self.memory_operation(0xe5, 0xed, "sbc", right_location, offset);
+                    self.sta_location(destination, offset);
+                }
             }
-            BinaryOperator::BitwiseAnd => self.absolute_address(0x2d, "and", right_address),
-            BinaryOperator::BitwiseOr => self.absolute_address(0x0d, "ora", right_address),
-            BinaryOperator::BitwiseXor => self.absolute_address(0x4d, "eor", right_address),
-            BinaryOperator::Equal | BinaryOperator::NotEqual => {
-                self.absolute_address(0xcd, "cmp", right_address);
-                let (opcode, mnemonic) = if operator == BinaryOperator::Equal {
-                    (0xf0, "beq")
-                } else {
-                    (0xd0, "bne")
+            BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOr | BinaryOperator::BitwiseXor => {
+                let (zero_page, absolute, mnemonic) = match operator {
+                    BinaryOperator::BitwiseAnd => (0x25, 0x2d, "and"),
+                    BinaryOperator::BitwiseOr => (0x05, 0x0d, "ora"),
+                    BinaryOperator::BitwiseXor => (0x45, 0x4d, "eor"),
+                    _ => unreachable!(),
                 };
-                self.boolean_from_branch(opcode, mnemonic);
+                for offset in 0..destination.size {
+                    self.lda_location(left_location, offset);
+                    self.memory_operation(zero_page, absolute, mnemonic, right_location, offset);
+                    self.sta_location(destination, offset);
+                }
             }
-            BinaryOperator::Less => {
-                self.absolute_address(0xcd, "cmp", right_address);
-                self.boolean_from_branch(0x90, "bcc");
+            BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                self.compare_equality(
+                    left_location,
+                    right_location,
+                    destination,
+                    operator == BinaryOperator::Equal,
+                );
             }
-            BinaryOperator::GreaterEqual => {
-                self.absolute_address(0xcd, "cmp", right_address);
-                self.boolean_from_branch(0xb0, "bcs");
+            BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual => {
+                let left_type = &function.value_types[left.0 as usize];
+                let signed = left_type.pointer_depth == 0
+                    && matches!(
+                        left_type.kind,
+                        TypeKind::Integer(integer) if integer.is_signed()
+                    );
+                self.compare_order(left_location, right_location, destination, operator, signed);
+            }
+            BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => {
+                self.reduce_location(left_location);
+                self.sta_zero_page(ARGUMENT_SPILL_BASE);
+                self.reduce_location(right_location);
+                let (zero_page, absolute, mnemonic) = if operator == BinaryOperator::LogicalAnd {
+                    (0x25, 0x2d, "and")
+                } else {
+                    (0x05, 0x0d, "ora")
+                };
+                self.memory_operation(
+                    zero_page,
+                    absolute,
+                    mnemonic,
+                    Location {
+                        address: u16::from(ARGUMENT_SPILL_BASE),
+                        size: 1,
+                        zero_page: true,
+                    },
+                    0,
+                );
+                self.boolean_from_branch(0xd0, "bne");
+                self.store_boolean(destination);
             }
             _ => {
                 self.error(
-                    "this MIR binary operation needs a runtime helper",
+                    format!(
+                        "{operator:?} on {}-byte values needs a 6502 runtime helper",
+                        left_location.size
+                    ),
                     instruction.span,
                 );
-                return;
             }
         }
-        self.store_result(function, instruction);
     }
 
     fn terminator(&mut self, function: &Function, terminator: &Terminator) {
@@ -350,7 +584,7 @@ impl Emitter {
                 then_block,
                 else_block,
             } => {
-                self.lda_absolute(self.value_address(function, *condition));
+                self.reduce_location(self.value_location(function, *condition));
                 let then_symbol = self.block_symbol(function, *then_block);
                 self.relative_symbol(0xd0, "bne", then_symbol);
                 let else_symbol = self.block_symbol(function, *else_block);
@@ -358,7 +592,28 @@ impl Emitter {
             }
             Terminator::Return(value) => {
                 if let Some(value) = value {
-                    self.lda_absolute(self.value_address(function, *value));
+                    let source = self.value_location(function, *value);
+                    for offset in 3..source.size {
+                        let Some(AbiLocation::ZeroPage(address)) =
+                            return_location(usize::from(offset))
+                        else {
+                            self.errors.push(CodegenError {
+                                message: "return value is wider than the nescall ABI supports"
+                                    .to_owned(),
+                                span: None,
+                            });
+                            return;
+                        };
+                        self.lda_location(source, offset);
+                        self.sta_zero_page(address);
+                    }
+                    if source.size > 2 {
+                        self.ldy_location(source, 2);
+                    }
+                    if source.size > 1 {
+                        self.ldx_location(source, 1);
+                    }
+                    self.lda_location(source, 0);
                 }
                 self.emit_byte(0x60, "rts");
             }
@@ -381,31 +636,135 @@ impl Emitter {
         self.assembly.push_str(&format!("{end_name}:\n"));
     }
 
-    fn store_result(&mut self, function: &Function, instruction: &Instruction) {
-        if let Some(result) = instruction.result {
-            if result.0 >= 64 {
-                self.error(
-                    "function requires more than 64 temporary values",
-                    instruction.span,
+    fn reduce_location(&mut self, location: Location) {
+        self.lda_location(location, 0);
+        for offset in 1..location.size {
+            self.memory_operation(0x05, 0x0d, "ora", location, offset);
+        }
+    }
+
+    fn store_boolean(&mut self, destination: Location) {
+        self.sta_location(destination, 0);
+        for offset in 1..destination.size {
+            self.lda_immediate(0);
+            self.sta_location(destination, offset);
+        }
+    }
+
+    fn compare_equality(
+        &mut self,
+        left: Location,
+        right: Location,
+        destination: Location,
+        equal: bool,
+    ) {
+        let mismatch_name = self.fresh_label("compare_mismatch");
+        let end_name = self.fresh_label("compare_end");
+        let mismatch_symbol = self.local_symbol(&mismatch_name);
+        let end_symbol = self.local_symbol(&end_name);
+        for offset in 0..left.size {
+            self.lda_location(left, offset);
+            self.memory_operation(0xc5, 0xcd, "cmp", right, offset);
+            self.relative_symbol(0xd0, "bne", mismatch_symbol);
+        }
+        self.lda_immediate(u8::from(equal));
+        self.absolute_symbol(0x4c, "jmp", end_symbol);
+        self.define(mismatch_symbol);
+        self.assembly.push_str(&format!("{mismatch_name}:\n"));
+        self.lda_immediate(u8::from(!equal));
+        self.define(end_symbol);
+        self.assembly.push_str(&format!("{end_name}:\n"));
+        self.store_boolean(destination);
+    }
+
+    fn compare_order(
+        &mut self,
+        left: Location,
+        right: Location,
+        destination: Location,
+        operator: BinaryOperator,
+        signed: bool,
+    ) {
+        let (lower_left, lower_right, lower_is_true) = match operator {
+            BinaryOperator::Less => (left, right, true),
+            BinaryOperator::LessEqual => (right, left, false),
+            BinaryOperator::Greater => (right, left, true),
+            BinaryOperator::GreaterEqual => (left, right, false),
+            _ => unreachable!("order comparison operator"),
+        };
+        let lower_name = self.fresh_label("compare_lower");
+        let not_lower_name = self.fresh_label("compare_not_lower");
+        let end_name = self.fresh_label("compare_end");
+        let lower_symbol = self.local_symbol(&lower_name);
+        let not_lower_symbol = self.local_symbol(&not_lower_name);
+        let end_symbol = self.local_symbol(&end_name);
+        self.branch_if_less(
+            lower_left,
+            lower_right,
+            signed,
+            lower_symbol,
+            not_lower_symbol,
+        );
+        self.define(lower_symbol);
+        self.assembly.push_str(&format!("{lower_name}:\n"));
+        self.lda_immediate(u8::from(lower_is_true));
+        self.absolute_symbol(0x4c, "jmp", end_symbol);
+        self.define(not_lower_symbol);
+        self.assembly.push_str(&format!("{not_lower_name}:\n"));
+        self.lda_immediate(u8::from(!lower_is_true));
+        self.define(end_symbol);
+        self.assembly.push_str(&format!("{end_name}:\n"));
+        self.store_boolean(destination);
+    }
+
+    fn branch_if_less(
+        &mut self,
+        left: Location,
+        right: Location,
+        signed: bool,
+        lower_symbol: SymbolId,
+        not_lower_symbol: SymbolId,
+    ) {
+        for offset in (0..left.size).rev() {
+            if signed && offset == left.size - 1 {
+                self.lda_location(left, offset);
+                self.immediate(0x49, "eor", 0x80);
+                self.sta_zero_page(ARGUMENT_SPILL_BASE);
+                self.lda_location(right, offset);
+                self.immediate(0x49, "eor", 0x80);
+                self.sta_zero_page(ARGUMENT_SPILL_BASE + 1);
+                self.lda_zero_page(ARGUMENT_SPILL_BASE);
+                self.absolute_or_zero_page(
+                    0xc5,
+                    0xcd,
+                    "cmp",
+                    u16::from(ARGUMENT_SPILL_BASE + 1),
+                    true,
                 );
             } else {
-                self.sta_absolute(self.value_address(function, result));
+                self.lda_location(left, offset);
+                self.memory_operation(0xc5, 0xcd, "cmp", right, offset);
             }
+            self.relative_symbol(0x90, "bcc", lower_symbol);
+            self.relative_symbol(0xd0, "bne", not_lower_symbol);
         }
+        self.absolute_symbol(0x4c, "jmp", not_lower_symbol);
     }
 
     fn block_symbol(&self, function: &Function, block: BlockId) -> SymbolId {
         self.block_symbols[&(function.id.0, block.0)]
     }
 
-    fn local_address(&self, function: &Function, local: u32) -> u16 {
-        let frame = self.frame_indices[&function.id.0];
-        0x0300 + frame * 0x20 + u16::try_from(local.saturating_mul(2)).unwrap_or(0)
+    fn global_location(&self, global: nesc_mir::GlobalId) -> Location {
+        self.allocation.globals[global.0 as usize]
     }
 
-    fn value_address(&self, function: &Function, value: ValueId) -> u16 {
-        let frame = self.frame_indices[&function.id.0];
-        0x0500 + frame * 0x40 + u16::try_from(value.0).unwrap_or(0)
+    fn local_location(&self, function: &Function, local: nesc_mir::LocalId) -> Location {
+        self.allocation.locals[&(function.id, local)]
+    }
+
+    fn value_location(&self, function: &Function, value: ValueId) -> Location {
+        self.allocation.values[&(function.id, value)]
     }
 
     fn fresh_label(&mut self, prefix: &str) -> String {
@@ -429,20 +788,76 @@ impl Emitter {
         self.emit_bytes(&[0xa9, value], &format!("lda #${value:02x}"));
     }
 
-    fn lda_absolute(&mut self, address: u16) {
-        self.absolute_address(0xad, "lda", address);
+    fn immediate(&mut self, opcode: u8, mnemonic: &str, value: u8) {
+        self.emit_bytes(&[opcode, value], &format!("{mnemonic} #${value:02x}"));
     }
 
-    fn sta_absolute(&mut self, address: u16) {
-        self.absolute_address(0x8d, "sta", address);
+    fn lda_location(&mut self, location: Location, offset: u16) {
+        self.memory_operation(0xa5, 0xad, "lda", location, offset);
     }
 
-    fn ldx_absolute(&mut self, address: u16) {
-        self.absolute_address(0xae, "ldx", address);
+    fn sta_location(&mut self, location: Location, offset: u16) {
+        self.memory_operation(0x85, 0x8d, "sta", location, offset);
     }
 
-    fn ldy_absolute(&mut self, address: u16) {
-        self.absolute_address(0xac, "ldy", address);
+    fn ldx_location(&mut self, location: Location, offset: u16) {
+        self.memory_operation(0xa6, 0xae, "ldx", location, offset);
+    }
+
+    fn stx_location(&mut self, location: Location, offset: u16) {
+        self.memory_operation(0x86, 0x8e, "stx", location, offset);
+    }
+
+    fn ldy_location(&mut self, location: Location, offset: u16) {
+        self.memory_operation(0xa4, 0xac, "ldy", location, offset);
+    }
+
+    fn sty_location(&mut self, location: Location, offset: u16) {
+        self.memory_operation(0x84, 0x8c, "sty", location, offset);
+    }
+
+    fn lda_zero_page(&mut self, address: u8) {
+        self.absolute_or_zero_page(0xa5, 0xad, "lda", u16::from(address), true);
+    }
+
+    fn sta_zero_page(&mut self, address: u8) {
+        self.absolute_or_zero_page(0x85, 0x8d, "sta", u16::from(address), true);
+    }
+
+    fn memory_operation(
+        &mut self,
+        zero_page_opcode: u8,
+        absolute_opcode: u8,
+        mnemonic: &str,
+        location: Location,
+        offset: u16,
+    ) {
+        debug_assert!(offset < location.size);
+        self.absolute_or_zero_page(
+            zero_page_opcode,
+            absolute_opcode,
+            mnemonic,
+            location.address + offset,
+            location.zero_page,
+        );
+    }
+
+    fn absolute_or_zero_page(
+        &mut self,
+        zero_page_opcode: u8,
+        absolute_opcode: u8,
+        mnemonic: &str,
+        address: u16,
+        zero_page: bool,
+    ) {
+        if zero_page {
+            self.emit_bytes(
+                &[zero_page_opcode, address as u8],
+                &format!("{mnemonic} ${address:02x}"),
+            );
+        } else {
+            self.absolute_address(absolute_opcode, mnemonic, address);
+        }
     }
 
     fn absolute_address(&mut self, opcode: u8, mnemonic: &str, address: u16) {
@@ -518,10 +933,6 @@ impl Emitter {
             span: Some(span),
         });
     }
-}
-
-fn global_address(global: u32) -> u16 {
-    0x0200 + u16::try_from(global.saturating_mul(4)).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]
