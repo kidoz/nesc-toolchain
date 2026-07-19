@@ -194,6 +194,7 @@ dependencies = [
  "clap",
  "nesc-compiler",
  "nesc-diagnostics",
+ "nesc-disasm",
  "nesc-project",
  "nesc-rom",
  "tempfile",
@@ -244,6 +245,9 @@ version = "0.1.0"
 [[package]]
 name = "nesc-disasm"
 version = "0.1.0"
+dependencies = [
+ "nesc-rom",
+]
 
 [[package]]
 name = "nesc-emulator"

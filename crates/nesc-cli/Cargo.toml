@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 clap.workspace = true
 nesc-compiler = { path = "../nesc-compiler" }
+nesc-disasm = { path = "../nesc-disasm" }
 nesc-diagnostics = { path = "../nesc-diagnostics" }
 nesc-project = { path = "../nesc-project" }
 nesc-rom = { path = "../nesc-rom" }

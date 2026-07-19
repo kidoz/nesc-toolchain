@@ -134,4 +134,66 @@ fn build_and_inspect_generated_project() {
     let stdout = String::from_utf8_lossy(&inspected.stdout);
     assert!(stdout.contains("Mapper 0"), "{stdout}");
     assert!(stdout.contains("32 KiB PRG"), "{stdout}");
+
+    let disassembly_dir = project.join("target/recovered");
+    let disassembled = nesc()
+        .current_dir(&project)
+        .args([
+            "disasm",
+            "target/rom-demo.nes",
+            "--output",
+            disassembly_dir.to_str().expect("UTF-8 test path"),
+            "--round-trip-check",
+        ])
+        .output()
+        .expect("run nesc disasm");
+    assert!(
+        disassembled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disassembled.stderr)
+    );
+    let disassembled_stdout = String::from_utf8_lossy(&disassembled.stdout);
+    assert!(
+        disassembled_stdout.contains("PRG recovery verified"),
+        "{disassembled_stdout}"
+    );
+    for artifact in [
+        "analysis.txt",
+        "cartridge.toml",
+        "chr.bin",
+        "header.bin",
+        "prg.asm",
+    ] {
+        assert!(disassembly_dir.join(artifact).is_file(), "{artifact}");
+    }
+    let recovered_assembly =
+        fs::read_to_string(disassembly_dir.join("prg.asm")).expect("read recovered assembly");
+    assert!(recovered_assembly.contains("reset_prg"));
+
+    let repeated = nesc()
+        .current_dir(&project)
+        .args([
+            "disassemble",
+            "target/rom-demo.nes",
+            "--output",
+            disassembly_dir.to_str().expect("UTF-8 test path"),
+        ])
+        .output()
+        .expect("repeat nesc disassemble");
+    assert!(!repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stderr).contains("error[E4103]"));
+}
+
+#[test]
+fn disassemble_rejects_a_malformed_rom() {
+    let temporary = tempdir().expect("temporary directory");
+    let rom = temporary.path().join("invalid.nes");
+    fs::write(&rom, b"not a ROM").expect("write invalid ROM");
+    let output = nesc()
+        .current_dir(temporary.path())
+        .args(["disassemble", "invalid.nes"])
+        .output()
+        .expect("run nesc disassemble");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("error[E4101]"));
 }
