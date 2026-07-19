@@ -11,19 +11,22 @@ to Ricoh 2A03/2A07 machine code and packages the result as an iNES or NES 2.0
 ROM. The toolkit is written in stable Rust 2024.
 
 > [!IMPORTANT]
-> The repository currently provides its workspace foundation, project
-> generation, manifest validation, SDK headers, and structured diagnostics.
-> Source compilation and ROM generation are not available yet.
+> The compiler currently generates Mapper 0 ROMs. Mapper-aware ROM models for
+> UxROM and CNROM exist, while compilation for those cartridge layouts and the
+> disassembler/decompiler command-line workflow remain under development.
 
 ## Highlights
 
-- Stable Rust workspace with explicit compiler boundaries
-- `nesc new` starter-project generation without overwriting existing paths
-- `nesc check` validation for project structure and `NesC.toml`
-- Mapper 0 cartridge constraints and zero-page reservation checks
+- Preprocessing, parsing, semantic analysis, typed HIR, verified MIR, and safe
+  optimization passes
+- Ricoh 2A03/2A07 code generation with a stable `nescall` ABI, zero-page
+  allocation, stack reports, and reference-driven arithmetic helpers
+- Fixed arrays, pointer arithmetic, typed CPU-bus address spaces, volatile
+  indirect access, and configurable bounds checks
+- Mapper 0 linking, iNES/NES 2.0 ROM construction, symbols, source maps, and
+  deterministic emulator boot verification
+- `nesc new`, `nesc check`, `nesc build`, and `nesc inspect` workflows
 - Rustc-style diagnostics with source spans and suggested corrections
-- Initial NES SDK headers for PPU, controller, sprite, audio, and mapper access
-- Deterministic formatting, linting, and test gates in CI
 
 ## Current status
 
@@ -31,12 +34,13 @@ ROM. The toolkit is written in stable Rust 2024.
 | --- | --- |
 | Cargo workspace and crate boundaries | Available |
 | `nesc new` | Available |
-| `nesc check` for project manifests | Available |
-| NesC preprocessing and parsing | Planned |
-| HIR, MIR, and optimization | Planned |
-| 6502 code generation and linking | Planned |
-| ROM construction and inspection | Planned |
-| Emulator, debugger, and decompiler | Planned |
+| `nesc check` for manifests and source semantics | Available |
+| NesC preprocessing and parsing | Available |
+| HIR, MIR, verification, and optimization | Available |
+| 6502 code generation and Mapper 0 linking | Available |
+| ROM construction and inspection | Available |
+| Deterministic emulator boot verification | Available as a library |
+| Debugger and ROM-to-code decompiler | Planned |
 
 ## Quick start
 
@@ -47,6 +51,7 @@ repository root:
 cargo run -p nesc-cli -- new demo
 cd demo
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- check
+cargo run --manifest-path ../Cargo.toml -p nesc-cli -- build
 ```
 
 Expected output:
@@ -54,6 +59,7 @@ Expected output:
 ```text
 Created `demo` at demo
 Checked `demo` v0.1.0 (src/main.c)
+Built `demo` at target
 ```
 
 The generated project contains:
@@ -106,20 +112,25 @@ source-map = true
 ```
 
 The checker rejects unsafe entry paths, missing source files, unsupported
-mappers, invalid NROM capacities, overlapping zero-page ranges, malformed
-versions, and invalid stack limits.
+compiler cartridge layouts, invalid NROM capacities, overlapping zero-page
+ranges, malformed versions, invalid stack limits, and source-level type errors.
 
 ## Workspace
 
 The workspace separates frontend, intermediate representation, optimization,
 backend, object, linker, ROM, emulator, debugger, and reverse-engineering
-concerns. Currently implemented behavior lives in:
+concerns. Core implementation crates include:
 
 | Crate | Responsibility |
 | --- | --- |
 | `nesc-cli` | Command parsing and user workflows |
 | `nesc-project` | Manifest parsing, validation, and project generation |
 | `nesc-diagnostics` | Structured source diagnostics |
+| `nesc-frontend`, `nesc-hir`, `nesc-mir` | Parsing, type checking, lowering, and verification |
+| `nesc-opt` | MIR optimization passes |
+| `nesc-codegen-6502`, `nesc-runtime` | Machine-code selection and runtime support |
+| `nesc-object`, `nesc-linker`, `nesc-rom` | Relocatable objects, linking, and cartridge containers |
+| `nesc-emulator` | Deterministic generated-ROM verification |
 
 SDK declarations live under `sdk/include/`.
 
@@ -135,16 +146,12 @@ cargo test --workspace --all-features
 
 CI runs the same commands on pushes and pull requests.
 
-## Roadmap
+## Next work
 
-1. NesC lexer, parser, and typed syntax tree
-2. HIR, control-flow MIR, and verification
-3. Safe optimization passes
-4. Ricoh 2A03/2A07 code generation
-5. Mapper 0 linking and ROM construction
-6. Deterministic emulator and debugger
-7. Advanced optimization and mapper-aware compilation
-8. ROM disassembly and verified NesC/Rust decompilation
+1. Complete debugger integration and richer emulator timing coverage
+2. Add mapper-aware compilation for UxROM and CNROM
+3. Implement ROM disassembly and verified NesC/Rust decompilation
+4. Expand optimization quality and generated-code cost modeling
 
 ## License
 
