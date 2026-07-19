@@ -41,6 +41,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | 6502 code generation and Mapper 0 linking | Available |
 | ROM construction and inspection | Available |
 | Official 6502 decoding and recursive Mapper 0 disassembly | Available |
+| Bank-qualified NROM CFG and semantic 6502 IR | Available as a library |
 | Deterministic emulator boot verification | Available as a library |
 | Debugger and higher-level ROM-to-code decompiler | Planned |
 
@@ -64,7 +65,7 @@ Expected output:
 Created `demo` at demo
 Checked `demo` v0.1.0 (src/main.c)
 Built `demo` at target
-Disassembled `target/demo.nes` into target/demo-disassembly (..., PRG recovery verified)
+Disassembled `target/demo.nes` into target/demo-disassembly (..., exact ROM round trip verified)
 ```
 
 The generated project contains:
@@ -155,8 +156,8 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete debugger integration and richer emulator timing coverage
 2. Add mapper-aware compilation for UxROM and CNROM
-3. Extend disassembly to bank-switched cartridges and add verified NesC/Rust
-   decompilation
+3. Add SSA/value recovery and verified NesC/Rust decompilation, then extend
+   recovery to bank-switched cartridges
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
