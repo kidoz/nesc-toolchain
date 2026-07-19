@@ -1,12 +1,18 @@
 //! Provenance-rich 6502 semantic lifting, value, ABI, and type recovery.
 
 mod recovery_analysis;
+mod structuring;
 mod value_analysis;
 
 pub use recovery_analysis::{
     AbiByte, CallEdge, CallGraphCycle, CallingConvention, FunctionRecovery, PointerFact,
     RecoveredType, RecoveryAnalysis, RecoveryEvidence, RecoveryEvidenceKind, RecoveryLimits,
     Signedness, TypeFact, TypeSubject, Volatility, analyze_recovery,
+};
+pub use structuring::{
+    ControlEdge, ControlFlowAnalysis, ControlFlowLimits, CountedLoop, FallbackReason, LoopForm,
+    RegionId, StructureEvidence, StructureEvidenceKind, StructuredFunction, StructuredRegion,
+    StructuredRegionKind, structure_control_flow,
 };
 
 pub use value_analysis::{
