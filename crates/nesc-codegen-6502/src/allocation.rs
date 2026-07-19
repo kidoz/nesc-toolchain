@@ -5,6 +5,11 @@ use nesc_mir::{FunctionId, GlobalId, InstructionKind, LocalId, Module, Terminato
 
 use crate::CodegenError;
 
+/// First internal-RAM byte reserved for arithmetic runtime helpers.
+pub const RUNTIME_SCRATCH_START: u16 = 0x0700;
+/// First byte after the arithmetic runtime scratch block.
+pub const RUNTIME_SCRATCH_END: u16 = 0x0714;
+
 /// Inclusive zero-page address range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ZeroPageRange {
@@ -206,6 +211,11 @@ pub(crate) fn allocate(
     for request in requests {
         let location = find_zero_page(&available, request.size).map_or_else(
             || {
+                if internal_cursor < RUNTIME_SCRATCH_END
+                    && internal_cursor.saturating_add(request.size) > RUNTIME_SCRATCH_START
+                {
+                    internal_cursor = RUNTIME_SCRATCH_END;
+                }
                 let location = Location {
                     address: internal_cursor,
                     size: request.size,
@@ -370,7 +380,7 @@ pub(crate) fn render_report(allocation: &Allocation) -> String {
 mod tests {
     use nesc_mir::{Module, Type, TypeKind};
 
-    use super::{BackendConfig, ZeroPageRange, allocate};
+    use super::{BackendConfig, RUNTIME_SCRATCH_END, ZeroPageRange, allocate};
 
     #[test]
     fn respects_available_and_reserved_ranges() {
@@ -414,5 +424,29 @@ mod tests {
         assert_eq!(allocation.globals[0].address, 0x0200);
         assert_eq!(allocation.globals[0].size, 64);
         assert_eq!(allocation.globals[1].address, 0x0240);
+    }
+
+    #[test]
+    fn skips_runtime_arithmetic_scratch() {
+        let mut array = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        array.array_lengths.push(0x0500);
+        let module = Module {
+            functions: Vec::new(),
+            globals: vec![
+                array,
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
+            ],
+        };
+        let config = BackendConfig {
+            zero_page_available: vec![ZeroPageRange {
+                start: 0xf0,
+                end: 0xff,
+            }],
+            zero_page_reserved: Vec::new(),
+            ..BackendConfig::default()
+        };
+        let allocation = allocate(&module, &config).expect("allocation");
+        assert_eq!(allocation.globals[0].address, 0x0200);
+        assert_eq!(allocation.globals[1].address, RUNTIME_SCRATCH_END);
     }
 }

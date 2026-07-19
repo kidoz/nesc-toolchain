@@ -192,7 +192,8 @@ fn fold_binary(operator: BinaryOperator, left: u64, right: u64, ty: &Type) -> Op
     let left = truncate(left, ty);
     let right = truncate(right, ty);
     let width = type_width(ty);
-    let signed = matches!(ty.kind, TypeKind::Integer(integer) if integer.is_signed());
+    let signed = ty.pointer_depth == 0
+        && matches!(ty.kind, TypeKind::Integer(integer) if integer.is_signed());
     let signed_left = sign_extend(left, width);
     let signed_right = sign_extend(right, width);
     let value = match operator {
@@ -205,9 +206,11 @@ fn fold_binary(operator: BinaryOperator, left: u64, right: u64, ty: &Type) -> Op
         BinaryOperator::Remainder if right == 0 => return None,
         BinaryOperator::Remainder if signed => (signed_left % signed_right) as u64,
         BinaryOperator::Remainder => left % right,
-        BinaryOperator::ShiftLeft => left.wrapping_shl((right % u64::from(width)) as u32),
-        BinaryOperator::ShiftRight if signed => (signed_left >> (right % u64::from(width))) as u64,
-        BinaryOperator::ShiftRight => left >> (right % u64::from(width)),
+        BinaryOperator::ShiftLeft if right >= u64::from(width) => return None,
+        BinaryOperator::ShiftLeft => left.wrapping_shl(right as u32),
+        BinaryOperator::ShiftRight if right >= u64::from(width) => return None,
+        BinaryOperator::ShiftRight if signed => (signed_left >> right) as u64,
+        BinaryOperator::ShiftRight => left >> right,
         BinaryOperator::Less => u64::from(if signed {
             signed_left < signed_right
         } else {

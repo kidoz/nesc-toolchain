@@ -1,5 +1,9 @@
 //! NES startup and minimal hardware runtime for generated programs.
 
+mod arithmetic;
+
+use std::collections::BTreeSet;
+
 use nesc_object::{
     Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SymbolId, SymbolKind,
 };
@@ -16,6 +20,16 @@ pub struct Runtime {
 /// Builds the Mapper 0 startup and initial SDK runtime.
 #[must_use]
 pub fn build() -> Runtime {
+    build_selected(None)
+}
+
+/// Builds startup and SDK support with only the requested arithmetic helpers.
+#[must_use]
+pub fn build_for(required_helpers: &BTreeSet<String>) -> Runtime {
+    build_selected(Some(required_helpers))
+}
+
+fn build_selected(required_helpers: Option<&BTreeSet<String>>) -> Runtime {
     let mut emitter = RuntimeEmitter::new();
     emitter.reset();
     emitter.simple_interrupt("__nesc_nmi");
@@ -28,6 +42,8 @@ pub fn build() -> Runtime {
     emitter.background_color();
     emitter.controller();
     emitter.simple_return("nes_oam_dma");
+    let trap = emitter.trap();
+    emitter.arithmetic_helpers(required_helpers, trap);
     Runtime {
         object: emitter.object,
         assembly: emitter.assembly,
@@ -81,6 +97,12 @@ impl RuntimeEmitter {
     fn simple_return(&mut self, name: &str) {
         self.define(name);
         self.emit(&[0x60], "rts");
+    }
+
+    fn trap(&mut self) -> SymbolId {
+        let symbol = self.define("__nesc_trap");
+        self.emit(&[0x02], ".byte $02 ; runtime trap");
+        symbol
     }
 
     fn wait(&mut self, name: &str) {
@@ -153,7 +175,8 @@ impl RuntimeEmitter {
     }
 
     fn absolute(&mut self, opcode: u8, mnemonic: &str, symbol: SymbolId) {
-        self.emit(&[opcode], &format!("{mnemonic} main"));
+        let name = self.object.symbols[symbol.0 as usize].name.clone();
+        self.emit(&[opcode], &format!("{mnemonic} {name}"));
         let offset = self.bytes().len() as u32;
         self.emit(&[0, 0], "");
         self.object.add_relocation(Relocation {
@@ -184,7 +207,9 @@ impl RuntimeEmitter {
 
 #[cfg(test)]
 mod tests {
-    use super::build;
+    use std::collections::BTreeSet;
+
+    use super::{build, build_for};
 
     #[test]
     fn runtime_exports_reset_and_sdk_symbols() {
@@ -194,6 +219,11 @@ mod tests {
             "__nesc_reset",
             "__nesc_nmi",
             "__nesc_irq",
+            "__nesc_trap",
+            "__nesc_mul_8",
+            "__nesc_udiv_16",
+            "__nesc_srem_24",
+            "__nesc_ashr_32",
             "nes_wait_frame",
             "nes_set_background_color",
         ] {
@@ -205,5 +235,34 @@ mod tests {
                     .any(|symbol| symbol.name == name)
             );
         }
+        let byte_count = runtime
+            .object
+            .sections
+            .iter()
+            .map(|section| section.bytes.len())
+            .sum::<usize>();
+        assert!(byte_count < 16 * 1024, "runtime is {byte_count} bytes");
+    }
+
+    #[test]
+    fn emits_only_requested_arithmetic_helpers() {
+        let required = BTreeSet::from(["__nesc_mul_16".to_owned()]);
+        let runtime = build_for(&required);
+        runtime.object.validate().expect("valid selected runtime");
+        assert!(
+            runtime
+                .object
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "__nesc_mul_16")
+        );
+        assert!(
+            !runtime
+                .object
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "__nesc_mul_8")
+        );
+        assert!(!runtime.assembly.contains("__nesc_udiv_16"));
     }
 }

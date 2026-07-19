@@ -20,7 +20,10 @@ pub use abi::{
     ARGUMENT_SPILL_BASE, ARGUMENT_SPILL_LEN, AbiLocation, RETURN_SPILL_BASE, RETURN_SPILL_LEN,
     argument_location, return_location,
 };
-pub use allocation::{AllocationEntry, BackendConfig, Location, ZeroPageRange, ZeroPageStrategy};
+pub use allocation::{
+    AllocationEntry, BackendConfig, Location, RUNTIME_SCRATCH_END, RUNTIME_SCRATCH_START,
+    ZeroPageRange, ZeroPageStrategy,
+};
 pub use stack::StackReport;
 
 /// Result of 6502 instruction selection.
@@ -116,6 +119,8 @@ struct Emitter {
     code: SectionId,
     function_symbols: Vec<SymbolId>,
     block_symbols: HashMap<(u32, u32), SymbolId>,
+    helper_symbols: HashMap<String, SymbolId>,
+    constants: HashMap<(u32, u32), u64>,
     allocation: allocation::Allocation,
     assembly: String,
     label_counter: u32,
@@ -153,6 +158,7 @@ impl Emitter {
             function_symbols.push(symbol);
         }
         let mut block_symbols = HashMap::new();
+        let mut constants = HashMap::new();
         for function in &module.functions {
             for block in &function.blocks {
                 let symbol = object
@@ -170,6 +176,13 @@ impl Emitter {
                         }]
                     })?;
                 block_symbols.insert((function.id.0, block.id.0), symbol);
+                for instruction in &block.instructions {
+                    if let (Some(result), InstructionKind::Constant(value)) =
+                        (instruction.result, &instruction.kind)
+                    {
+                        constants.insert((function.id.0, result.0), *value);
+                    }
+                }
             }
         }
         Ok(Self {
@@ -177,6 +190,8 @@ impl Emitter {
             code,
             function_symbols,
             block_symbols,
+            helper_symbols: HashMap::new(),
+            constants,
             allocation,
             assembly: ".segment \"CODE\"\n".to_owned(),
             label_counter: 0,
@@ -368,12 +383,27 @@ impl Emitter {
         callee: nesc_mir::FunctionId,
         arguments: &[ValueId],
     ) {
+        let locations = arguments
+            .iter()
+            .map(|argument| self.value_location(function, *argument))
+            .collect::<Vec<_>>();
+        let destination = instruction
+            .result
+            .map(|result| self.value_location(function, result));
+        let symbol = self.function_symbols[callee.0 as usize];
+        self.emit_call(&locations, destination, symbol, instruction.span);
+    }
+
+    fn emit_call(
+        &mut self,
+        arguments: &[Location],
+        destination: Option<Location>,
+        symbol: SymbolId,
+        span: SourceSpan,
+    ) {
         let bytes = arguments
             .iter()
-            .flat_map(|argument| {
-                let location = self.value_location(function, *argument);
-                (0..location.size).map(move |offset| (location, offset))
-            })
+            .flat_map(|location| (0..location.size).map(move |offset| (*location, offset)))
             .collect::<Vec<_>>();
         if bytes.len() > 3 + ARGUMENT_SPILL_LEN {
             self.error(
@@ -382,7 +412,7 @@ impl Emitter {
                     bytes.len(),
                     3 + ARGUMENT_SPILL_LEN
                 ),
-                instruction.span,
+                span,
             );
             return;
         }
@@ -403,10 +433,9 @@ impl Emitter {
         if let Some((location, offset)) = bytes.first() {
             self.lda_location(*location, *offset);
         }
-        self.absolute_symbol(0x20, "jsr", self.function_symbols[callee.0 as usize]);
+        self.absolute_symbol(0x20, "jsr", symbol);
 
-        if let Some(result) = instruction.result {
-            let destination = self.value_location(function, result);
+        if let Some(destination) = destination {
             for offset in 0..destination.size.min(3) {
                 match return_location(usize::from(offset)) {
                     Some(AbiLocation::A) => self.sta_location(destination, offset),
@@ -418,10 +447,7 @@ impl Emitter {
             for offset in 3..destination.size {
                 let Some(AbiLocation::ZeroPage(address)) = return_location(usize::from(offset))
                 else {
-                    self.error(
-                        "return value is wider than the nescall ABI supports",
-                        instruction.span,
-                    );
+                    self.error("return value is wider than the nescall ABI supports", span);
                     return;
                 };
                 self.lda_zero_page(address);
@@ -561,6 +587,20 @@ impl Emitter {
                 self.boolean_from_branch(0xd0, "bne");
                 self.store_boolean(destination);
             }
+            BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Remainder
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight => self.arithmetic(
+                function,
+                instruction,
+                operator,
+                left,
+                right,
+                left_location,
+                right_location,
+                destination,
+            ),
             _ => {
                 self.error(
                     format!(
@@ -569,6 +609,178 @@ impl Emitter {
                     ),
                     instruction.span,
                 );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arithmetic(
+        &mut self,
+        function: &Function,
+        instruction: &Instruction,
+        operator: BinaryOperator,
+        left: ValueId,
+        right: ValueId,
+        left_location: Location,
+        right_location: Location,
+        destination: Location,
+    ) {
+        if !(1..=4).contains(&destination.size) {
+            self.error(
+                format!(
+                    "{operator:?} on {}-byte values has no arithmetic lowering",
+                    destination.size
+                ),
+                instruction.span,
+            );
+            return;
+        }
+        let left_type = &function.value_types[left.0 as usize];
+        let signed = left_type.pointer_depth == 0
+            && matches!(
+                left_type.kind,
+                TypeKind::Integer(integer) if integer.is_signed()
+            );
+        let constant = self.constants.get(&(function.id.0, right.0)).copied();
+        let bit_width = destination.size * 8;
+
+        if matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder)
+            && constant == Some(0)
+        {
+            self.error("division or remainder by constant zero", instruction.span);
+            return;
+        }
+        if matches!(
+            operator,
+            BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight
+        ) && constant.is_some_and(|count| count >= u64::from(bit_width))
+        {
+            self.error(
+                format!("constant shift count must be less than {bit_width}"),
+                instruction.span,
+            );
+            return;
+        }
+
+        if let Some(value) = constant
+            && self.constant_arithmetic(
+                operator,
+                signed,
+                value,
+                left_location,
+                destination,
+                bit_width,
+            )
+        {
+            return;
+        }
+
+        let bits = destination.size * 8;
+        let name = match operator {
+            BinaryOperator::Multiply => format!("__nesc_mul_{bits}"),
+            BinaryOperator::Divide => {
+                format!("__nesc_{}div_{bits}", if signed { "s" } else { "u" })
+            }
+            BinaryOperator::Remainder => {
+                format!("__nesc_{}rem_{bits}", if signed { "s" } else { "u" })
+            }
+            BinaryOperator::ShiftLeft => format!("__nesc_shl_{bits}"),
+            BinaryOperator::ShiftRight if signed => format!("__nesc_ashr_{bits}"),
+            BinaryOperator::ShiftRight => format!("__nesc_lshr_{bits}"),
+            _ => unreachable!("arithmetic helper operator"),
+        };
+        let symbol = self.helper_symbol(&name);
+        self.emit_call(
+            &[left_location, right_location],
+            Some(destination),
+            symbol,
+            instruction.span,
+        );
+    }
+
+    fn constant_arithmetic(
+        &mut self,
+        operator: BinaryOperator,
+        signed: bool,
+        constant: u64,
+        source: Location,
+        destination: Location,
+        bit_width: u16,
+    ) -> bool {
+        match operator {
+            BinaryOperator::Multiply if constant == 0 => {
+                self.write_constant(destination, 0);
+                true
+            }
+            BinaryOperator::Multiply if constant.is_power_of_two() => {
+                self.inline_shift(
+                    source,
+                    destination,
+                    constant.trailing_zeros() as u16,
+                    BinaryOperator::ShiftLeft,
+                    false,
+                );
+                true
+            }
+            BinaryOperator::Divide if !signed && constant.is_power_of_two() => {
+                self.inline_shift(
+                    source,
+                    destination,
+                    constant.trailing_zeros() as u16,
+                    BinaryOperator::ShiftRight,
+                    false,
+                );
+                true
+            }
+            BinaryOperator::Remainder if !signed && constant.is_power_of_two() => {
+                let mask = constant - 1;
+                for offset in 0..destination.size {
+                    self.lda_location(source, offset);
+                    self.immediate(0x29, "and", (mask >> (u32::from(offset) * 8)) as u8);
+                    self.sta_location(destination, offset);
+                }
+                true
+            }
+            BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
+                debug_assert!(constant < u64::from(bit_width));
+                self.inline_shift(source, destination, constant as u16, operator, signed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn inline_shift(
+        &mut self,
+        source: Location,
+        destination: Location,
+        count: u16,
+        operator: BinaryOperator,
+        signed: bool,
+    ) {
+        self.copy_location(source, destination);
+        for _ in 0..count {
+            match operator {
+                BinaryOperator::ShiftLeft => {
+                    self.memory_operation(0x06, 0x0e, "asl", destination, 0);
+                    for offset in 1..destination.size {
+                        self.memory_operation(0x26, 0x2e, "rol", destination, offset);
+                    }
+                }
+                BinaryOperator::ShiftRight if signed => {
+                    self.lda_location(destination, destination.size - 1);
+                    self.emit_byte(0x0a, "asl a");
+                    for offset in (0..destination.size).rev() {
+                        self.memory_operation(0x66, 0x6e, "ror", destination, offset);
+                    }
+                }
+                BinaryOperator::ShiftRight => {
+                    self.memory_operation(0x46, 0x4e, "lsr", destination, destination.size - 1);
+                    for offset in (0..destination.size - 1).rev() {
+                        self.memory_operation(0x66, 0x6e, "ror", destination, offset);
+                    }
+                }
+                _ => unreachable!("shift operator"),
             }
         }
     }
@@ -779,6 +991,18 @@ impl Emitter {
             .expect("generated symbol is valid")
     }
 
+    fn helper_symbol(&mut self, name: &str) -> SymbolId {
+        if let Some(symbol) = self.helper_symbols.get(name) {
+            return *symbol;
+        }
+        let symbol = self
+            .object
+            .add_symbol(name, None, 0, SymbolKind::Function, Binding::Global)
+            .expect("runtime helper symbol is valid");
+        self.helper_symbols.insert(name.to_owned(), symbol);
+        symbol
+    }
+
     fn define(&mut self, symbol: SymbolId) {
         let offset = self.code_len();
         self.object.symbols[symbol.0 as usize].offset = offset as u32;
@@ -938,8 +1162,8 @@ impl Emitter {
 #[cfg(test)]
 mod tests {
     use nesc_mir::{
-        BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionKind, Module, SourceId,
-        SourceSpan, Terminator, Type, TypeKind, ValueId,
+        BasicBlock, BinaryOperator, BlockId, Function, FunctionId, Instruction, InstructionKind,
+        Module, SourceId, SourceSpan, Terminator, Type, TypeKind, ValueId,
     };
 
     use super::generate;
@@ -979,6 +1203,74 @@ mod tests {
                 .symbols
                 .iter()
                 .any(|symbol| symbol.name == "main")
+        );
+    }
+
+    #[test]
+    fn selects_eight_bit_multiply_helper() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "multiply".to_owned(),
+                return_type: ty.clone(),
+                parameters: vec![nesc_mir::LocalId(0), nesc_mir::LocalId(1)],
+                locals: vec![
+                    nesc_mir::Local {
+                        id: nesc_mir::LocalId(0),
+                        name: "left".to_owned(),
+                        ty: ty.clone(),
+                        parameter: true,
+                    },
+                    nesc_mir::Local {
+                        id: nesc_mir::LocalId(1),
+                        name: "right".to_owned(),
+                        ty: ty.clone(),
+                        parameter: true,
+                    },
+                ],
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::LoadLocal(nesc_mir::LocalId(0)),
+                            effect: nesc_mir::Effect::Read,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(1)),
+                            kind: InstructionKind::LoadLocal(nesc_mir::LocalId(1)),
+                            effect: nesc_mir::Effect::Read,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(2)),
+                            kind: InstructionKind::Binary {
+                                operator: BinaryOperator::Multiply,
+                                left: ValueId(0),
+                                right: ValueId(1),
+                            },
+                            effect: nesc_mir::Effect::Pure,
+                            span,
+                        },
+                    ],
+                    terminator: Some(Terminator::Return(Some(ValueId(2)))),
+                }],
+                value_types: vec![ty.clone(), ty.clone(), ty],
+            }],
+        };
+        let generated = generate(&module).expect("code generation");
+        assert!(generated.assembly.contains("jsr __nesc_mul_8"));
+        assert!(
+            generated
+                .object
+                .symbols
+                .iter()
+                .any(|symbol| { symbol.name == "__nesc_mul_8" && symbol.section.is_none() })
         );
     }
 }

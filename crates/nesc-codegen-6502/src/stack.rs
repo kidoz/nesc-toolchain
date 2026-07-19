@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use nesc_mir::{FunctionId, InstructionKind, Module};
+use nesc_mir::{BinaryOperator, FunctionId, InstructionKind, Module};
 
 use crate::CodegenError;
 
@@ -19,19 +19,31 @@ pub struct StackReport {
 
 pub(crate) fn analyze(module: &Module, limit: u16) -> Result<StackReport, Vec<CodegenError>> {
     let mut calls = HashMap::<FunctionId, BTreeSet<FunctionId>>::new();
+    let mut helper_callers = HashSet::new();
     for function in &module.functions {
         if function.blocks.is_empty() {
             continue;
         }
-        let callees = function
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .filter_map(|instruction| match instruction.kind {
-                InstructionKind::Call { function, .. } => Some(function),
-                _ => None,
-            })
-            .collect();
+        let mut callees = BTreeSet::new();
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            match instruction.kind {
+                InstructionKind::Call { function, .. } => {
+                    callees.insert(function);
+                }
+                InstructionKind::Binary {
+                    operator:
+                        BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Remainder
+                        | BinaryOperator::ShiftLeft
+                        | BinaryOperator::ShiftRight,
+                    ..
+                } => {
+                    helper_callers.insert(function.id);
+                }
+                _ => {}
+            }
+        }
         calls.insert(function.id, callees);
     }
     let mut memo = HashMap::new();
@@ -41,7 +53,13 @@ pub(crate) fn analyze(module: &Module, limit: u16) -> Result<StackReport, Vec<Co
         if function.blocks.is_empty() {
             continue;
         }
-        let usage = call_usage(function.id, &calls, &mut memo, &mut HashSet::new())?;
+        let usage = call_usage(
+            function.id,
+            &calls,
+            &helper_callers,
+            &mut memo,
+            &mut HashSet::new(),
+        )?;
         maximum_call_path = maximum_call_path.max(usage);
         functions.insert(function.name.clone(), usage);
     }
@@ -66,6 +84,7 @@ pub(crate) fn analyze(module: &Module, limit: u16) -> Result<StackReport, Vec<Co
 fn call_usage(
     function: FunctionId,
     calls: &HashMap<FunctionId, BTreeSet<FunctionId>>,
+    helper_callers: &HashSet<FunctionId>,
     memo: &mut HashMap<FunctionId, u16>,
     visiting: &mut HashSet<FunctionId>,
 ) -> Result<u16, Vec<CodegenError>> {
@@ -79,11 +98,11 @@ fn call_usage(
             span: None,
         }]);
     }
-    let mut nested = 0;
+    let mut nested = u16::from(helper_callers.contains(&function)) * 2;
     if let Some(callees) = calls.get(&function) {
         for callee in callees {
             let usage = if calls.contains_key(callee) {
-                call_usage(*callee, calls, memo, visiting)?
+                call_usage(*callee, calls, helper_callers, memo, visiting)?
             } else {
                 3
             };
@@ -122,6 +141,7 @@ mod tests {
         let usage = call_usage(
             FunctionId(0),
             &calls,
+            &HashSet::new(),
             &mut HashMap::new(),
             &mut HashSet::new(),
         )
@@ -135,10 +155,25 @@ mod tests {
         let errors = call_usage(
             FunctionId(0),
             &calls,
+            &HashSet::new(),
             &mut HashMap::new(),
             &mut HashSet::new(),
         )
         .expect_err("recursive graph");
         assert!(errors[0].message.contains("recursive call graph"));
+    }
+
+    #[test]
+    fn includes_arithmetic_helper_calls() {
+        let calls = HashMap::from([(FunctionId(0), BTreeSet::new())]);
+        let usage = call_usage(
+            FunctionId(0),
+            &calls,
+            &HashSet::from([FunctionId(0)]),
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("acyclic graph");
+        assert_eq!(usage, 4);
     }
 }

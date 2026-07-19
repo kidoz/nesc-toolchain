@@ -1,6 +1,6 @@
 //! Top-level orchestration for the NesC compilation pipeline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use nesc_diagnostics::Diagnostic;
@@ -155,7 +155,14 @@ pub fn build_project(
                 })
                 .collect::<Vec<_>>()
         })?;
-    let runtime = nesc_runtime::build();
+    let required_helpers = generated
+        .object
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.section.is_none() && symbol.name.starts_with("__nesc_"))
+        .map(|symbol| symbol.name.clone())
+        .collect::<BTreeSet<_>>();
+    let runtime = nesc_runtime::build_for(&required_helpers);
     let link_config = linker_config(project)?;
     let linked = nesc_linker::link(
         &[runtime.object.clone(), generated.object.clone()],

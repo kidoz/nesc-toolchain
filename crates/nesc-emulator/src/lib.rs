@@ -270,8 +270,35 @@ impl Machine {
                 self.adc(value);
                 2
             }
-            0x49 => {
-                self.a ^= self.fetch()?;
+            0xe9 => {
+                let value = self.fetch()?;
+                self.sbc(value);
+                2
+            }
+            0x09 | 0x29 | 0x49 | 0xc9 => {
+                let value = self.fetch()?;
+                match opcode {
+                    0x09 => {
+                        self.a |= value;
+                        self.set_nz(self.a);
+                    }
+                    0x29 => {
+                        self.a &= value;
+                        self.set_nz(self.a);
+                    }
+                    0x49 => {
+                        self.a ^= value;
+                        self.set_nz(self.a);
+                    }
+                    0xc9 => self.compare(self.a, value),
+                    _ => unreachable!(),
+                }
+                2
+            }
+            0x0a => {
+                let value = self.a;
+                self.set_carry(value & 0x80 != 0);
+                self.a = value << 1;
                 self.set_nz(self.a);
                 2
             }
@@ -320,6 +347,39 @@ impl Machine {
                     _ => unreachable!(),
                 }
                 3
+            }
+            0x06 | 0x26 | 0x46 | 0x66 | 0x0e | 0x2e | 0x4e | 0x6e | 0xce => {
+                let (address, cycles) = if matches!(opcode, 0x06 | 0x26 | 0x46 | 0x66) {
+                    (u16::from(self.fetch()?), 5)
+                } else {
+                    (self.fetch_word()?, 6)
+                };
+                let value = self.read(address)?;
+                let output = match opcode {
+                    0x06 | 0x0e => {
+                        self.set_carry(value & 0x80 != 0);
+                        value << 1
+                    }
+                    0x26 | 0x2e => {
+                        let carry = self.status & 1;
+                        self.set_carry(value & 0x80 != 0);
+                        (value << 1) | carry
+                    }
+                    0x46 | 0x4e => {
+                        self.set_carry(value & 1 != 0);
+                        value >> 1
+                    }
+                    0x66 | 0x6e => {
+                        let carry = (self.status & 1) << 7;
+                        self.set_carry(value & 1 != 0);
+                        (value >> 1) | carry
+                    }
+                    0xce => value.wrapping_sub(1),
+                    _ => unreachable!(),
+                };
+                self.write(address, output)?;
+                self.set_nz(output);
+                cycles
             }
             0x2c => {
                 let address = self.fetch_word()?;
@@ -480,6 +540,10 @@ impl Machine {
     fn compare(&mut self, left: u8, right: u8) {
         self.status = (self.status & !1) | u8::from(left >= right);
         self.set_nz(left.wrapping_sub(right));
+    }
+
+    fn set_carry(&mut self, carry: bool) {
+        self.status = (self.status & !1) | u8::from(carry);
     }
 
     fn set_nz(&mut self, value: u8) {
