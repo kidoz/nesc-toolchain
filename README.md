@@ -12,8 +12,8 @@ ROM. The toolkit is written in stable Rust 2024.
 
 > [!IMPORTANT]
 > The compiler currently generates Mapper 0 ROMs. Mapper-aware ROM models for
-> UxROM and CNROM exist, while compilation for those cartridge layouts and the
-> disassembler/decompiler command-line workflow remain under development.
+> UxROM and CNROM exist. Recursive disassembly currently accepts Mapper 0 ROMs;
+> higher-level NesC and Rust recovery remains under development.
 
 ## Highlights
 
@@ -25,7 +25,8 @@ ROM. The toolkit is written in stable Rust 2024.
   indirect access, and configurable bounds checks
 - Mapper 0 linking, iNES/NES 2.0 ROM construction, symbols, source maps, and
   deterministic emulator boot verification
-- `nesc new`, `nesc check`, `nesc build`, and `nesc inspect` workflows
+- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, and Mapper 0
+  `nesc disassemble` workflows
 - Rustc-style diagnostics with source spans and suggested corrections
 
 ## Current status
@@ -39,8 +40,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | HIR, MIR, verification, and optimization | Available |
 | 6502 code generation and Mapper 0 linking | Available |
 | ROM construction and inspection | Available |
+| Official 6502 decoding and recursive Mapper 0 disassembly | Available |
 | Deterministic emulator boot verification | Available as a library |
-| Debugger and ROM-to-code decompiler | Planned |
+| Debugger and higher-level ROM-to-code decompiler | Planned |
 
 ## Quick start
 
@@ -52,6 +54,8 @@ cargo run -p nesc-cli -- new demo
 cd demo
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- check
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- build
+cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
+  disassemble target/demo.nes --round-trip-check
 ```
 
 Expected output:
@@ -60,6 +64,7 @@ Expected output:
 Created `demo` at demo
 Checked `demo` v0.1.0 (src/main.c)
 Built `demo` at target
+Disassembled `target/demo.nes` into target/demo-disassembly (..., PRG recovery verified)
 ```
 
 The generated project contains:
@@ -150,7 +155,8 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete debugger integration and richer emulator timing coverage
 2. Add mapper-aware compilation for UxROM and CNROM
-3. Implement ROM disassembly and verified NesC/Rust decompilation
+3. Extend disassembly to bank-switched cartridges and add verified NesC/Rust
+   decompilation
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
