@@ -7,5 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+nesc-hir = { path = "../nesc-hir" }
+
+[dev-dependencies]
+nesc-frontend = { path = "../nesc-frontend" }
+tempfile.workspace = true
+
 [lints]
 workspace = true
