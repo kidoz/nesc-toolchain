@@ -37,6 +37,30 @@ pub struct LinkedImage {
     pub map: String,
 }
 
+/// Exact NROM recovery input after assembly reconstruction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryLinkInput<'a> {
+    /// Original 16-byte container header.
+    pub header: &'a [u8],
+    /// Optional original trainer.
+    pub trainer: Option<&'a [u8]>,
+    /// PRG-ROM emitted by `nesc-asm`.
+    pub prg_rom: &'a [u8],
+    /// Original CHR-ROM.
+    pub chr_rom: &'a [u8],
+    /// Original bytes after declared cartridge regions.
+    pub trailing: &'a [u8],
+}
+
+/// Exact relink result for a recovered NROM project.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredImage {
+    /// Complete reconstructed container.
+    pub rom: Vec<u8>,
+    /// Reparsed cartridge metadata and regions.
+    pub cartridge: Rom,
+}
+
 /// Link or relocation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkError(pub String);
@@ -247,6 +271,45 @@ pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<L
     })
 }
 
+/// Relinks an exact Mapper 0 recovery image through the shared ROM builder.
+///
+/// This path does not perform ordinary section placement or rewrite vectors:
+/// those bytes are already explicit in the recovered assembly. It validates
+/// the reconstructed container and Mapper 0 layout before returning it.
+///
+/// # Errors
+///
+/// Returns a deterministic error for inconsistent container parts, malformed
+/// metadata, unsupported mappers, or invalid NROM capacities.
+pub fn relink_nrom(input: RecoveryLinkInput<'_>) -> Result<RecoveredImage, LinkError> {
+    let rom = nesc_rom::rebuild_exact(nesc_rom::ExactImageParts {
+        header: input.header,
+        trainer: input.trainer,
+        prg_rom: input.prg_rom,
+        chr_rom: input.chr_rom,
+        trailing: input.trailing,
+    })
+    .map_err(|error| LinkError(error.to_string()))?;
+    let cartridge = nesc_rom::parse(&rom).map_err(|error| LinkError(error.to_string()))?;
+    if cartridge.metadata.mapper != 0 {
+        return Err(LinkError(format!(
+            "recovery relinking supports Mapper 0, not Mapper {}",
+            cartridge.metadata.mapper
+        )));
+    }
+    if !matches!(cartridge.prg_rom.len(), 0x4000 | 0x8000) {
+        return Err(LinkError(
+            "Mapper 0 recovery requires 16 or 32 KiB PRG-ROM".to_owned(),
+        ));
+    }
+    if !matches!(cartridge.chr_rom.len(), 0 | 0x2000) {
+        return Err(LinkError(
+            "Mapper 0 recovery requires 0 or 8 KiB CHR-ROM".to_owned(),
+        ));
+    }
+    Ok(RecoveredImage { rom, cartridge })
+}
+
 fn align(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -256,7 +319,7 @@ mod tests {
     use nesc_object::{Binding, Object, SectionKind, SymbolKind};
     use nesc_rom::{Format, Mirroring, Region};
 
-    use super::{LinkConfig, link};
+    use super::{LinkConfig, RecoveryLinkInput, link, relink_nrom};
 
     #[test]
     fn resolves_vectors_in_nrom() {
@@ -284,5 +347,37 @@ mod tests {
         let reset = u16::from_le_bytes([linked.prg_rom[0x7ffc], linked.prg_rom[0x7ffd]]);
         assert_eq!(reset, linked.symbols["__nesc_reset"]);
         assert!(linked.symbols["main"] > reset);
+    }
+
+    #[test]
+    fn relinks_exact_recovery_container() {
+        let cartridge = nesc_rom::Rom {
+            metadata: nesc_rom::Metadata {
+                format: Format::Ines,
+                mapper: 0,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: 0x4000,
+                chr_rom_len: 0x2000,
+            },
+            trainer: Some(vec![0x55; 512]),
+            prg_rom: vec![0xea; 0x4000],
+            chr_rom: vec![0xaa; 0x2000],
+        };
+        let mut original = nesc_rom::build(&cartridge).expect("ROM");
+        original[10] = 0x7f;
+        original.extend_from_slice(&[0xde, 0xad]);
+        let rebuilt = relink_nrom(RecoveryLinkInput {
+            header: &original[..16],
+            trainer: cartridge.trainer.as_deref(),
+            prg_rom: &cartridge.prg_rom,
+            chr_rom: &cartridge.chr_rom,
+            trailing: &original[original.len() - 2..],
+        })
+        .expect("relink");
+        assert_eq!(rebuilt.rom, original);
+        assert_eq!(rebuilt.cartridge, cartridge);
     }
 }

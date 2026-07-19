@@ -75,6 +75,21 @@ pub struct Rom {
     pub chr_rom: Vec<u8>,
 }
 
+/// Borrowed parts of an exact cartridge container reconstruction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactImageParts<'a> {
+    /// Original 16-byte iNES or NES 2.0 header.
+    pub header: &'a [u8],
+    /// Optional original trainer.
+    pub trainer: Option<&'a [u8]>,
+    /// Rebuilt PRG-ROM bytes.
+    pub prg_rom: &'a [u8],
+    /// Original CHR-ROM bytes.
+    pub chr_rom: &'a [u8],
+    /// Bytes following the container-declared cartridge regions.
+    pub trailing: &'a [u8],
+}
+
 /// ROM parsing or construction failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RomError {
@@ -240,6 +255,79 @@ pub fn build(rom: &Rom) -> Result<Vec<u8>, RomError> {
     bytes.extend_from_slice(&rom.prg_rom);
     bytes.extend_from_slice(&rom.chr_rom);
     Ok(bytes)
+}
+
+/// Reconstructs a cartridge while preserving the original header and extras.
+///
+/// Unlike [`build`], this function retains ignored or reserved header bits and
+/// trailing container bytes. It still validates declared sizes, trainer
+/// presence, and the reconstructed cartridge through the normal parser.
+///
+/// # Errors
+///
+/// Returns a failure when the header is malformed, a supplied region does not
+/// match its declared size, arithmetic overflows, or reparsing fails.
+pub fn rebuild_exact(parts: ExactImageParts<'_>) -> Result<Vec<u8>, RomError> {
+    let header: &[u8; HEADER_LEN] = parts
+        .header
+        .try_into()
+        .map_err(|_| RomError::new("exact reconstruction requires a 16-byte header"))?;
+    if header[..4] != *b"NES\x1a" {
+        return Err(RomError::new("ROM does not begin with the NES magic bytes"));
+    }
+    let format = if header[7] & 0x0c == 0x08 {
+        Format::Nes2
+    } else {
+        Format::Ines
+    };
+    let declared_prg = decode_size(header[4], header[9] & 0x0f, PRG_UNIT, format)?;
+    let declared_chr = decode_size(header[5], header[9] >> 4, CHR_UNIT, format)?;
+    if declared_prg != parts.prg_rom.len() {
+        return Err(RomError::new(format!(
+            "header declares {declared_prg} PRG-ROM bytes but reconstruction supplies {}",
+            parts.prg_rom.len()
+        )));
+    }
+    if declared_chr != parts.chr_rom.len() {
+        return Err(RomError::new(format!(
+            "header declares {declared_chr} CHR-ROM bytes but reconstruction supplies {}",
+            parts.chr_rom.len()
+        )));
+    }
+    let trainer_expected = header[6] & 0x04 != 0;
+    match (trainer_expected, parts.trainer) {
+        (true, Some(trainer)) if trainer.len() == TRAINER_LEN => {}
+        (true, Some(trainer)) => {
+            return Err(RomError::new(format!(
+                "trainer contains {} bytes instead of {TRAINER_LEN}",
+                trainer.len()
+            )));
+        }
+        (true, None) => return Err(RomError::new("header declares a missing trainer")),
+        (false, Some(_)) => return Err(RomError::new("header does not declare a trainer")),
+        (false, None) => {}
+    }
+    let capacity = HEADER_LEN
+        .checked_add(parts.trainer.map_or(0, <[u8]>::len))
+        .and_then(|size| size.checked_add(parts.prg_rom.len()))
+        .and_then(|size| size.checked_add(parts.chr_rom.len()))
+        .and_then(|size| size.checked_add(parts.trailing.len()))
+        .ok_or_else(|| RomError::new("exact ROM reconstruction size overflows"))?;
+    let mut rebuilt = Vec::with_capacity(capacity);
+    rebuilt.extend_from_slice(header);
+    if let Some(trainer) = parts.trainer {
+        rebuilt.extend_from_slice(trainer);
+    }
+    rebuilt.extend_from_slice(parts.prg_rom);
+    rebuilt.extend_from_slice(parts.chr_rom);
+    rebuilt.extend_from_slice(parts.trailing);
+    let parsed = parse(&rebuilt)?;
+    if parsed.prg_rom != parts.prg_rom || parsed.chr_rom != parts.chr_rom {
+        return Err(RomError::new(
+            "reparsed cartridge regions differ after exact reconstruction",
+        ));
+    }
+    Ok(rebuilt)
 }
 
 fn validate(rom: &Rom) -> Result<(), RomError> {
@@ -424,7 +512,8 @@ impl Mapper {
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuAddress, Format, Mapper, MapperState, Metadata, Mirroring, Region, Rom, build, parse,
+        CpuAddress, ExactImageParts, Format, Mapper, MapperState, Metadata, Mirroring, Region, Rom,
+        build, parse, rebuild_exact,
     };
 
     fn nrom(format: Format, prg_len: usize) -> Rom {
@@ -450,6 +539,37 @@ mod tests {
         let rom = nrom(Format::Nes2, 32 * 1024);
         let bytes = build(&rom).expect("ROM build");
         assert_eq!(parse(&bytes).expect("ROM parse"), rom);
+    }
+
+    #[test]
+    fn exact_rebuild_preserves_reserved_header_and_trailing_bytes() {
+        let cartridge = Rom {
+            metadata: Metadata {
+                format: Format::Ines,
+                mapper: 0,
+                submapper: 0,
+                mirroring: Mirroring::Vertical,
+                battery: true,
+                region: Region::Ntsc,
+                prg_rom_len: 16 * 1024,
+                chr_rom_len: 8 * 1024,
+            },
+            trainer: Some(vec![0x5a; 512]),
+            prg_rom: vec![0xea; 16 * 1024],
+            chr_rom: vec![0x3c; 8 * 1024],
+        };
+        let mut original = build(&cartridge).expect("ROM");
+        original[10] = 0xa5;
+        original.extend_from_slice(&[0xde, 0xad]);
+        let rebuilt = rebuild_exact(ExactImageParts {
+            header: &original[..16],
+            trainer: Some(&original[16..528]),
+            prg_rom: &cartridge.prg_rom,
+            chr_rom: &cartridge.chr_rom,
+            trailing: &original[original.len() - 2..],
+        })
+        .expect("exact rebuild");
+        assert_eq!(rebuilt, original);
     }
 
     #[test]

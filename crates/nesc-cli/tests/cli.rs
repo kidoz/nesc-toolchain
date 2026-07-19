@@ -1,6 +1,7 @@
 use std::fs;
 use std::process::Command;
 
+use nesc_rom::{Format, Metadata, Mirroring, Region, Rom};
 use tempfile::tempdir;
 
 fn nesc() -> Command {
@@ -154,7 +155,7 @@ fn build_and_inspect_generated_project() {
     );
     let disassembled_stdout = String::from_utf8_lossy(&disassembled.stdout);
     assert!(
-        disassembled_stdout.contains("PRG recovery verified"),
+        disassembled_stdout.contains("exact ROM round trip verified"),
         "{disassembled_stdout}"
     );
     for artifact in [
@@ -196,4 +197,68 @@ fn disassemble_rejects_a_malformed_rom() {
         .expect("run nesc disassemble");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("error[E4101]"));
+}
+
+#[test]
+fn round_trips_exact_nrom_container_with_mirrored_code() {
+    let temporary = tempdir().expect("temporary directory");
+    let mut prg = vec![0xff; 16 * 1024];
+    prg[..5].copy_from_slice(&[0xd0, 0x02, 0x02, 0xaa, 0x60]);
+    let vectors = prg.len() - 6;
+    for offset in [0, 2, 4] {
+        prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0x8000_u16.to_le_bytes());
+    }
+    let cartridge = Rom {
+        metadata: Metadata {
+            format: Format::Ines,
+            mapper: 0,
+            submapper: 0,
+            mirroring: Mirroring::Vertical,
+            battery: true,
+            region: Region::Ntsc,
+            prg_rom_len: prg.len(),
+            chr_rom_len: 8 * 1024,
+        },
+        trainer: Some(vec![0x5a; 512]),
+        prg_rom: prg,
+        chr_rom: vec![0x3c; 8 * 1024],
+    };
+    let mut original = nesc_rom::build(&cartridge).expect("ROM");
+    original[10] = 0xa5;
+    original.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    fs::write(temporary.path().join("mirrored.nes"), &original).expect("write ROM");
+
+    let disassembled = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "disassemble",
+            "mirrored.nes",
+            "--output",
+            "recovered",
+            "--round-trip-check",
+        ])
+        .output()
+        .expect("run nesc disassemble");
+    assert!(
+        disassembled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disassembled.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&disassembled.stdout).contains("exact ROM round trip verified")
+    );
+    assert_eq!(
+        fs::read(temporary.path().join("recovered/header.bin")).expect("header"),
+        &original[..16]
+    );
+    assert_eq!(
+        fs::read(temporary.path().join("recovered/trailing.bin")).expect("trailing"),
+        [0xde, 0xad, 0xbe, 0xef]
+    );
+    assert!(temporary.path().join("recovered/trainer.bin").is_file());
+    assert!(temporary.path().join("recovered/chr.bin").is_file());
+    let assembly =
+        fs::read_to_string(temporary.path().join("recovered/prg.asm")).expect("assembly");
+    assert!(assembly.contains("bne *+4"));
+    assert!(assembly.contains(".byte $02, $AA"));
 }

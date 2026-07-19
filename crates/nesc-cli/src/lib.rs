@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use nesc_asm::AssemblyLimits;
 use nesc_compiler::{BuildArtifacts, CompilerConfig, build_project, check_project};
 use nesc_diagnostics::Diagnostic;
 use nesc_disasm::{AnalysisLimits, ByteClassification, Disassembly, disassemble};
+use nesc_linker::{RecoveryLinkInput, relink_nrom};
 use nesc_project::{Project, create_project};
 
 /// Top-level command-line arguments.
@@ -236,9 +238,7 @@ fn disassemble_rom_file(
     let disassembly = disassemble(&bytes, limits)
         .map_err(|error| vec![Diagnostic::error("E4101", error.to_string())])?;
     if round_trip_check {
-        disassembly
-            .verify_recovery()
-            .map_err(|error| vec![Diagnostic::error("E4102", error.to_string())])?;
+        verify_disassembly_round_trip(&bytes, &disassembly)?;
     }
     let destination = output
         .map(Path::to_path_buf)
@@ -255,11 +255,55 @@ fn disassemble_rom_file(
             .filter(|classification| **classification == ByteClassification::Data)
             .count(),
         if round_trip_check {
-            ", PRG recovery verified"
+            ", exact ROM round trip verified"
         } else {
             ""
         }
     ))
+}
+
+fn verify_disassembly_round_trip(
+    original: &[u8],
+    disassembly: &Disassembly,
+) -> Result<(), Vec<Diagnostic>> {
+    let assembly = disassembly.assembly();
+    let rebuilt_prg = nesc_asm::assemble_recovery(
+        &assembly,
+        disassembly.rom.prg_rom.len(),
+        AssemblyLimits::default(),
+    )
+    .map_err(|error| {
+        vec![Diagnostic::error(
+            "E4102",
+            format!("could not assemble recovered PRG-ROM: {error}"),
+        )]
+    })?;
+    let declared_len = 16
+        + disassembly.rom.trainer.as_ref().map_or(0, Vec::len)
+        + disassembly.rom.prg_rom.len()
+        + disassembly.rom.chr_rom.len();
+    let trailing = original.get(declared_len..).ok_or_else(|| {
+        vec![Diagnostic::error(
+            "E4102",
+            "parsed cartridge regions exceed the original ROM file",
+        )]
+    })?;
+    let rebuilt = relink_nrom(RecoveryLinkInput {
+        header: &original[..16],
+        trainer: disassembly.rom.trainer.as_deref(),
+        prg_rom: &rebuilt_prg,
+        chr_rom: &disassembly.rom.chr_rom,
+        trailing,
+    })
+    .map_err(|error| {
+        vec![Diagnostic::error(
+            "E4102",
+            format!("could not relink recovered ROM: {error}"),
+        )]
+    })?;
+    disassembly
+        .verify_rom_rebuild(original, &rebuilt.rom)
+        .map_err(|error| vec![Diagnostic::error("E4102", error.to_string())])
 }
 
 fn default_disassembly_path(path: &Path) -> PathBuf {

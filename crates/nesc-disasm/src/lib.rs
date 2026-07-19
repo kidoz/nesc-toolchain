@@ -192,6 +192,33 @@ impl Disassembly {
         )))
     }
 
+    /// Verifies a rebuilt complete container against the original input.
+    ///
+    /// # Errors
+    ///
+    /// Reports the first differing file offset with its cartridge region and,
+    /// for PRG-ROM, physical bank and mapped CPU address.
+    pub fn verify_rom_rebuild(
+        &self,
+        original: &[u8],
+        rebuilt: &[u8],
+    ) -> Result<(), DisassemblyError> {
+        if original == rebuilt {
+            return Ok(());
+        }
+        let offset = original
+            .iter()
+            .zip(rebuilt)
+            .position(|(original, rebuilt)| original != rebuilt)
+            .unwrap_or_else(|| original.len().min(rebuilt.len()));
+        let expected = format_optional_byte(original.get(offset));
+        let actual = format_optional_byte(rebuilt.get(offset));
+        Err(DisassemblyError::new(format!(
+            "round-trip first differs at file offset ${offset:05X} in {}: expected {expected}, rebuilt {actual}",
+            self.describe_file_offset(offset)
+        )))
+    }
+
     /// Renders deterministic ca65-style assembly with explicit data bytes.
     #[must_use]
     pub fn assembly(&self) -> String {
@@ -231,6 +258,46 @@ impl Disassembly {
     fn prg_file_start(&self) -> usize {
         HEADER_LEN + self.rom.trainer.as_ref().map_or(0, |_| TRAINER_LEN)
     }
+
+    fn describe_file_offset(&self, file_offset: usize) -> String {
+        if file_offset < HEADER_LEN {
+            return "header".to_owned();
+        }
+        let prg_start = self.prg_file_start();
+        if file_offset < prg_start {
+            return format!("trainer offset ${:03X}", file_offset - HEADER_LEN);
+        }
+        let prg_end = prg_start + self.rom.prg_rom.len();
+        if file_offset < prg_end {
+            let prg_offset = file_offset - prg_start;
+            let bank = physical_bank(prg_offset);
+            let bank_offset = prg_offset % PRG_BANK_LEN;
+            let cpu_base = if self.rom.prg_rom.len() == PRG_BANK_LEN {
+                0xc000
+            } else {
+                0x8000
+            };
+            let cpu_address = cpu_base + u16::try_from(prg_offset).unwrap_or(0);
+            return format!(
+                "PRG-ROM physical bank {bank:02X}, bank offset ${bank_offset:04X}, CPU ${cpu_address:04X}"
+            );
+        }
+        let chr_end = prg_end + self.rom.chr_rom.len();
+        if file_offset < chr_end {
+            let chr_offset = file_offset - prg_end;
+            return format!(
+                "CHR-ROM physical bank {:02X}, bank offset ${:04X}, PPU ${:04X}",
+                chr_offset / 0x2000,
+                chr_offset % 0x2000,
+                chr_offset % 0x2000
+            );
+        }
+        format!("trailing data offset ${:05X}", file_offset - chr_end)
+    }
+}
+
+fn format_optional_byte(byte: Option<&u8>) -> String {
+    byte.map_or_else(|| "end of file".to_owned(), |byte| format!("${byte:02X}"))
 }
 
 /// Fatal ROM parsing, mapping, or resource-limit failure.
@@ -574,7 +641,15 @@ fn render_assembly(disassembly: &Disassembly) -> String {
          .setcpu \"6502\"\n\
          .segment \"PRG\"\n",
     );
-    let labels = labels_by_offset(&disassembly.labels);
+    if !disassembly.labels.is_empty() {
+        assembly.push_str("\n; Stable bank-qualified CPU symbols\n");
+        for label in &disassembly.labels {
+            assembly.push_str(&format!(
+                "{} = ${:04X} ; PRG bank {:02X}, offset ${:05X}\n",
+                label.name, label.address.cpu_address, label.address.bank, label.prg_offset
+            ));
+        }
+    }
     let mut offset = 0;
     while offset < disassembly.rom.prg_rom.len() {
         if offset % PRG_BANK_LEN == 0 {
@@ -587,12 +662,6 @@ fn render_assembly(disassembly: &Disassembly) -> String {
                 "\n; Physical PRG bank {:02X}\n.org ${origin:04X}\n",
                 physical_bank(offset)
             ));
-        }
-        if let Some(offset_labels) = labels.get(&offset) {
-            for label in offset_labels {
-                assembly.push_str(&label.name);
-                assembly.push_str(":\n");
-            }
         }
         if let Some(instruction) = disassembly.instructions.get(&offset) {
             assembly.push_str("    ");
@@ -616,7 +685,6 @@ fn render_assembly(disassembly: &Disassembly) -> String {
             && offset < bank_end
             && offset - start < 16
             && !disassembly.instructions.contains_key(&offset)
-            && (offset == start || !labels.contains_key(&offset))
         {
             offset += 1;
         }
@@ -645,14 +713,6 @@ fn render_assembly(disassembly: &Disassembly) -> String {
     assembly
 }
 
-fn labels_by_offset(labels: &[Label]) -> BTreeMap<usize, Vec<&Label>> {
-    let mut by_offset = BTreeMap::<usize, Vec<&Label>>::new();
-    for label in labels {
-        by_offset.entry(label.prg_offset).or_default().push(label);
-    }
-    by_offset
-}
-
 fn render_operand(disassembly: &Disassembly, instruction: &Instruction) -> Option<String> {
     let decoded = instruction.decoded;
     let operand = decoded.operand();
@@ -667,12 +727,12 @@ fn render_operand(disassembly: &Disassembly, instruction: &Instruction) -> Optio
         AddressingMode::ZeroPageX => Some(format!("${byte:02X},x")),
         AddressingMode::ZeroPageY => Some(format!("${byte:02X},y")),
         AddressingMode::Relative => {
-            let next = instruction
-                .address
-                .cpu_address
-                .wrapping_add(u16::from(decoded.opcode.len()));
-            let target = next.wrapping_add_signed(i16::from(byte as i8));
-            Some(target_label(disassembly, target).unwrap_or_else(|| format!("${target:04X}")))
+            let delta = i16::from(decoded.opcode.len()) + i16::from(byte as i8);
+            Some(if delta < 0 {
+                format!("*-{}", -delta)
+            } else {
+                format!("*+{delta}")
+            })
         }
         AddressingMode::Absolute => {
             if matches!(decoded.opcode.flow(), FlowControl::Call | FlowControl::Jump) {
@@ -796,5 +856,19 @@ mod tests {
         rom[6] = 0x20;
         let error = disassemble(&rom, AnalysisLimits::default()).expect_err("Mapper 2");
         assert!(error.message().contains("Mapper 0"));
+    }
+
+    #[test]
+    fn reports_first_complete_rom_mismatch_with_mapping() {
+        let rom = nrom_with_program(&[0x60], 0xc000);
+        let disassembly = disassemble(&rom, AnalysisLimits::default()).expect("disassembly");
+        let mut rebuilt = rom.clone();
+        rebuilt[16 + 0x123] ^= 0xff;
+        let error = disassembly
+            .verify_rom_rebuild(&rom, &rebuilt)
+            .expect_err("mismatch");
+        assert!(error.message().contains("file offset $00133"));
+        assert!(error.message().contains("physical bank 00"));
+        assert!(error.message().contains("CPU $C123"));
     }
 }
