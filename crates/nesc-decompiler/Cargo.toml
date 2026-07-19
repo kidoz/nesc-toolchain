@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+nesc-codegen-6502 = { path = "../nesc-codegen-6502" }
 nesc-disasm = { path = "../nesc-disasm" }
 
 [dev-dependencies]

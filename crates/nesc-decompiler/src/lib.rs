@@ -1,6 +1,13 @@
-//! Provenance-rich 6502 semantic lifting and bank-qualified control flow.
+//! Provenance-rich 6502 semantic lifting, value, ABI, and type recovery.
 
+mod recovery_analysis;
 mod value_analysis;
+
+pub use recovery_analysis::{
+    AbiByte, CallEdge, CallGraphCycle, CallingConvention, FunctionRecovery, PointerFact,
+    RecoveredType, RecoveryAnalysis, RecoveryEvidence, RecoveryEvidenceKind, RecoveryLimits,
+    Signedness, TypeFact, TypeSubject, Volatility, analyze_recovery,
+};
 
 pub use value_analysis::{
     Barrier, BarrierKind, BlockValueState, ComparisonPredicate, Confidence, FunctionSummary,
