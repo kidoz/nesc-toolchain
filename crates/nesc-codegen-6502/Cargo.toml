@@ -7,5 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+nesc-mir = { path = "../nesc-mir" }
+nesc-object = { path = "../nesc-object" }
+
 [lints]
 workspace = true
