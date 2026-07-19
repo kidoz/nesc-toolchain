@@ -1,5 +1,14 @@
 //! Provenance-rich 6502 semantic lifting and bank-qualified control flow.
 
+mod value_analysis;
+
+pub use value_analysis::{
+    Barrier, BarrierKind, BlockValueState, ComparisonPredicate, Confidence, FunctionSummary,
+    FunctionValueAnalysis, MemoryLocation, PhiInput, RecoveredCondition, RecoveredPredicate,
+    StateVariable, UnknownReason, ValueAnalysis, ValueAnalysisLimits, ValueEvidence,
+    ValueEvidenceKind, ValueExpression, ValueId, ValueNode, ValueOperator, analyze_values,
+};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
