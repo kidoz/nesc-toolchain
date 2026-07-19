@@ -141,6 +141,8 @@ fn write_artifacts(
         ("map", artifacts.map.as_bytes()),
         ("sym", artifacts.symbols.as_bytes()),
         ("source-map", artifacts.source_map.as_bytes()),
+        ("zero-page", artifacts.zero_page.as_bytes()),
+        ("stack", artifacts.stack.as_bytes()),
     ] {
         let path = target.join(format!("{name}.{extension}"));
         fs::write(&path, contents).map_err(|error| {

@@ -399,7 +399,7 @@ fn validate_zero_page(document: &ManifestDocument, diagnostics: &mut Vec<Diagnos
         ("reserved", &zero_page.reserved),
     ] {
         for range in ranges {
-            let Some((start, end)) = parse_range(range) else {
+            let Some((start, end)) = parse_zero_page_range(range) else {
                 diagnostics.push(document.field_error(
                     "E0105",
                     format!("invalid zero-page range `{range}`"),
@@ -428,7 +428,9 @@ fn validate_zero_page(document: &ManifestDocument, diagnostics: &mut Vec<Diagnos
     }
 }
 
-fn parse_range(value: &str) -> Option<(u8, u8)> {
+/// Parses an inclusive zero-page range accepted by the manifest format.
+#[must_use]
+pub fn parse_zero_page_range(value: &str) -> Option<(u8, u8)> {
     let (start, end) = value.split_once("..")?;
     let start = parse_u8(start)?;
     let end = parse_u8(end.strip_prefix('=').unwrap_or(end))?;
@@ -473,14 +475,14 @@ fn safe_relative_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, valid_package_name, valid_semver};
+    use super::{parse_zero_page_range, valid_package_name, valid_semver};
 
     #[test]
     fn parses_zero_page_ranges() {
-        assert_eq!(parse_range("0x00..0xEF"), Some((0x00, 0xEF)));
-        assert_eq!(parse_range("16..=31"), Some((16, 31)));
-        assert_eq!(parse_range("0x20..0x10"), None);
-        assert_eq!(parse_range("invalid"), None);
+        assert_eq!(parse_zero_page_range("0x00..0xEF"), Some((0x00, 0xEF)));
+        assert_eq!(parse_zero_page_range("16..=31"), Some((16, 31)));
+        assert_eq!(parse_zero_page_range("0x20..0x10"), None);
+        assert_eq!(parse_zero_page_range("invalid"), None);
     }
 
     #[test]

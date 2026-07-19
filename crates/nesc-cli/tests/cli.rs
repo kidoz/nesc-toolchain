@@ -109,7 +109,15 @@ fn build_and_inspect_generated_project() {
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    for extension in ["nes", "asm", "map", "sym", "source-map"] {
+    for extension in [
+        "nes",
+        "asm",
+        "map",
+        "sym",
+        "source-map",
+        "zero-page",
+        "stack",
+    ] {
         assert!(
             project
                 .join(format!("target/rom-demo.{extension}"))

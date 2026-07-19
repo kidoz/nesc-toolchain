@@ -70,6 +70,10 @@ pub struct BuildArtifacts {
     pub symbols: String,
     /// Source-to-symbol mapping.
     pub source_map: String,
+    /// Zero-page storage placement report.
+    pub zero_page: String,
+    /// Static hardware-stack usage report.
+    pub stack: String,
     /// Resolved global addresses for tooling and boot verification.
     pub symbol_addresses: BTreeMap<String, u16>,
 }
@@ -135,20 +139,22 @@ pub fn build_project(
     config: &CompilerConfig,
 ) -> Result<BuildArtifacts, Vec<Diagnostic>> {
     let checked = check_project(project, config)?;
-    let generated = nesc_codegen_6502::generate(&checked.mir).map_err(|errors| {
-        errors
-            .into_iter()
-            .map(|error| match error.span {
-                Some(span) => checked.hir.sources.error(
-                    "E3000",
-                    error.message,
-                    span,
-                    "cannot select a legal 6502 instruction sequence",
-                ),
-                None => Diagnostic::error("E3000", error.message),
-            })
-            .collect::<Vec<_>>()
-    })?;
+    let backend_config = backend_config(project);
+    let generated = nesc_codegen_6502::generate_with_config(&checked.mir, &backend_config)
+        .map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|error| match error.span {
+                    Some(span) => checked.hir.sources.error(
+                        "E3000",
+                        error.message,
+                        span,
+                        "cannot select a legal 6502 instruction sequence",
+                    ),
+                    None => Diagnostic::error("E3000", error.message),
+                })
+                .collect::<Vec<_>>()
+        })?;
     let runtime = nesc_runtime::build();
     let link_config = linker_config(project)?;
     let linked = nesc_linker::link(
@@ -187,8 +193,32 @@ pub fn build_project(
         map: linked.map,
         symbols,
         source_map,
+        zero_page: generated.zero_page_report,
+        stack: generated.stack_report,
         symbol_addresses: linked.symbols,
     })
+}
+
+fn backend_config(project: &Project) -> nesc_codegen_6502::BackendConfig {
+    let zero_page = &project.manifest().memory.zero_page;
+    let ranges = |values: &[String]| {
+        values
+            .iter()
+            .filter_map(|value| nesc_project::parse_zero_page_range(value))
+            .map(|(start, end)| nesc_codegen_6502::ZeroPageRange { start, end })
+            .collect()
+    };
+    nesc_codegen_6502::BackendConfig {
+        zero_page_available: ranges(&zero_page.available),
+        zero_page_reserved: ranges(&zero_page.reserved),
+        zero_page_strategy: match zero_page.strategy {
+            nesc_project::ZeroPageStrategy::Frequency => {
+                nesc_codegen_6502::ZeroPageStrategy::Frequency
+            }
+            nesc_project::ZeroPageStrategy::Cycles => nesc_codegen_6502::ZeroPageStrategy::Cycles,
+        },
+        stack_limit: project.manifest().compiler.stack_limit,
+    }
 }
 
 fn linker_config(project: &Project) -> Result<nesc_linker::LinkConfig, Vec<Diagnostic>> {
@@ -273,6 +303,8 @@ NES_MAIN int main(void) {
         assert_eq!(rom.metadata.mapper, 0);
         assert!(artifacts.symbols.contains("main"));
         assert!(artifacts.assembly.contains("__nesc_reset:"));
+        assert!(artifacts.zero_page.contains("Zero-page allocation"));
+        assert!(artifacts.stack.contains("Estimated total:"));
         let boot = nesc_emulator::verify_compiler_boot(
             &artifacts.rom,
             &artifacts.symbol_addresses,
@@ -282,5 +314,44 @@ NES_MAIN int main(void) {
         .expect("boot oracle");
         assert_eq!(boot.background_color, 0x21);
         assert!(boot.frames >= 2);
+    }
+
+    #[test]
+    fn executes_wide_nescall_arithmetic() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("wide-call");
+        create_project("wide-call", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+u16 add_words(u16 left, u16 right) {
+    return left + right;
+}
+
+NES_MAIN int main(void) {
+    u16 total = add_words(0x1201, 0x0033);
+    nes_wait_vblank();
+    nes_set_background_color((u8)total);
+    while (true) {
+        nes_wait_frame();
+    }
+}
+"#,
+        )
+        .expect("wide-call source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        assert!(artifacts.assembly.contains("adc $"));
+        assert!(artifacts.assembly.contains("stx $"));
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x34,
+            200_000,
+        )
+        .expect("wide nescall boot oracle");
+        assert_eq!(boot.background_color, 0x34);
     }
 }

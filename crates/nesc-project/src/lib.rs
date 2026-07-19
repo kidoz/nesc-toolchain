@@ -5,7 +5,7 @@ mod scaffold;
 
 pub use manifest::{
     BoundsChecks, Manifest, ManifestDocument, Mirroring, Optimization, Region, RomFormat,
-    SignedOverflow, ZeroPageStrategy, load_manifest,
+    SignedOverflow, ZeroPageStrategy, load_manifest, parse_zero_page_range,
 };
 pub use scaffold::create_project;
 
