@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use nesc_compiler::{CompilerConfig, check_project};
 use nesc_diagnostics::Diagnostic;
 use nesc_project::{Project, create_project};
 
@@ -76,14 +77,16 @@ fn execute(command: Command) -> Result<String, Vec<Diagnostic>> {
                 .map(|created| format!("Created `{}` at {}", name, created.display()))
                 .map_err(|diagnostic| vec![*diagnostic])
         }
-        Command::Check { manifest_path } => Project::load(&manifest_path).map(|project| {
-            format!(
+        Command::Check { manifest_path } => {
+            let project = Project::load(&manifest_path)?;
+            check_project(&project, &CompilerConfig::bundled_sdk())?;
+            Ok(format!(
                 "Checked `{}` v{} ({})",
                 project.manifest().package.name,
                 project.manifest().package.version,
                 project.entry_path().display()
-            )
-        }),
+            ))
+        }
     }
 }
 

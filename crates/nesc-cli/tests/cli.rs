@@ -60,3 +60,30 @@ fn check_rejects_unimplemented_mapper() {
     assert!(!checked.status.success());
     assert!(String::from_utf8_lossy(&checked.stderr).contains("error[E0103]"));
 }
+
+#[test]
+fn check_reports_source_diagnostics() {
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "invalid-source"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+
+    fs::write(
+        temporary.path().join("invalid-source/src/main.c"),
+        "#include <nes.h>\nNES_MAIN int main(void) { u8 color = 300; return 0; }\n",
+    )
+    .expect("write source");
+    let checked = nesc()
+        .current_dir(temporary.path().join("invalid-source"))
+        .arg("check")
+        .output()
+        .expect("run nesc check");
+
+    assert!(!checked.status.success());
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(stderr.contains("error[E1204]"), "{stderr}");
+    assert!(stderr.contains("src/main.c:2:"), "{stderr}");
+}

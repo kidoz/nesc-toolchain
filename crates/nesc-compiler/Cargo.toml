@@ -7,5 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+nesc-diagnostics = { path = "../nesc-diagnostics" }
+nesc-frontend = { path = "../nesc-frontend" }
+nesc-hir = { path = "../nesc-hir" }
+nesc-mir = { path = "../nesc-mir" }
+nesc-opt = { path = "../nesc-opt" }
+nesc-project = { path = "../nesc-project" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

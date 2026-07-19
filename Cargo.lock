@@ -192,6 +192,7 @@ name = "nesc-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "nesc-compiler",
  "nesc-diagnostics",
  "nesc-project",
  "tempfile",
@@ -204,6 +205,15 @@ version = "0.1.0"
 [[package]]
 name = "nesc-compiler"
 version = "0.1.0"
+dependencies = [
+ "nesc-diagnostics",
+ "nesc-frontend",
+ "nesc-hir",
+ "nesc-mir",
+ "nesc-opt",
+ "nesc-project",
+ "tempfile",
+]
 
 [[package]]
 name = "nesc-debug"
@@ -232,10 +242,18 @@ version = "0.1.0"
 [[package]]
 name = "nesc-frontend"
 version = "0.1.0"
+dependencies = [
+ "nesc-diagnostics",
+ "tempfile",
+]
 
 [[package]]
 name = "nesc-hir"
 version = "0.1.0"
+dependencies = [
+ "nesc-frontend",
+ "tempfile",
+]
 
 [[package]]
 name = "nesc-linker"
@@ -244,6 +262,11 @@ version = "0.1.0"
 [[package]]
 name = "nesc-mir"
 version = "0.1.0"
+dependencies = [
+ "nesc-frontend",
+ "nesc-hir",
+ "tempfile",
+]
 
 [[package]]
 name = "nesc-object"
@@ -252,6 +275,9 @@ version = "0.1.0"
 [[package]]
 name = "nesc-opt"
 version = "0.1.0"
+dependencies = [
+ "nesc-mir",
+]
 
 [[package]]
 name = "nesc-project"
