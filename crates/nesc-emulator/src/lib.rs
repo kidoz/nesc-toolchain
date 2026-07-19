@@ -640,4 +640,46 @@ mod tests {
         assert_eq!(machine.ram[0x200], 0x80);
         assert_eq!(machine.ram[0x201], 1);
     }
+
+    #[test]
+    fn executes_codegen_shift_and_immediate_sequences() {
+        let program = [
+            0xa9, 0x81, 0x85, 0x20, 0x06, 0x20, 0x26, 0x20, 0x46, 0x20, 0x38, 0x66, 0x20, 0xa5,
+            0x20, 0x29, 0x0f, 0xc9, 0x01, 0x38, 0xe9, 0x01, 0x85, 0x21,
+        ];
+        let mut prg = vec![0; 32 * 1024];
+        prg[..program.len()].copy_from_slice(&program);
+        let mapper = Mapper::new(0, prg.len(), 0).expect("NROM mapper");
+        let mut machine = Machine::new(prg, mapper);
+        machine.pc = 0x8000;
+
+        for _ in 0..13 {
+            machine.step().expect("supported instruction");
+        }
+
+        assert_eq!(machine.ram[0x20], 0x81);
+        assert_eq!(machine.ram[0x21], 0);
+        assert_ne!(machine.status & 0x02, 0);
+    }
+
+    #[test]
+    fn executes_indexed_indirect_loads_and_stores_with_zero_page_wrap() {
+        let program = [
+            0xa9, 0x10, 0x85, 0xff, 0xa9, 0x02, 0x85, 0x00, 0xa9, 0x5a, 0x8d, 0x11, 0x02, 0xa0,
+            0x01, 0xb1, 0xff, 0xa0, 0x02, 0x91, 0xff,
+        ];
+        let mut prg = vec![0; 32 * 1024];
+        prg[..program.len()].copy_from_slice(&program);
+        let mapper = Mapper::new(0, prg.len(), 0).expect("NROM mapper");
+        let mut machine = Machine::new(prg, mapper);
+        machine.pc = 0x8000;
+
+        for _ in 0..10 {
+            machine.step().expect("supported indirect instruction");
+        }
+
+        assert_eq!(machine.a, 0x5a);
+        assert_eq!(machine.y, 2);
+        assert_eq!(machine.ram[0x212], 0x5a);
+    }
 }

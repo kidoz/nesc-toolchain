@@ -367,4 +367,372 @@ NES_MAIN int main(void) {
         .expect("wide nescall boot oracle");
         assert_eq!(boot.background_color, 0x34);
     }
+
+    #[test]
+    fn executes_runtime_arithmetic_helpers() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("arithmetic");
+        create_project("arithmetic", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+u16 mul16(u16 a, u16 b) { return a * b; }
+u24 mul24(u24 a, u24 b) { return a * b; }
+u32 mul32(u32 a, u32 b) { return a * b; }
+
+u16 udiv16(u16 a, u16 b) { return a / b; }
+u24 udiv24(u24 a, u24 b) { return a / b; }
+u32 udiv32(u32 a, u32 b) { return a / b; }
+u16 urem16(u16 a, u16 b) { return a % b; }
+u24 urem24(u24 a, u24 b) { return a % b; }
+u32 urem32(u32 a, u32 b) { return a % b; }
+
+i16 sdiv16(i16 a, i16 b) { return a / b; }
+i24 sdiv24(i24 a, i24 b) { return a / b; }
+i32 sdiv32(i32 a, i32 b) { return a / b; }
+i16 srem16(i16 a, i16 b) { return a % b; }
+i24 srem24(i24 a, i24 b) { return a % b; }
+i32 srem32(i32 a, i32 b) { return a % b; }
+
+u16 shl16(u16 a, u16 count) { return a << count; }
+u24 shl24(u24 a, u24 count) { return a << count; }
+u32 shl32(u32 a, u32 count) { return a << count; }
+u16 shr16(u16 a, u16 count) { return a >> count; }
+u24 shr24(u24 a, u24 count) { return a >> count; }
+u32 shr32(u32 a, u32 count) { return a >> count; }
+i16 ashr16(i16 a, i16 count) { return a >> count; }
+i24 ashr24(i24 a, i24 count) { return a >> count; }
+i32 ashr32(i32 a, i32 count) { return a >> count; }
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    if (
+        mul16(300u16, 7u16) == 2100u16 &&
+        mul16(0xFFFFu16, 2u16) == 0xFFFEu16 &&
+        mul24(0x010203u24, 17u24) == 0x112233u24 &&
+        mul24(0xFFFFFFu24, 2u24) == 0xFFFFFEu24 &&
+        mul32(0x00010003u32, 257u32) == 0x01010303u32 &&
+        mul32(0xFFFFFFFFu32, 2u32) == 0xFFFFFFFEu32 &&
+        udiv16(300u16, 7u16) == 42u16 && urem16(300u16, 7u16) == 6u16 &&
+        udiv16(7u16, 300u16) == 0u16 && urem16(7u16, 300u16) == 7u16 &&
+        udiv24(0x010203u24, 17u24) == 3885u24 && urem24(0x010203u24, 17u24) == 6u24 &&
+        udiv32(0x00010003u32, 257u32) == 255u32 && urem32(0x00010003u32, 257u32) == 4u32 &&
+        sdiv16(-300i16, 7i16) == -42i16 && srem16(-300i16, 7i16) == -6i16 &&
+        sdiv16(300i16, -7i16) == -42i16 && srem16(300i16, -7i16) == 6i16 &&
+        sdiv16(-300i16, -7i16) == 42i16 && srem16(-300i16, -7i16) == -6i16 &&
+        sdiv24(-50000i24, 300i24) == -166i24 && srem24(-50000i24, 300i24) == -200i24 &&
+        sdiv32(-100000i32, 300i32) == -333i32 && srem32(-100000i32, 300i32) == -100i32 &&
+        shl16(0x1234u16, 20u16) == 0x2340u16 && shr16(0x1234u16, 20u16) == 0x0123u16 &&
+        shl16(0x1234u16, 0x0104u16) == 0x2340u16 &&
+        shl24(0x654321u24, 29u24) == 0xA86420u24 && shr24(0x654321u24, 29u24) == 0x032A19u24 &&
+        shl24(1u24, 0x010000u24) == 0x010000u24 &&
+        shl32(0x80000001u32, 36u32) == 0x00000010u32 && shr32(0x80000001u32, 36u32) == 0x08000000u32 &&
+        shl32(1u32, 0x00000104u32) == 0x00000010u32 &&
+        ashr16(-300i16, 3i16) == -38i16 &&
+        ashr24(-50000i24, 4i24) == -3125i24 &&
+        ashr32(-100000i32, 7i32) == -782i32
+    ) {
+        nes_set_background_color(0x2A);
+    } else {
+        nes_set_background_color(0x16);
+    }
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("arithmetic source");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+        for optimization in ["0", "1", "2", "size", "min-size", "cycles"] {
+            fs::write(
+                &manifest_path,
+                manifest.replace(
+                    "optimization = \"size\"",
+                    &format!("optimization = \"{optimization}\""),
+                ),
+            )
+            .expect("optimization manifest");
+            let project = Project::load(&manifest_path).expect("manifest");
+            let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+            let boot = nesc_emulator::verify_compiler_boot(
+                &artifacts.rom,
+                &artifacts.symbol_addresses,
+                0x2a,
+                500_000,
+            )
+            .unwrap_or_else(|error| panic!("{optimization} arithmetic boot oracle: {error}"));
+            assert_eq!(boot.background_color, 0x2a);
+        }
+    }
+
+    #[test]
+    fn diagnoses_invalid_constant_arithmetic() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("invalid-arithmetic");
+        create_project("invalid-arithmetic", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+u16 invalid(u16 value) {
+    u16 quotient = value / 0u16;
+    return quotient << 16u16;
+}
+
+NES_MAIN int main(void) { return (int)invalid(1u16); }
+"#,
+        )
+        .expect("invalid arithmetic source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+
+        let errors = build_project(&project, &CompilerConfig::bundled_sdk())
+            .expect_err("invalid constant arithmetic");
+        let rendered = errors
+            .iter()
+            .map(nesc_diagnostics::Diagnostic::render)
+            .collect::<String>();
+        assert!(rendered.contains("division or remainder by constant zero"));
+        assert!(rendered.contains("constant shift count must be less than 16"));
+    }
+
+    #[test]
+    fn traps_on_runtime_zero_divisor() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("zero-divisor");
+        create_project("zero-divisor", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+u16 divide(u16 value, u16 divisor) { return value / divisor; }
+
+NES_MAIN int main(void) {
+    u16 result = divide(100u16, 0u16);
+    nes_set_background_color((u8)result);
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("zero-divisor source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+
+        let error = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x64,
+            200_000,
+        )
+        .expect_err("runtime division trap");
+        assert!(error.message.contains("runtime trap"));
+    }
+
+    #[test]
+    fn inlines_power_of_two_arithmetic() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("inline-arithmetic");
+        create_project("inline-arithmetic", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+u16 power_arithmetic(u16 value) {
+    return value * 8u16 + value / 8u16 + value % 8u16 +
+           (value << 3u16) + (value >> 3u16);
+}
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    nes_set_background_color((u8)power_arithmetic(0x1234u16));
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("inline arithmetic source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+
+        for helper in [
+            "jsr __nesc_mul_16",
+            "jsr __nesc_udiv_16",
+            "jsr __nesc_urem_16",
+            "jsr __nesc_shl_16",
+            "jsr __nesc_lshr_16",
+        ] {
+            assert!(!artifacts.assembly.contains(helper), "unexpected {helper}");
+        }
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0xd0,
+            200_000,
+        )
+        .expect("inline arithmetic boot oracle");
+        assert_eq!(boot.background_color, 0xd0);
+    }
+
+    #[test]
+    fn executes_arrays_pointers_and_typed_volatile_bus_accesses() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("pointer-memory");
+        create_project("pointer-memory", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+static u8 values[3];
+
+u8 read_value(u8 index) {
+    return values[index];
+}
+
+NES_MAIN int main(void) {
+    u8 local[2];
+    u8 *pointer = &local[0];
+    ptr<ppu_register, volatile u8> ppu_address =
+        (ptr<ppu_register, volatile u8>)0x2006u16;
+    ptr<ppu_register, volatile u8> ppu_data =
+        (ptr<ppu_register, volatile u8>)0x2007u16;
+
+    values[0] = 0x10;
+    values[1] = 0x20;
+    pointer[0] = values[0];
+    pointer[1] = read_value(1);
+
+    nes_wait_vblank();
+    *ppu_address = 0x3F;
+    *ppu_address = 0x00;
+    *ppu_data = pointer[0] + pointer[1];
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("pointer-memory source");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+
+        for optimization in ["0", "1", "2", "size", "min-size", "cycles"] {
+            fs::write(
+                &manifest_path,
+                manifest.replace(
+                    "optimization = \"size\"",
+                    &format!("optimization = \"{optimization}\""),
+                ),
+            )
+            .expect("optimization manifest");
+            let project = Project::load(&manifest_path).expect("manifest");
+            let artifacts = build_project(&project, &CompilerConfig::bundled_sdk())
+                .unwrap_or_else(|errors| panic!("{optimization} pointer build: {errors:#?}"));
+            assert!(artifacts.assembly.contains("lda ($f0),y"));
+            assert!(artifacts.assembly.contains("sta ($f0),y"));
+            assert!(artifacts.assembly.contains("jmp __nesc_trap"));
+            assert!(!artifacts.assembly.contains(".export __nesc_mul_"));
+            let boot = nesc_emulator::verify_compiler_boot(
+                &artifacts.rom,
+                &artifacts.symbol_addresses,
+                0x30,
+                300_000,
+            )
+            .unwrap_or_else(|error| panic!("{optimization} pointer boot oracle: {error}"));
+            assert_eq!(boot.background_color, 0x30);
+        }
+    }
+
+    #[test]
+    fn applies_manifest_bounds_policy() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("bounds-policy");
+        create_project("bounds-policy", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"static u8 values[2];
+u8 read_value(u8 index) { return values[index]; }
+NES_MAIN int main(void) { return read_value(1); }
+"#,
+        )
+        .expect("bounds source");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+
+        let project = Project::load(&manifest_path).expect("elide manifest");
+        let checked = check_project(&project, &CompilerConfig::bundled_sdk()).expect("elide MIR");
+        assert!(checked.mir.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        nesc_mir::InstructionKind::BoundsCheck { .. }
+                    )
+                })
+            })
+        }));
+
+        fs::write(
+            &manifest_path,
+            manifest.replace(
+                "bounds-checks = \"elide-proven\"",
+                "bounds-checks = \"off\"",
+            ),
+        )
+        .expect("off manifest");
+        let project = Project::load(&manifest_path).expect("off manifest");
+        let checked = check_project(&project, &CompilerConfig::bundled_sdk()).expect("off MIR");
+        assert!(!checked.mir.functions.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        nesc_mir::InstructionKind::BoundsCheck { .. }
+                    )
+                })
+            })
+        }));
+    }
+
+    #[test]
+    fn traps_on_runtime_out_of_bounds_index() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("bounds-trap");
+        create_project("bounds-trap", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"static u8 values[2];
+u8 read_value(u8 index) { return values[index]; }
+NES_MAIN int main(void) { return read_value(2); }
+"#,
+        )
+        .expect("bounds trap source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        let error = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x21,
+            50_000,
+        )
+        .expect_err("bounds trap");
+        assert!(error.message.contains("runtime trap"));
+    }
+
+    #[test]
+    fn rejects_writes_through_rom_pointers() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("rom-write");
+        create_project("rom-write", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"NES_MAIN int main(void) {
+    ptr<prg_rom, u8> data = (ptr<prg_rom, u8>)0x8000u16;
+    *data = 1;
+    return 0;
+}
+"#,
+        )
+        .expect("ROM write source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let errors = check_project(&project, &CompilerConfig::bundled_sdk())
+            .expect_err("ROM write diagnostic");
+        assert!(errors.iter().any(|error| error.code() == "E1344"));
+    }
 }
