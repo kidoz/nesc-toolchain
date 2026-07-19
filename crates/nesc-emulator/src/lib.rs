@@ -192,6 +192,11 @@ impl Machine {
                 self.set_nz(self.x);
                 2
             }
+            0xa0 => {
+                self.y = self.fetch()?;
+                self.set_nz(self.y);
+                2
+            }
             0xa4..=0xa6 => {
                 let address = u16::from(self.fetch()?);
                 let value = self.read(address)?;
@@ -247,6 +252,24 @@ impl Machine {
                 };
                 self.write(address, value)?;
                 3
+            }
+            0xb1 => {
+                let pointer = self.fetch()?;
+                let low = self.read(u16::from(pointer))?;
+                let high = self.read(u16::from(pointer.wrapping_add(1)))?;
+                let base = u16::from_le_bytes([low, high]);
+                let address = base.wrapping_add(u16::from(self.y));
+                self.a = self.read(address)?;
+                self.set_nz(self.a);
+                5 + u64::from((base & 0xff00) != (address & 0xff00))
+            }
+            0x91 => {
+                let pointer = self.fetch()?;
+                let low = self.read(u16::from(pointer))?;
+                let high = self.read(u16::from(pointer.wrapping_add(1)))?;
+                let address = u16::from_le_bytes([low, high]).wrapping_add(u16::from(self.y));
+                self.write(address, self.a)?;
+                6
             }
             0x9a => {
                 self.sp = self.x;

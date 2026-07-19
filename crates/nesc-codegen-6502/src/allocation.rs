@@ -289,6 +289,22 @@ fn access_counts(module: &Module) -> AccessCounts {
                         bump(&mut globals, *global);
                         bump(&mut values, (function.id, *value));
                     }
+                    InstructionKind::AddressOfLocal(local) => {
+                        bump(&mut locals, (function.id, *local));
+                    }
+                    InstructionKind::AddressOfGlobal(global) => bump(&mut globals, *global),
+                    InstructionKind::BoundsCheck { index, .. }
+                    | InstructionKind::LoadIndirect { address: index, .. } => {
+                        bump(&mut values, (function.id, *index));
+                    }
+                    InstructionKind::PointerOffset { base, offset, .. } => {
+                        bump(&mut values, (function.id, *base));
+                        bump(&mut values, (function.id, *offset));
+                    }
+                    InstructionKind::StoreIndirect { address, value, .. } => {
+                        bump(&mut values, (function.id, *address));
+                        bump(&mut values, (function.id, *value));
+                    }
                     InstructionKind::Unary { operand, .. } => {
                         bump(&mut values, (function.id, *operand));
                     }

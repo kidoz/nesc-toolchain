@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use nesc_diagnostics::Diagnostic;
 
 use crate::{
-    BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function, IntegerLiteral,
-    IntegerSuffix, IntegerType, MacroDefinition, Program, SourceMap, SourceSpan, Statement,
-    StorageClass, Type, TypeKind, UnaryOperator, Variable,
+    AddressSpace, BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function,
+    IntegerLiteral, IntegerSuffix, IntegerType, MacroDefinition, Program, SourceMap, SourceSpan,
+    Statement, StorageClass, Type, TypeKind, UnaryOperator, Variable,
 };
 
 /// Kind of a resolved global symbol.
@@ -620,6 +620,19 @@ impl FunctionChecker<'_, '_> {
                         "const object is not writable",
                     );
                 }
+                if target_type.as_ref().is_some_and(|ty| {
+                    matches!(
+                        ty.address_space,
+                        AddressSpace::PrgRom | AddressSpace::ChrRom
+                    )
+                }) {
+                    self.error(
+                        "E1344",
+                        "cannot write through a read-only ROM address space",
+                        target.span,
+                        "ROM storage is not writable",
+                    );
+                }
                 if *operator != BinaryOperator::Assign {
                     self.binary_type(
                         *operator,
@@ -839,6 +852,15 @@ impl FunctionChecker<'_, '_> {
             return Some(left_type);
         }
         if comparison && left_type.pointer_depth > 0 && right_type.pointer_depth > 0 {
+            if left_type.address_space != right_type.address_space {
+                self.error(
+                    "E1345",
+                    "pointer comparison requires matching address spaces",
+                    left.span.through(right.span),
+                    "cast explicitly to a common pointer type",
+                );
+                return None;
+            }
             return Some(Type::scalar(TypeKind::Bool));
         }
         self.error(
@@ -938,6 +960,7 @@ impl FunctionChecker<'_, '_> {
         if actual.pointer_depth == expected.pointer_depth
             && actual.pointer_depth > 0
             && actual.kind == expected.kind
+            && actual.address_space == expected.address_space
         {
             return;
         }
@@ -1102,7 +1125,24 @@ fn type_name(ty: &Type) -> String {
         TypeKind::Integer(IntegerType::Tile) => "tile",
         TypeKind::Integer(IntegerType::Palette) => "palette",
     };
-    format!("{base}{}", "*".repeat(ty.pointer_depth.into()))
+    if ty.pointer_depth > 0 && ty.address_space != AddressSpace::Unknown {
+        let address_space = match ty.address_space {
+            AddressSpace::Unknown => unreachable!("handled by the outer condition"),
+            AddressSpace::ZeroPage => "zero_page",
+            AddressSpace::InternalRam => "internal_ram",
+            AddressSpace::PpuRegister => "ppu_register",
+            AddressSpace::ApuRegister => "apu_register",
+            AddressSpace::IoRegister => "io_register",
+            AddressSpace::PrgRom => "prg_rom",
+            AddressSpace::PrgRam => "prg_ram",
+            AddressSpace::ChrRom => "chr_rom",
+            AddressSpace::ChrRam => "chr_ram",
+            AddressSpace::MapperRegister => "mapper_register",
+        };
+        format!("ptr<{address_space}, {base}>")
+    } else {
+        format!("{base}{}", "*".repeat(ty.pointer_depth.into()))
+    }
 }
 
 fn find_cycle(

@@ -115,6 +115,8 @@ pub struct Type {
     pub is_volatile: bool,
     /// Number of ordinary `unknown`-address-space pointers.
     pub pointer_depth: u8,
+    /// Address space used by the outermost pointer.
+    pub address_space: AddressSpace,
     /// Fixed array lengths from outermost to innermost.
     pub array_lengths: Vec<u32>,
 }
@@ -128,6 +130,7 @@ impl Type {
             is_const: false,
             is_volatile: false,
             pointer_depth: 0,
+            address_space: AddressSpace::Unknown,
             array_lengths: Vec::new(),
         }
     }
@@ -150,6 +153,33 @@ impl Type {
             TypeKind::Void => None,
         }
     }
+}
+
+/// NES CPU-bus address-space classification carried by pointer types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressSpace {
+    /// Pointer may alias any CPU-bus address.
+    Unknown,
+    /// Zero page.
+    ZeroPage,
+    /// Internal CPU RAM.
+    InternalRam,
+    /// PPU register window.
+    PpuRegister,
+    /// APU register window.
+    ApuRegister,
+    /// General I/O register window.
+    IoRegister,
+    /// Program ROM.
+    PrgRom,
+    /// Program RAM.
+    PrgRam,
+    /// Character ROM.
+    ChrRom,
+    /// Character RAM.
+    ChrRam,
+    /// Cartridge mapper registers.
+    MapperRegister,
 }
 
 /// Base type category.

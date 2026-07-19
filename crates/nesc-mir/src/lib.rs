@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub use nesc_hir::{
-    BinaryOperator, FunctionId, GlobalId, IntegerType, SourceId, SourceSpan, Type, TypeKind,
-    UnaryOperator,
+    AddressSpace, BinaryOperator, FunctionId, GlobalId, IntegerType, SourceId, SourceSpan, Type,
+    TypeKind, UnaryOperator,
 };
 use nesc_hir::{Expression, ExpressionKind, Module as HirModule, Statement};
 
@@ -128,6 +128,48 @@ pub enum InstructionKind {
         /// Stored value.
         value: ValueId,
     },
+    /// Address of a function-local object.
+    AddressOfLocal(LocalId),
+    /// Address of a global object.
+    AddressOfGlobal(GlobalId),
+    /// Checked fixed-array index before address calculation.
+    BoundsCheck {
+        /// Runtime index value.
+        index: ValueId,
+        /// Exclusive element count.
+        length: u32,
+    },
+    /// Adds a byte offset to a 16-bit pointer.
+    PointerOffset {
+        /// Base pointer.
+        base: ValueId,
+        /// Unsigned byte offset.
+        offset: ValueId,
+        /// Whether to subtract instead of add.
+        subtract: bool,
+    },
+    /// CPU-bus load through a pointer.
+    LoadIndirect {
+        /// Effective CPU address.
+        address: ValueId,
+        /// Pointer address space.
+        address_space: AddressSpace,
+        /// Whether this access is observable.
+        volatile: bool,
+    },
+    /// CPU-bus store through a pointer.
+    StoreIndirect {
+        /// Effective CPU address.
+        address: ValueId,
+        /// Stored scalar value.
+        value: ValueId,
+        /// Destination object type.
+        ty: Type,
+        /// Pointer address space.
+        address_space: AddressSpace,
+        /// Whether this access is observable.
+        volatile: bool,
+    },
     /// Prefix arithmetic or logical operation.
     Unary {
         /// Operation.
@@ -200,6 +242,32 @@ pub struct VerificationError {
     pub message: String,
 }
 
+/// Fixed-array bounds-check lowering policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundsChecks {
+    /// Emit no runtime checks.
+    Off,
+    /// Retain every fixed-array check.
+    Trap,
+    /// Remove only checks proven in range.
+    ElideProven,
+}
+
+/// MIR construction settings supplied by the project manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoweringConfig {
+    /// Fixed-array bounds behavior.
+    pub bounds_checks: BoundsChecks,
+}
+
+impl Default for LoweringConfig {
+    fn default() -> Self {
+        Self {
+            bounds_checks: BoundsChecks::ElideProven,
+        }
+    }
+}
+
 impl fmt::Display for VerificationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "function {:?}", self.function)?;
@@ -217,6 +285,18 @@ impl fmt::Display for VerificationError {
 /// Returns source-backed failures for constructs not representable by the
 /// current MIR contract.
 pub fn lower(hir: &HirModule) -> Result<Module, Vec<LoweringError>> {
+    lower_with_config(hir, LoweringConfig::default())
+}
+
+/// Lowers structured HIR with explicit semantic policies.
+///
+/// # Errors
+///
+/// Returns source-backed failures for constructs not representable by MIR.
+pub fn lower_with_config(
+    hir: &HirModule,
+    config: LoweringConfig,
+) -> Result<Module, Vec<LoweringError>> {
     let globals = hir
         .globals
         .iter()
@@ -252,7 +332,7 @@ pub fn lower(hir: &HirModule) -> Result<Module, Vec<LoweringError>> {
             });
             continue;
         };
-        let mut builder = Builder::new(hir, function);
+        let mut builder = Builder::new(hir, function, config);
         builder.lower_block(body, false);
         builder.finish();
         errors.append(&mut builder.errors);
@@ -289,10 +369,11 @@ struct Builder<'a> {
     scopes: Vec<HashMap<String, LocalId>>,
     loops: Vec<(BlockId, BlockId)>,
     errors: Vec<LoweringError>,
+    config: LoweringConfig,
 }
 
 impl<'a> Builder<'a> {
-    fn new(hir: &'a HirModule, source: &nesc_hir::Function) -> Self {
+    fn new(hir: &'a HirModule, source: &nesc_hir::Function, config: LoweringConfig) -> Self {
         let entry = BlockId(0);
         let mut builder = Self {
             hir,
@@ -314,6 +395,7 @@ impl<'a> Builder<'a> {
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
             errors: Vec::new(),
+            config,
         };
         for (index, parameter) in source.parameters.iter().enumerate() {
             let name = parameter
@@ -365,7 +447,11 @@ impl<'a> Builder<'a> {
                     self.emit(
                         None,
                         InstructionKind::StoreLocal { local, value },
-                        Effect::Write,
+                        if variable.ty.is_volatile {
+                            Effect::Volatile
+                        } else {
+                            Effect::Write
+                        },
                         variable.span,
                     );
                 }
@@ -551,6 +637,27 @@ impl<'a> Builder<'a> {
                 ) {
                     return self.lower_update(*operator, operand, false, expression.span, ty);
                 }
+                if *operator == UnaryOperator::AddressOf {
+                    return self.lower_address(operand);
+                }
+                if *operator == UnaryOperator::Dereference {
+                    let pointer_type = operand.ty.clone()?;
+                    let address = self.lower_expression(operand)?;
+                    return Some(self.value_instruction(
+                        InstructionKind::LoadIndirect {
+                            address,
+                            address_space: pointer_type.address_space,
+                            volatile: ty.is_volatile,
+                        },
+                        if ty.is_volatile {
+                            Effect::Volatile
+                        } else {
+                            Effect::Read
+                        },
+                        expression.span,
+                        ty,
+                    ));
+                }
                 let operand = self.lower_expression(operand)?;
                 Some(self.value_instruction(
                     InstructionKind::Unary {
@@ -567,8 +674,38 @@ impl<'a> Builder<'a> {
                 left,
                 right,
             } => {
+                if matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
+                    && left.ty.as_ref().is_some_and(|ty| ty.pointer_depth > 0)
+                {
+                    let pointer_type = left.ty.clone()?;
+                    let base = self.lower_expression(left)?;
+                    let offset =
+                        self.lower_scaled_offset(right, pointee_size(&pointer_type), right.span)?;
+                    return Some(self.value_instruction(
+                        InstructionKind::PointerOffset {
+                            base,
+                            offset,
+                            subtract: *operator == BinaryOperator::Subtract,
+                        },
+                        Effect::Pure,
+                        expression.span,
+                        ty,
+                    ));
+                }
+                let left_type = left.ty.clone()?;
+                let right_type = right.ty.clone()?;
+                let left_span = left.span;
+                let right_span = right.span;
                 let left = self.lower_expression(left)?;
                 let right = self.lower_expression(right)?;
+                let (left, right) = if ty.kind != TypeKind::Bool && ty.pointer_depth == 0 {
+                    (
+                        self.cast_if_needed(left, &left_type, &ty, left_span),
+                        self.cast_if_needed(right, &right_type, &ty, right_span),
+                    )
+                } else {
+                    (left, right)
+                };
                 Some(self.value_instruction(
                     InstructionKind::Binary {
                         operator: *operator,
@@ -635,9 +772,24 @@ impl<'a> Builder<'a> {
             ExpressionKind::Postfix { operator, operand } => {
                 self.lower_update(*operator, operand, true, expression.span, ty)
             }
-            ExpressionKind::String(_)
-            | ExpressionKind::Index { .. }
-            | ExpressionKind::Field { .. } => {
+            ExpressionKind::Index { .. } => {
+                let (address, address_space) = self.lower_address_with_space(expression)?;
+                Some(self.value_instruction(
+                    InstructionKind::LoadIndirect {
+                        address,
+                        address_space,
+                        volatile: ty.is_volatile,
+                    },
+                    if ty.is_volatile {
+                        Effect::Volatile
+                    } else {
+                        Effect::Read
+                    },
+                    expression.span,
+                    ty,
+                ))
+            }
+            ExpressionKind::String(_) | ExpressionKind::Field { .. } => {
                 self.unsupported(
                     "expression lowering is not available for this construct",
                     expression.span,
@@ -655,15 +807,107 @@ impl<'a> Builder<'a> {
         span: SourceSpan,
         ty: Type,
     ) -> Option<ValueId> {
-        let ExpressionKind::Name(name) = &target.kind else {
-            self.unsupported("only named assignment targets are lowered", target.span);
-            return None;
-        };
+        match &target.kind {
+            ExpressionKind::Name(name) => {
+                let right = self.lower_expression(value)?;
+                let stored = if operator == BinaryOperator::Assign {
+                    right
+                } else if ty.pointer_depth > 0
+                    && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
+                {
+                    let offset =
+                        self.scale_value(right, value.ty.as_ref()?, pointee_size(&ty), value.span);
+                    let left = self.load_name(name, target.span, ty.clone())?;
+                    self.value_instruction(
+                        InstructionKind::PointerOffset {
+                            base: left,
+                            offset,
+                            subtract: operator == BinaryOperator::Subtract,
+                        },
+                        Effect::Pure,
+                        span,
+                        ty,
+                    )
+                } else {
+                    let left = self.load_name(name, target.span, ty.clone())?;
+                    self.value_instruction(
+                        InstructionKind::Binary {
+                            operator,
+                            left,
+                            right,
+                        },
+                        Effect::Pure,
+                        span,
+                        ty,
+                    )
+                };
+                self.store_name(name, stored, span);
+                Some(stored)
+            }
+            ExpressionKind::Unary {
+                operator: UnaryOperator::Dereference,
+                operand,
+            } => {
+                let pointer_type = operand.ty.clone()?;
+                let address = self.lower_expression(operand)?;
+                self.lower_indirect_assignment(
+                    operator,
+                    address,
+                    pointer_type.address_space,
+                    target,
+                    value,
+                    span,
+                    ty,
+                )
+            }
+            ExpressionKind::Index { .. } => {
+                let (address, address_space) = self.lower_address_with_space(target)?;
+                self.lower_indirect_assignment(
+                    operator,
+                    address,
+                    address_space,
+                    target,
+                    value,
+                    span,
+                    ty,
+                )
+            }
+            _ => {
+                self.unsupported("assignment target has no lowered address", target.span);
+                None
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_indirect_assignment(
+        &mut self,
+        operator: BinaryOperator,
+        address: ValueId,
+        address_space: AddressSpace,
+        target: &Expression,
+        value: &Expression,
+        span: SourceSpan,
+        ty: Type,
+    ) -> Option<ValueId> {
         let right = self.lower_expression(value)?;
         let stored = if operator == BinaryOperator::Assign {
             right
         } else {
-            let left = self.load_name(name, target.span, ty.clone())?;
+            let left = self.value_instruction(
+                InstructionKind::LoadIndirect {
+                    address,
+                    address_space,
+                    volatile: ty.is_volatile,
+                },
+                if ty.is_volatile {
+                    Effect::Volatile
+                } else {
+                    Effect::Read
+                },
+                target.span,
+                ty.clone(),
+            );
             self.value_instruction(
                 InstructionKind::Binary {
                     operator,
@@ -672,11 +916,208 @@ impl<'a> Builder<'a> {
                 },
                 Effect::Pure,
                 span,
-                ty,
+                ty.clone(),
             )
         };
-        self.store_name(name, stored, span);
+        self.emit(
+            None,
+            InstructionKind::StoreIndirect {
+                address,
+                value: stored,
+                ty: ty.clone(),
+                address_space,
+                volatile: ty.is_volatile,
+            },
+            if ty.is_volatile {
+                Effect::Volatile
+            } else {
+                Effect::Write
+            },
+            span,
+        );
         Some(stored)
+    }
+
+    fn lower_address(&mut self, expression: &Expression) -> Option<ValueId> {
+        self.lower_address_with_space(expression)
+            .map(|(address, _)| address)
+    }
+
+    fn lower_address_with_space(
+        &mut self,
+        expression: &Expression,
+    ) -> Option<(ValueId, AddressSpace)> {
+        match &expression.kind {
+            ExpressionKind::Name(name) => {
+                let mut pointer_type = expression.ty.clone()?;
+                pointer_type.pointer_depth = pointer_type.pointer_depth.saturating_add(1);
+                pointer_type.array_lengths.clear();
+                if let Some(local) = self.local(name) {
+                    let value = self.value_instruction(
+                        InstructionKind::AddressOfLocal(local),
+                        Effect::Pure,
+                        expression.span,
+                        pointer_type,
+                    );
+                    return Some((value, AddressSpace::InternalRam));
+                }
+                if let Some(global) = self.hir.global_names.get(name).copied() {
+                    let value = self.value_instruction(
+                        InstructionKind::AddressOfGlobal(global),
+                        Effect::Pure,
+                        expression.span,
+                        pointer_type,
+                    );
+                    return Some((value, AddressSpace::InternalRam));
+                }
+                self.unsupported(
+                    format!("resolved name `{name}` has no address"),
+                    expression.span,
+                );
+                None
+            }
+            ExpressionKind::Unary {
+                operator: UnaryOperator::Dereference,
+                operand,
+            } => {
+                let pointer_type = operand.ty.clone()?;
+                self.lower_expression(operand)
+                    .map(|address| (address, pointer_type.address_space))
+            }
+            ExpressionKind::Index { base, index } => {
+                let base_type = base.ty.clone()?;
+                let (base_address, address_space) = if base_type.array_lengths.is_empty() {
+                    (self.lower_expression(base)?, base_type.address_space)
+                } else {
+                    self.lower_address_with_space(base)?
+                };
+                let index_value = self.lower_expression(index)?;
+                if let Some(length) = base_type.array_lengths.first().copied()
+                    && self.should_check_bounds(index, length)
+                {
+                    self.emit(
+                        None,
+                        InstructionKind::BoundsCheck {
+                            index: index_value,
+                            length,
+                        },
+                        Effect::Trap,
+                        index.span,
+                    );
+                }
+                let element_type = expression.ty.clone()?;
+                let offset = self.scale_value(
+                    index_value,
+                    &element_type,
+                    type_size(&element_type),
+                    index.span,
+                );
+                let mut pointer_type = element_type;
+                pointer_type.pointer_depth = pointer_type.pointer_depth.saturating_add(1);
+                pointer_type.array_lengths.clear();
+                pointer_type.address_space = address_space;
+                let address = self.value_instruction(
+                    InstructionKind::PointerOffset {
+                        base: base_address,
+                        offset,
+                        subtract: false,
+                    },
+                    Effect::Pure,
+                    expression.span,
+                    pointer_type,
+                );
+                Some((address, address_space))
+            }
+            _ => {
+                self.unsupported("expression has no address", expression.span);
+                None
+            }
+        }
+    }
+
+    fn lower_scaled_offset(
+        &mut self,
+        expression: &Expression,
+        scale: u16,
+        span: SourceSpan,
+    ) -> Option<ValueId> {
+        let value = self.lower_expression(expression)?;
+        Some(self.scale_value(value, expression.ty.as_ref()?, scale, span))
+    }
+
+    fn cast_if_needed(
+        &mut self,
+        value: ValueId,
+        source: &Type,
+        target: &Type,
+        span: SourceSpan,
+    ) -> ValueId {
+        if source == target {
+            value
+        } else {
+            self.value_instruction(
+                InstructionKind::Cast {
+                    value,
+                    target: target.clone(),
+                },
+                Effect::Pure,
+                span,
+                target.clone(),
+            )
+        }
+    }
+
+    fn scale_value(
+        &mut self,
+        value: ValueId,
+        source_type: &Type,
+        scale: u16,
+        span: SourceSpan,
+    ) -> ValueId {
+        let address_type = Type::scalar(TypeKind::Integer(IntegerType::U16));
+        let widened = if source_type == &address_type {
+            value
+        } else {
+            self.value_instruction(
+                InstructionKind::Cast {
+                    value,
+                    target: address_type.clone(),
+                },
+                Effect::Pure,
+                span,
+                address_type.clone(),
+            )
+        };
+        if scale <= 1 {
+            return widened;
+        }
+        let factor = self.value_instruction(
+            InstructionKind::Constant(u64::from(scale)),
+            Effect::Pure,
+            span,
+            address_type.clone(),
+        );
+        self.value_instruction(
+            InstructionKind::Binary {
+                operator: BinaryOperator::Multiply,
+                left: widened,
+                right: factor,
+            },
+            Effect::Pure,
+            span,
+            address_type,
+        )
+    }
+
+    fn should_check_bounds(&self, index: &Expression, length: u32) -> bool {
+        match self.config.bounds_checks {
+            BoundsChecks::Off => false,
+            BoundsChecks::Trap => true,
+            BoundsChecks::ElideProven => !matches!(
+                index.kind,
+                ExpressionKind::Integer(ref literal) if literal.value < u64::from(length)
+            ),
+        }
     }
 
     fn lower_update(
@@ -692,6 +1133,27 @@ impl<'a> Builder<'a> {
             return None;
         };
         let old = self.load_name(name, operand.span, ty.clone())?;
+        if ty.pointer_depth > 0 {
+            let offset_type = Type::scalar(TypeKind::Integer(IntegerType::U16));
+            let offset = self.value_instruction(
+                InstructionKind::Constant(u64::from(pointee_size(&ty))),
+                Effect::Pure,
+                span,
+                offset_type,
+            );
+            let new = self.value_instruction(
+                InstructionKind::PointerOffset {
+                    base: old,
+                    offset,
+                    subtract: operator == UnaryOperator::Decrement,
+                },
+                Effect::Pure,
+                span,
+                ty,
+            );
+            self.store_name(name, new, span);
+            return Some(if postfix { old } else { new });
+        }
         let one =
             self.value_instruction(InstructionKind::Constant(1), Effect::Pure, span, ty.clone());
         let operation = if operator == UnaryOperator::Increment {
@@ -714,10 +1176,15 @@ impl<'a> Builder<'a> {
     }
 
     fn load_name(&mut self, name: &str, span: SourceSpan, ty: Type) -> Option<ValueId> {
+        let effect = if ty.is_volatile {
+            Effect::Volatile
+        } else {
+            Effect::Read
+        };
         if let Some(local) = self.local(name) {
             return Some(self.value_instruction(
                 InstructionKind::LoadLocal(local),
-                Effect::Read,
+                effect,
                 span,
                 ty,
             ));
@@ -725,7 +1192,7 @@ impl<'a> Builder<'a> {
         if let Some(global) = self.hir.global_names.get(name).copied() {
             return Some(self.value_instruction(
                 InstructionKind::LoadGlobal(global),
-                Effect::Read,
+                effect,
                 span,
                 ty,
             ));
@@ -744,17 +1211,27 @@ impl<'a> Builder<'a> {
 
     fn store_name(&mut self, name: &str, value: ValueId, span: SourceSpan) {
         if let Some(local) = self.local(name) {
+            let effect = if self.function.locals[local.0 as usize].ty.is_volatile {
+                Effect::Volatile
+            } else {
+                Effect::Write
+            };
             self.emit(
                 None,
                 InstructionKind::StoreLocal { local, value },
-                Effect::Write,
+                effect,
                 span,
             );
         } else if let Some(global) = self.hir.global_names.get(name).copied() {
+            let effect = if self.hir.globals[global.0 as usize].variable.ty.is_volatile {
+                Effect::Volatile
+            } else {
+                Effect::Write
+            };
             self.emit(
                 None,
                 InstructionKind::StoreGlobal { global, value },
-                Effect::Write,
+                effect,
                 span,
             );
         } else {
@@ -840,6 +1317,23 @@ impl<'a> Builder<'a> {
             span,
         });
     }
+}
+
+fn type_size(ty: &Type) -> u16 {
+    let element_size = if ty.pointer_depth > 0 {
+        2
+    } else {
+        u16::from(ty.integer_width().unwrap_or(0).div_ceil(8).max(1))
+    };
+    ty.array_lengths.iter().fold(element_size, |size, length| {
+        size.saturating_mul(u16::try_from(*length).unwrap_or(u16::MAX))
+    })
+}
+
+fn pointee_size(pointer: &Type) -> u16 {
+    let mut pointee = pointer.clone();
+    pointee.pointer_depth = pointee.pointer_depth.saturating_sub(1);
+    type_size(&pointee)
 }
 
 fn verify_function(module: &Module, function: &Function, errors: &mut Vec<VerificationError>) {
@@ -986,6 +1480,36 @@ fn verify_instruction(
             }
             operands.push(*value);
         }
+        InstructionKind::AddressOfLocal(local) => {
+            if local.0 as usize >= function.locals.len() {
+                verification_error(
+                    errors,
+                    function.id,
+                    Some(block),
+                    "local address is out of range",
+                );
+            }
+        }
+        InstructionKind::AddressOfGlobal(global) => {
+            if global.0 as usize >= module.globals.len() {
+                verification_error(
+                    errors,
+                    function.id,
+                    Some(block),
+                    "global address is out of range",
+                );
+            }
+        }
+        InstructionKind::BoundsCheck { index, .. } => operands.push(*index),
+        InstructionKind::PointerOffset { base, offset, .. } => {
+            operands.push(*base);
+            operands.push(*offset);
+        }
+        InstructionKind::LoadIndirect { address, .. } => operands.push(*address),
+        InstructionKind::StoreIndirect { address, value, .. } => {
+            operands.push(*address);
+            operands.push(*value);
+        }
         InstructionKind::Unary { operand, .. } => operands.push(*operand),
         InstructionKind::Binary { left, right, .. } => {
             operands.push(*left);
@@ -1016,7 +1540,10 @@ fn verify_instruction(
     }
     let produces_value = !matches!(
         instruction.kind,
-        InstructionKind::StoreLocal { .. } | InstructionKind::StoreGlobal { .. }
+        InstructionKind::StoreLocal { .. }
+            | InstructionKind::StoreGlobal { .. }
+            | InstructionKind::StoreIndirect { .. }
+            | InstructionKind::BoundsCheck { .. }
     );
     if produces_value
         && instruction.result.is_none()
@@ -1092,7 +1619,7 @@ mod tests {
 
     use nesc_frontend::{FrontendConfig, check};
 
-    use super::{Terminator, lower, verify};
+    use super::{InstructionKind, Terminator, lower, verify};
 
     #[test]
     fn lowers_control_flow_and_passes_verifier() {
@@ -1126,5 +1653,45 @@ mod tests {
                 .any(|error| error.message == "block has no terminator")
         );
         mir.functions[0].blocks[0].terminator = Some(Terminator::Unreachable);
+    }
+
+    #[test]
+    fn lowers_fixed_array_addresses_bounds_and_indirect_accesses() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("main.c");
+        fs::write(
+            &source,
+            "NES_MAIN int main(void) { u8 values[2]; u8 i = 1; values[i] = 3; return values[i]; }",
+        )
+        .expect("source");
+        let checked = check(&FrontendConfig::new(source)).expect("frontend");
+        let hir = nesc_hir::lower(checked);
+        let mir = lower(&hir).expect("MIR lowering");
+        verify(&mir).expect("valid MIR");
+        let instructions = mir.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        assert!(
+            instructions.iter().any(|instruction| {
+                matches!(instruction.kind, InstructionKind::AddressOfLocal(_))
+            })
+        );
+        assert!(instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                InstructionKind::BoundsCheck { length: 2, .. }
+            )
+        }));
+        assert!(instructions.iter().any(|instruction| {
+            matches!(instruction.kind, InstructionKind::PointerOffset { .. })
+        }));
+        assert!(instructions.iter().any(|instruction| {
+            matches!(instruction.kind, InstructionKind::LoadIndirect { .. })
+        }));
+        assert!(instructions.iter().any(|instruction| {
+            matches!(instruction.kind, InstructionKind::StoreIndirect { .. })
+        }));
     }
 }

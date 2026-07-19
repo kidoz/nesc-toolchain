@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use nesc_diagnostics::Diagnostic;
 use nesc_frontend::{CheckedProgram, FrontendConfig};
-use nesc_project::{Mirroring, Optimization, Project, Region, RomFormat};
+use nesc_project::{BoundsChecks, Mirroring, Optimization, Project, Region, RomFormat};
 
 /// Compiler settings that are independent of a project manifest.
 #[derive(Clone, Debug)]
@@ -96,19 +96,25 @@ pub fn check_project(
         .push(config.sdk_include_directory.clone());
     let frontend = nesc_frontend::check(&frontend)?;
     let hir = nesc_hir::lower(frontend.clone());
-    let mut mir = nesc_mir::lower(&hir).map_err(|errors| {
-        errors
-            .into_iter()
-            .map(|error| {
-                hir.sources.error(
-                    "E2000",
-                    error.message,
-                    error.span,
-                    "could not lower this expression to MIR",
-                )
-            })
-            .collect::<Vec<_>>()
-    })?;
+    let bounds_checks = match project.manifest().compiler.bounds_checks {
+        BoundsChecks::Off => nesc_mir::BoundsChecks::Off,
+        BoundsChecks::Trap => nesc_mir::BoundsChecks::Trap,
+        BoundsChecks::ElideProven => nesc_mir::BoundsChecks::ElideProven,
+    };
+    let mut mir = nesc_mir::lower_with_config(&hir, nesc_mir::LoweringConfig { bounds_checks })
+        .map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|error| {
+                    hir.sources.error(
+                        "E2000",
+                        error.message,
+                        error.span,
+                        "could not lower this expression to MIR",
+                    )
+                })
+                .collect::<Vec<_>>()
+        })?;
     let optimization = if project.manifest().compiler.optimization == Optimization::O0 {
         nesc_opt::OptimizationReport::default()
     } else {

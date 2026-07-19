@@ -257,6 +257,38 @@ impl Emitter {
                     self.global_location(*global),
                 );
             }
+            InstructionKind::AddressOfLocal(local) => {
+                if let Some(result) = instruction.result {
+                    self.write_constant(
+                        self.value_location(function, result),
+                        u64::from(self.local_location(function, *local).address),
+                    );
+                }
+            }
+            InstructionKind::AddressOfGlobal(global) => {
+                if let Some(result) = instruction.result {
+                    self.write_constant(
+                        self.value_location(function, result),
+                        u64::from(self.global_location(*global).address),
+                    );
+                }
+            }
+            InstructionKind::BoundsCheck { index, length } => {
+                self.bounds_check(function, *index, *length);
+            }
+            InstructionKind::PointerOffset {
+                base,
+                offset,
+                subtract,
+            } => self.pointer_offset(function, instruction, *base, *offset, *subtract),
+            InstructionKind::LoadIndirect { address, .. } => {
+                self.load_indirect(function, instruction, *address);
+            }
+            InstructionKind::StoreIndirect {
+                address, value, ty, ..
+            } => {
+                self.store_indirect(function, *address, *value, ty);
+            }
             InstructionKind::Unary { operator, operand } => {
                 self.unary(function, instruction, *operator, *operand);
             }
@@ -273,6 +305,116 @@ impl Emitter {
                 self.call(function, instruction, *callee, arguments);
             }
         }
+    }
+
+    fn pointer_offset(
+        &mut self,
+        function: &Function,
+        instruction: &Instruction,
+        base: ValueId,
+        offset: ValueId,
+        subtract: bool,
+    ) {
+        let Some(result) = instruction.result else {
+            return;
+        };
+        let base = self.value_location(function, base);
+        let offset = self.value_location(function, offset);
+        let destination = self.value_location(function, result);
+        self.emit_byte(
+            if subtract { 0x38 } else { 0x18 },
+            if subtract { "sec" } else { "clc" },
+        );
+        for byte in 0..destination.size.min(2) {
+            self.lda_location(base, byte);
+            let (zero_page, absolute, mnemonic) = if subtract {
+                (0xe5, 0xed, "sbc")
+            } else {
+                (0x65, 0x6d, "adc")
+            };
+            self.memory_operation(zero_page, absolute, mnemonic, offset, byte);
+            self.sta_location(destination, byte);
+        }
+    }
+
+    fn prepare_indirect_address(&mut self, function: &Function, address: ValueId) {
+        let address = self.value_location(function, address);
+        self.lda_location(address, 0);
+        self.sta_zero_page(ARGUMENT_SPILL_BASE);
+        self.lda_location(address, 1);
+        self.sta_zero_page(ARGUMENT_SPILL_BASE + 1);
+    }
+
+    fn load_indirect(&mut self, function: &Function, instruction: &Instruction, address: ValueId) {
+        let Some(result) = instruction.result else {
+            return;
+        };
+        let destination = self.value_location(function, result);
+        self.prepare_indirect_address(function, address);
+        for offset in 0..destination.size {
+            self.ldy_immediate(offset as u8);
+            self.emit_bytes(
+                &[0xb1, ARGUMENT_SPILL_BASE],
+                &format!("lda (${:02x}),y", ARGUMENT_SPILL_BASE),
+            );
+            self.sta_location(destination, offset);
+        }
+    }
+
+    fn store_indirect(
+        &mut self,
+        function: &Function,
+        address: ValueId,
+        value: ValueId,
+        ty: &nesc_mir::Type,
+    ) {
+        let source = self.value_location(function, value);
+        self.prepare_indirect_address(function, address);
+        for offset in 0..source.size.min(allocation::type_size(ty)) {
+            self.ldy_immediate(offset as u8);
+            self.lda_location(source, offset);
+            self.emit_bytes(
+                &[0x91, ARGUMENT_SPILL_BASE],
+                &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
+            );
+        }
+    }
+
+    fn bounds_check(&mut self, function: &Function, index: ValueId, length: u32) {
+        let index_location = self.value_location(function, index);
+        let trap_name = self.fresh_label("bounds_trap");
+        let done_name = self.fresh_label("bounds_done");
+        let trap_symbol = self.local_symbol(&trap_name);
+        let done_symbol = self.local_symbol(&done_name);
+        let index_type = &function.value_types[index.0 as usize];
+        let signed = index_type.pointer_depth == 0
+            && matches!(index_type.kind, TypeKind::Integer(integer) if integer.is_signed());
+
+        if signed {
+            self.lda_location(index_location, index_location.size - 1);
+            self.relative_symbol(0x30, "bmi", trap_symbol);
+        }
+        for offset in (2..index_location.size).rev() {
+            self.lda_location(index_location, offset);
+            self.relative_symbol(0xd0, "bne", trap_symbol);
+        }
+        if index_location.size > 1 {
+            self.lda_location(index_location, 1);
+            self.immediate(0xc9, "cmp", (length >> 8) as u8);
+            self.relative_symbol(0x90, "bcc", done_symbol);
+            self.relative_symbol(0xd0, "bne", trap_symbol);
+        } else if length > u32::from(u8::MAX) {
+            self.absolute_symbol(0x4c, "jmp", done_symbol);
+        }
+        self.lda_location(index_location, 0);
+        self.immediate(0xc9, "cmp", length as u8);
+        self.relative_symbol(0x90, "bcc", done_symbol);
+        self.define(trap_symbol);
+        self.assembly.push_str(&format!("{trap_name}:\n"));
+        let runtime_trap = self.helper_symbol("__nesc_trap");
+        self.absolute_symbol(0x4c, "jmp", runtime_trap);
+        self.define(done_symbol);
+        self.assembly.push_str(&format!("{done_name}:\n"));
     }
 
     fn parameter_prologue(&mut self, function: &Function) {
@@ -1010,6 +1152,10 @@ impl Emitter {
 
     fn lda_immediate(&mut self, value: u8) {
         self.emit_bytes(&[0xa9, value], &format!("lda #${value:02x}"));
+    }
+
+    fn ldy_immediate(&mut self, value: u8) {
+        self.emit_bytes(&[0xa0, value], &format!("ldy #${value:02x}"));
     }
 
     fn immediate(&mut self, opcode: u8, mnemonic: &str, value: u8) {

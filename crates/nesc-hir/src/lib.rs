@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 pub use nesc_frontend::{
-    Attribute, BinaryOperator, Block, Expression, ExpressionKind, IntegerType, Linkage, Parameter,
-    SourceId, SourceMap, SourceSpan, Statement, Type, TypeKind, UnaryOperator, Variable,
+    AddressSpace, Attribute, BinaryOperator, Block, Expression, ExpressionKind, IntegerType,
+    Linkage, Parameter, SourceId, SourceMap, SourceSpan, Statement, Type, TypeKind, UnaryOperator,
+    Variable,
 };
 use nesc_frontend::{CheckedProgram, Declaration};
 

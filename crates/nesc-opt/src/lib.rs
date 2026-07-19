@@ -160,6 +160,18 @@ fn instruction_operands(kind: &InstructionKind, used: &mut HashSet<ValueId>) {
         | InstructionKind::Cast { value, .. } => {
             used.insert(*value);
         }
+        InstructionKind::BoundsCheck { index, .. }
+        | InstructionKind::LoadIndirect { address: index, .. } => {
+            used.insert(*index);
+        }
+        InstructionKind::PointerOffset { base, offset, .. } => {
+            used.insert(*base);
+            used.insert(*offset);
+        }
+        InstructionKind::StoreIndirect { address, value, .. } => {
+            used.insert(*address);
+            used.insert(*value);
+        }
         InstructionKind::Unary { operand, .. } => {
             used.insert(*operand);
         }
@@ -170,7 +182,9 @@ fn instruction_operands(kind: &InstructionKind, used: &mut HashSet<ValueId>) {
         InstructionKind::Call { arguments, .. } => used.extend(arguments.iter().copied()),
         InstructionKind::Constant(_)
         | InstructionKind::LoadLocal(_)
-        | InstructionKind::LoadGlobal(_) => {}
+        | InstructionKind::LoadGlobal(_)
+        | InstructionKind::AddressOfLocal(_)
+        | InstructionKind::AddressOfGlobal(_) => {}
     }
 }
 

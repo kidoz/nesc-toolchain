@@ -1,8 +1,8 @@
 use nesc_diagnostics::Diagnostic;
 
 use crate::{
-    Attribute, BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function,
-    IntegerType, Linkage, NodeId, Parameter, Program, SourceMap, SourceSpan, Statement,
+    AddressSpace, Attribute, BinaryOperator, Block, Declaration, Expression, ExpressionKind,
+    Function, IntegerType, Linkage, NodeId, Parameter, Program, SourceMap, SourceSpan, Statement,
     StorageClass, Token, TokenKind, Type, TypeKind, UnaryOperator, Variable,
 };
 
@@ -202,6 +202,42 @@ impl Parser<'_> {
             is_volatile |= self.consume(&TokenKind::Volatile).is_some();
         }
 
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "ptr")
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| token.kind == TokenKind::Less)
+        {
+            self.advance();
+            self.expect(&TokenKind::Less, "E1202", "expected `<` after `ptr`")?;
+            let (space, space_span) = self.identifier("expected an NES address space")?;
+            let Some(address_space) = address_space(&space) else {
+                self.error_at(
+                    "E1206",
+                    format!("unknown NES address space `{space}`"),
+                    space_span,
+                    "use a documented CPU-bus address space",
+                );
+                return None;
+            };
+            self.expect(
+                &TokenKind::Comma,
+                "E1202",
+                "expected `,` after pointer address space",
+            )?;
+            let mut pointee = self.parse_type()?;
+            self.expect(
+                &TokenKind::Greater,
+                "E1202",
+                "expected `>` after pointer pointee type",
+            )?;
+            pointee.pointer_depth = pointee.pointer_depth.saturating_add(1);
+            pointee.address_space = address_space;
+            pointee.is_const |= is_const;
+            pointee.is_volatile |= is_volatile;
+            return Some(pointee);
+        }
+
         let kind = match &self.current().kind {
             TokenKind::Void => {
                 self.advance();
@@ -255,6 +291,7 @@ impl Parser<'_> {
             is_const,
             is_volatile,
             pointer_depth: 0,
+            address_space: AddressSpace::Unknown,
             array_lengths: Vec::new(),
         })
     }
@@ -995,7 +1032,24 @@ fn is_type_start(kind: &TokenKind) -> bool {
             | TokenKind::Short
             | TokenKind::Int
             | TokenKind::Long
-    ) || matches!(kind, TokenKind::Identifier(name) if integer_type_name(name).is_some())
+    ) || matches!(kind, TokenKind::Identifier(name) if integer_type_name(name).is_some() || name == "ptr")
+}
+
+fn address_space(name: &str) -> Option<AddressSpace> {
+    match name {
+        "unknown" => Some(AddressSpace::Unknown),
+        "zero_page" => Some(AddressSpace::ZeroPage),
+        "internal_ram" => Some(AddressSpace::InternalRam),
+        "ppu_register" => Some(AddressSpace::PpuRegister),
+        "apu_register" => Some(AddressSpace::ApuRegister),
+        "io_register" => Some(AddressSpace::IoRegister),
+        "prg_rom" => Some(AddressSpace::PrgRom),
+        "prg_ram" => Some(AddressSpace::PrgRam),
+        "chr_rom" => Some(AddressSpace::ChrRom),
+        "chr_ram" => Some(AddressSpace::ChrRam),
+        "mapper_register" => Some(AddressSpace::MapperRegister),
+        _ => None,
+    }
 }
 
 fn same_variant(left: &TokenKind, right: &TokenKind) -> bool {
