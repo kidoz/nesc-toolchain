@@ -13,8 +13,9 @@ ROM. The toolkit is written in stable Rust 2024.
 > [!IMPORTANT]
 > The compiler currently generates Mapper 0 ROMs. Mapper-aware ROM models for
 > UxROM and CNROM exist. Recursive disassembly currently accepts Mapper 0 ROMs;
-> SSA/value analysis is available as a library, while NesC and Rust source
-> emission remains under development.
+> SSA/value, call-graph, calling-convention, and conservative type recovery are
+> available as a library, while NesC and Rust source emission remains under
+> development.
 
 ## Highlights
 
@@ -30,6 +31,8 @@ ROM. The toolkit is written in stable Rust 2024.
   `nesc disassemble` workflows
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
+- Bank-qualified call graphs, recursive-component detection, evidence-scored
+  `nescall` signatures, and conservative scalar and pointer type facts
 - Rustc-style diagnostics with source spans and suggested corrections
 
 ## Current status
@@ -45,7 +48,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | ROM construction and inspection | Available |
 | Official 6502 decoding and recursive Mapper 0 disassembly | Available |
 | Bank-qualified NROM CFG and semantic 6502 IR | Available as a library |
-| SSA/value, flag, memory, and function-summary recovery | Available as a library |
+| SSA/value, call-graph, ABI, and conservative type recovery | Available as a library |
 | Deterministic emulator boot verification | Available as a library |
 | Debugger and NesC/Rust source emission | Planned |
 
@@ -160,8 +163,8 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete debugger integration and richer emulator timing coverage
 2. Add mapper-aware compilation for UxROM and CNROM
-3. Add type and calling-convention recovery, structured control flow, and
-   verified NesC/Rust emission, then extend recovery to bank-switched cartridges
+3. Structure reducible control flow and add verified NesC/Rust emission, then
+   extend recovery to bank-switched cartridges
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
