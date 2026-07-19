@@ -7,5 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+nesc-object = { path = "../nesc-object" }
+nesc-rom = { path = "../nesc-rom" }
+
+[dev-dependencies]
+nesc-runtime = { path = "../nesc-runtime" }
+
 [lints]
 workspace = true
