@@ -201,6 +201,7 @@ dependencies = [
  "nesc-decompiler",
  "nesc-diagnostics",
  "nesc-disasm",
+ "nesc-emulator",
  "nesc-linker",
  "nesc-project",
  "nesc-rom",

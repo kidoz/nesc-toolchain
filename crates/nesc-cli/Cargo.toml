@@ -14,6 +14,7 @@ nesc-compiler = { path = "../nesc-compiler" }
 nesc-decompiler = { path = "../nesc-decompiler" }
 nesc-disasm = { path = "../nesc-disasm" }
 nesc-diagnostics = { path = "../nesc-diagnostics" }
+nesc-emulator = { path = "../nesc-emulator" }
 nesc-linker = { path = "../nesc-linker" }
 nesc-project = { path = "../nesc-project" }
 nesc-rom = { path = "../nesc-rom" }

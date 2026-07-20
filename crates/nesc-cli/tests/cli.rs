@@ -596,7 +596,7 @@ fn decompiles_mapper_zero_to_a_stable_rust_project() {
         String::from_utf8_lossy(&built_nesc.stderr)
     );
 
-    let unsupported_verification = nesc()
+    let verified_nesc = nesc()
         .current_dir(temporary.path())
         .args([
             "decompile",
@@ -605,12 +605,25 @@ fn decompiles_mapper_zero_to_a_stable_rust_project() {
             "nesc",
             "--verify",
             "--output",
-            "unsupported-verification",
+            "verified-nesc",
         ])
         .output()
-        .expect("reject unsupported verification");
-    assert!(!unsupported_verification.status.success());
-    assert!(String::from_utf8_lossy(&unsupported_verification.stderr).contains("error[E4210]"));
+        .expect("verify generated NesC");
+    assert!(
+        verified_nesc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified_nesc.stderr)
+    );
+    let report = fs::read_to_string(temporary.path().join("verified-nesc/verification.json"))
+        .expect("NesC verification report");
+    assert!(report.contains("\"mode\": \"original-6502-vs-nesc\""));
+    assert!(report.contains("\"status\": \"passed\""));
+    assert!(report.contains("\"prg_ram_bytes_compared_per_completed_execution\": 4096"));
+    assert!(report.contains("\"verification_workspace\": \"0x7000..0x7fff\""));
+    let verified_source = fs::read_to_string(temporary.path().join("verified-nesc/src/main.c"))
+        .expect("instrumented NesC source");
+    assert!(verified_source.contains("verification_store(0x7f0c, 1)"));
+    assert!(temporary.path().join("verified-nesc/target").is_dir());
 
     let repeated = nesc()
         .current_dir(temporary.path())
@@ -677,6 +690,7 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
             "--output",
             "translated-nesc",
             "--high-level-only",
+            "--verify",
         ])
         .output()
         .expect("decompile UxROM to NesC");
@@ -694,6 +708,10 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
         .expect("NesC source");
     assert!(source.contains("NES_BANK(1) NES_NOINLINE"));
     assert!(source.contains("fn_prg0001_8000"));
+    let report = fs::read_to_string(temporary.path().join("translated-nesc/verification.json"))
+        .expect("NesC verification report");
+    assert!(report.contains("\"mapper\": 2"));
+    assert!(report.contains("\"switchable_bank_contexts\": 3"));
 
     let built = nesc()
         .current_dir(temporary.path())
@@ -805,6 +823,30 @@ fn keeps_unknown_mapper_two_bank_state_in_rust_fallback() {
     assert!(!nesc_rejected.status.success());
     assert!(String::from_utf8_lossy(&nesc_rejected.stderr).contains("error[E4211]"));
     assert!(!temporary.path().join("nesc-high-level-only").exists());
+
+    let verification_rejected = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "unknown-bank.nes",
+            "--emit",
+            "nesc",
+            "--output",
+            "nesc-unverified",
+            "--verify",
+        ])
+        .output()
+        .expect("report unverifiable Mapper 2 fallback");
+    assert!(!verification_rejected.status.success());
+    let stderr = String::from_utf8_lossy(&verification_rejected.stderr);
+    assert!(stderr.contains("error[E4212]"), "{stderr}");
+    assert!(stderr.contains("original execution failed"), "{stderr}");
+    assert!(
+        !temporary
+            .path()
+            .join("nesc-unverified/verification.json")
+            .exists()
+    );
 }
 
 #[test]

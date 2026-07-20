@@ -39,6 +39,7 @@ impl Default for NesCEmissionLimits {
 pub struct NesCEmitConfig {
     pub package_name: String,
     pub high_level_only: bool,
+    pub verification: bool,
     pub fallback_instruction_limit: u16,
     pub max_fallback_call_depth: u8,
 }
@@ -128,6 +129,11 @@ pub fn emit_nesc_project(
         return Err(vec![AnalysisError::new(format!(
             "high-level-only NesC emission rejected {fallbacks} dispatcher fallback region(s)"
         ))]);
+    }
+    if config.verification && program.functions.len() > usize::from(u16::MAX) + 1 {
+        return Err(vec![AnalysisError::new(
+            "NesC verification cannot address more than 65536 recovered functions",
+        )]);
     }
     let prg_bank_count = disassembly.rom.prg_rom.len() / (16 * 1024);
     if prg_bank_count > usize::from(u8::MAX) + 1 {
@@ -245,11 +251,17 @@ impl Emitter<'_> {
             self.line(0, "static void decompile_dispatch_once(void);")?;
             self.line(0, "static void decompile_fallback(u16 entry);")?;
         }
+        if self.config.verification {
+            self.line(0, "static void verification_dispatch(u16 test_case);")?;
+        }
         for function in &functions {
             self.emit_function(function)?;
         }
         if has_fallback {
             self.emit_fallback_dispatcher()?;
+        }
+        if self.config.verification {
+            self.emit_verification_dispatch()?;
         }
         let reset = self
             .program
@@ -265,17 +277,48 @@ impl Emitter<'_> {
         let reset_name = self.names[&reset.id].clone();
         self.line(0, "")?;
         self.line(0, "NES_MAIN int main(void) {")?;
-        self.line(1, "cpu_sp = 0xfd;")?;
-        self.line(1, "cpu_status = 0x24;")?;
-        if self.program.mapper == 2 {
-            self.line(1, "cpu_selected_prg_bank = 0;")?;
+        if self.config.verification {
+            self.line(1, "u16 verification_case;")?;
+            self.line(1, "cpu_a = 0;")?;
+            self.line(1, "cpu_x = 0;")?;
+            self.line(1, "cpu_y = 0;")?;
         }
-        self.line(1, &format!("cpu_pc = 0x{:04x};", reset.entry.cpu_address))?;
+        self.line(1, "cpu_sp = 0xfd;")?;
+        if self.config.verification {
+            self.line(1, "cpu_status = verification_load(0x7ff2);")?;
+        } else {
+            self.line(1, "cpu_status = 0x24;")?;
+        }
+        if self.program.mapper == 2 {
+            self.line(
+                1,
+                if self.config.verification {
+                    "cpu_selected_prg_bank = verification_load(0x7ff3);"
+                } else {
+                    "cpu_selected_prg_bank = 0;"
+                },
+            )?;
+        }
         self.line(
             1,
             &format!("cpu_budget = {};", self.config.fallback_instruction_limit),
         )?;
-        self.line(1, &format!("{reset_name}();"))?;
+        if self.config.verification {
+            self.line(1, "verification_store(0x7f00, 0);")?;
+            self.line(1, "verification_store(0x7f01, 0);")?;
+            self.line(1, "verification_store(0x7f02, 0);")?;
+            self.line(1, "verification_store(0x7f0b, 0);")?;
+            self.line(1, "verification_store(0x7f0c, 0);")?;
+            self.line(
+                1,
+                "verification_case = (u16)(verification_load(0x7ff0) | ((u16)verification_load(0x7ff1) << 8));",
+            )?;
+            self.line(1, "verification_dispatch(verification_case);")?;
+            self.line(1, "verification_finish();")?;
+        } else {
+            self.line(1, &format!("cpu_pc = 0x{:04x};", reset.entry.cpu_address))?;
+            self.line(1, &format!("{reset_name}();"))?;
+        }
         self.line(1, "return 0;")?;
         self.line(0, "}")
     }
@@ -319,11 +362,43 @@ impl Emitter<'_> {
         self.line(1, "cpu_set_flag(0x80, (u8)((value & 0x80) != 0));")?;
         self.line(1, "cpu_set_flag(0x02, (u8)(value == 0));")?;
         self.line(0, "}")?;
+        if self.config.verification {
+            self.emit_verification_helpers()?;
+        }
         self.line(0, "static u8 cpu_read(u16 address) {")?;
-        self.line(1, "return *((ptr<unknown, volatile u8>)address);")?;
+        if self.config.verification {
+            self.line(1, "u8 value;")?;
+            self.line(1, "if ((address >= 0x7000) && (address < 0x8000)) {")?;
+            self.line(2, "verification_store(0x7f0c, 1);")?;
+            self.line(2, "__nesc_trap();")?;
+            self.line(1, "}")?;
+            self.line(1, "if (address < 0x2000) {")?;
+            self.line(
+                2,
+                "value = *((ptr<unknown, volatile u8>)(0x7000 + (address & 0x07ff)));",
+            )?;
+            self.line(1, "} else {")?;
+            self.line(2, "value = *((ptr<unknown, volatile u8>)address);")?;
+            self.line(1, "}")?;
+            self.line(1, "if ((address >= 0x2000) && (address <= 0x4017)) {")?;
+            self.line(2, "verification_observe(1, address, value);")?;
+            self.line(1, "}")?;
+            self.line(1, "return value;")?;
+        } else {
+            self.line(1, "return *((ptr<unknown, volatile u8>)address);")?;
+        }
         self.line(0, "}")?;
         self.line(0, "static void cpu_write(u16 address, u8 value) {")?;
-        self.line(1, "*((ptr<unknown, volatile u8>)address) = value;")?;
+        if self.config.verification {
+            self.line(1, "if ((address >= 0x7000) && (address < 0x8000)) {")?;
+            self.line(2, "verification_store(0x7f0c, 1);")?;
+            self.line(2, "__nesc_trap();")?;
+            self.line(1, "}")?;
+            self.line(1, "verification_observe_write(address, value);")?;
+            self.line(1, "verification_bus_write(address, value);")?;
+        } else {
+            self.line(1, "*((ptr<unknown, volatile u8>)address) = value;")?;
+        }
         if self.program.mapper == 2 {
             self.line(1, "if (address >= 0x8000) {")?;
             self.line(
@@ -337,7 +412,14 @@ impl Emitter<'_> {
         }
         self.line(0, "}")?;
         self.line(0, "static void cpu_step(void) {")?;
-        self.line(1, "if (cpu_budget == 0) { __nesc_trap(); }")?;
+        if self.config.verification {
+            self.line(
+                1,
+                "if (cpu_budget == 0) { verification_store(0x7f0b, 1); __nesc_trap(); }",
+            )?;
+        } else {
+            self.line(1, "if (cpu_budget == 0) { __nesc_trap(); }")?;
+        }
         self.line(1, "cpu_budget = (u16)(cpu_budget - 1);")?;
         self.line(0, "}")?;
         self.line(0, "static void cpu_push(u8 value) {")?;
@@ -386,6 +468,84 @@ impl Emitter<'_> {
         self.line(1, "cpu_set_nz((u8)(left - right));")?;
         self.line(0, "}")?;
         Ok(())
+    }
+
+    fn emit_verification_helpers(&mut self) -> Result<(), Vec<AnalysisError>> {
+        self.line(0, "static u8 verification_load(u16 address) {")?;
+        self.line(1, "return *((ptr<unknown, volatile u8>)address);")?;
+        self.line(0, "}")?;
+        self.line(0, "static void verification_store(u16 address, u8 value) {")?;
+        self.line(1, "*((ptr<unknown, volatile u8>)address) = value;")?;
+        self.line(0, "}")?;
+        self.line(
+            0,
+            "static void verification_observe(u8 kind, u16 address, u8 value) {",
+        )?;
+        self.line(1, "u8 count;")?;
+        self.line(1, "u16 base;")?;
+        self.line(1, "count = verification_load(0x7f00);")?;
+        self.line(1, "if (count < 192) {")?;
+        self.line(2, "base = (u16)(0x7c00 + ((u16)count << 2));")?;
+        self.line(2, "verification_store(base, kind);")?;
+        self.line(2, "verification_store((u16)(base + 1), (u8)address);")?;
+        self.line(
+            2,
+            "verification_store((u16)(base + 2), (u8)(address >> 8));",
+        )?;
+        self.line(2, "verification_store((u16)(base + 3), value);")?;
+        self.line(2, "verification_store(0x7f00, (u8)(count + 1));")?;
+        self.line(1, "} else {")?;
+        self.line(2, "verification_store(0x7f01, 1);")?;
+        self.line(1, "}")?;
+        self.line(0, "}")?;
+        self.line(
+            0,
+            "static void verification_observe_write(u16 address, u8 value) {",
+        )?;
+        self.line(1, "if (address < 0x2000) {")?;
+        self.line(2, "verification_observe(6, address, value);")?;
+        self.line(1, "} else if ((address >= 0x6000) && (address < 0x8000)) {")?;
+        self.line(2, "verification_observe(7, address, value);")?;
+        self.line(1, "} else if (address >= 0x8000) {")?;
+        self.line(2, "verification_observe(3, address, value);")?;
+        self.line(
+            1,
+            "} else if ((address >= 0x2000) && (address <= 0x4017)) {",
+        )?;
+        self.line(2, "if (address == 0x4014) {")?;
+        self.line(3, "verification_observe(4, address, value);")?;
+        self.line(2, "}")?;
+        self.line(2, "verification_observe(2, address, value);")?;
+        self.line(1, "}")?;
+        self.line(0, "}")?;
+        self.line(
+            0,
+            "static void verification_bus_write(u16 address, u8 value) {",
+        )?;
+        self.line(1, "if (address < 0x2000) {")?;
+        self.line(
+            2,
+            "*((ptr<unknown, volatile u8>)(0x7000 + (address & 0x07ff))) = value;",
+        )?;
+        self.line(1, "} else {")?;
+        self.line(2, "*((ptr<unknown, volatile u8>)address) = value;")?;
+        self.line(1, "}")?;
+        self.line(0, "}")?;
+        self.line(0, "static void verification_finish(void) {")?;
+        self.line(1, "verification_store(0x7f03, cpu_a);")?;
+        self.line(1, "verification_store(0x7f04, cpu_x);")?;
+        self.line(1, "verification_store(0x7f05, cpu_y);")?;
+        self.line(1, "verification_store(0x7f06, cpu_sp);")?;
+        self.line(1, "verification_store(0x7f07, cpu_status);")?;
+        self.line(1, "verification_store(0x7f08, (u8)cpu_pc);")?;
+        self.line(1, "verification_store(0x7f09, (u8)(cpu_pc >> 8));")?;
+        if self.program.mapper == 2 {
+            self.line(1, "verification_store(0x7f0a, cpu_selected_prg_bank);")?;
+        } else {
+            self.line(1, "verification_store(0x7f0a, 0);")?;
+        }
+        self.line(1, "verification_store(0x7f02, 0xa5);")?;
+        self.line(0, "}")
     }
 
     fn emit_function(&mut self, function: &StructuredFunction) -> Result<(), Vec<AnalysisError>> {
@@ -806,6 +966,25 @@ impl Emitter<'_> {
         }
     }
 
+    fn emit_verification_dispatch(&mut self) -> Result<(), Vec<AnalysisError>> {
+        self.line(0, "")?;
+        self.line(0, "static void verification_dispatch(u16 test_case) {")?;
+        let functions = self.program.functions.clone();
+        for (index, function) in functions.iter().enumerate() {
+            let name = self.names[&function.id].clone();
+            self.line(1, &format!("if (test_case == {index}) {{"))?;
+            self.line(
+                2,
+                &format!("cpu_pc = 0x{:04x};", function.entry.cpu_address),
+            )?;
+            self.line(2, &format!("{name}();"))?;
+            self.line(2, "return;")?;
+            self.line(1, "}")?;
+        }
+        self.line(1, "__nesc_trap();")?;
+        self.line(0, "}")
+    }
+
     fn emit_fallback_dispatcher(&mut self) -> Result<(), Vec<AnalysisError>> {
         let blocks = self.program.blocks.values().cloned().collect::<Vec<_>>();
         for block in &blocks {
@@ -956,6 +1135,9 @@ impl Emitter<'_> {
                 self.line(indent, "}")?;
             }
             Terminator::Interrupt => {
+                if self.config.verification {
+                    self.line(indent, "verification_observe(5, 0xfffe, 0);")?;
+                }
                 let pc = block
                     .instructions
                     .last()

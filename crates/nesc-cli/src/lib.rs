@@ -1,5 +1,7 @@
 //! Command-line parsing and initial project workflows.
 
+mod nesc_verification;
+
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -81,7 +83,7 @@ enum Command {
         #[arg(long, default_value_t = 100_000)]
         max_work_items: usize,
     },
-    /// Translate Mapper 0/2 to host Rust, or Mapper 0 to hybrid NesC.
+    /// Translate Mapper 0/2 to host Rust or hybrid NesC.
     Decompile {
         /// ROM file to translate.
         #[arg(value_name = "ROM")]
@@ -95,7 +97,7 @@ enum Command {
         /// Reject output if any interpreter fallback is required.
         #[arg(long)]
         high_level_only: bool,
-        /// Differentially verify generated Rust against the original 6502 instructions.
+        /// Differentially verify generated code against the original 6502 instructions.
         #[arg(long)]
         verify: bool,
         /// Maximum number of instructions accepted from untrusted input.
@@ -575,15 +577,6 @@ fn decompile_rom_file(
             ))
         }
         DecompileKind::Nesc => {
-            if verify {
-                return Err(vec![
-                    Diagnostic::error(
-                        "E4210",
-                        "differential verification currently supports `--emit=rust` only",
-                    )
-                    .with_help("omit `--verify` or select `--emit=rust`"),
-                ]);
-            }
             let generated = emit_nesc_project(
                 &disassembly,
                 &program,
@@ -593,19 +586,56 @@ fn decompile_rom_file(
                 &NesCEmitConfig {
                     package_name: crate_name,
                     high_level_only,
-                    fallback_instruction_limit: u16::MAX,
+                    verification: verify,
+                    fallback_instruction_limit: u16::try_from(
+                        limits.max_instructions.min(usize::from(u16::MAX)),
+                    )
+                    .expect("bounded NesC instruction limit fits in u16"),
                     max_fallback_call_depth: u8::MAX,
                 },
                 NesCEmissionLimits::default(),
             )
             .map_err(|errors| decompiler_diagnostics("E4211", "NesC emission", errors))?;
             write_nesc_project(&destination, &generated)?;
+            let verification = if verify {
+                let project = Project::load(destination.join("NesC.toml"))?;
+                let artifacts = build_project(&project, &CompilerConfig::bundled_sdk())?;
+                let target = destination.join("target");
+                write_artifacts(&target, &project.manifest().package.name, &artifacts)?;
+                let report = nesc_verification::verify(
+                    &bytes,
+                    &artifacts,
+                    &program,
+                    limits.max_instructions as u64,
+                )
+                .map_err(|error| {
+                    vec![Diagnostic::error(
+                        "E4212",
+                        format!("generated NesC failed differential verification: {error}"),
+                    )]
+                })?;
+                fs::write(destination.join("verification.json"), report.json).map_err(|error| {
+                    vec![Diagnostic::error(
+                        "E4212",
+                        format!(
+                            "could not write NesC verification report `{}`: {error}",
+                            destination.join("verification.json").display()
+                        ),
+                    )]
+                })?;
+                Some(report.executions)
+            } else {
+                None
+            };
             Ok(format!(
-                "Decompiled `{}` into {} as hybrid NesC ({} functions, {} fallbacks)",
+                "Decompiled `{}` into {} as hybrid NesC ({} functions, {} fallbacks{})",
                 path.display(),
                 destination.display(),
                 program.functions.len(),
-                fallback_count
+                fallback_count,
+                verification.map_or_else(String::new, |executions| {
+                    format!(", verified with {executions} executions")
+                })
             ))
         }
     }
