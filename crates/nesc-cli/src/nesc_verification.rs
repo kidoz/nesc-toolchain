@@ -1,8 +1,11 @@
 use std::fmt;
 
 use nesc_compiler::BuildArtifacts;
-use nesc_decompiler::Program;
-use nesc_emulator::{CpuState, EmulatorConfig, EventKind, Machine, ObservableEvent, Termination};
+use nesc_decompiler::{Function, FunctionEvidence, Program, Terminator};
+use nesc_disasm::VectorKind;
+use nesc_emulator::{
+    CpuState, EmulatorConfig, EventKind, InterruptKind, Machine, ObservableEvent, Termination,
+};
 use nesc_rom::MapperState;
 
 const EVENT_BASE: usize = 0x1c00;
@@ -20,16 +23,21 @@ const RESULT_PC_HIGH: usize = 0x1f09;
 const RESULT_PRG_BANK: usize = 0x1f0a;
 const BUDGET_EXHAUSTED: usize = 0x1f0b;
 const WORKSPACE_CONFLICT: usize = 0x1f0c;
+const CHECKPOINT_REACHED: usize = 0x1f0d;
 const CONFIG_CASE_LOW: usize = 0x1ff0;
 const CONFIG_CASE_HIGH: usize = 0x1ff1;
 const CONFIG_STATUS: usize = 0x1ff2;
 const CONFIG_PRG_BANK: usize = 0x1ff3;
+const CONFIG_SCHEDULE_KIND: usize = 0x1ff4;
+const CONFIG_SCHEDULE_STEP_LOW: usize = 0x1ff5;
+const CONFIG_SCHEDULE_STEP_HIGH: usize = 0x1ff6;
 const COMPLETION_MARKER: u8 = 0xa5;
 const PHYSICAL_INSTRUCTION_MULTIPLIER: u64 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RootTermination {
     Returned,
+    Checkpoint,
     Trap(u8),
     InstructionLimit,
 }
@@ -38,10 +46,39 @@ impl fmt::Display for RootTermination {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Returned => formatter.write_str("returned"),
+            Self::Checkpoint => formatter.write_str("reached the scheduled checkpoint"),
             Self::Trap(reason) => write!(formatter, "trapped with reason ${reason:02X}"),
             Self::InstructionLimit => formatter.write_str("reached the instruction limit"),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerificationSchedule {
+    None,
+    Nmi { instruction: u16 },
+    Irq { instruction: u16 },
+    FrameCheckpoint { instruction: u16 },
+}
+
+impl VerificationSchedule {
+    const fn encoded(self) -> (u8, u16) {
+        match self {
+            Self::None => (0, 0),
+            Self::Nmi { instruction } => (1, instruction),
+            Self::Irq { instruction } => (2, instruction),
+            Self::FrameCheckpoint { instruction } => (3, instruction),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutionConfig {
+    initial_bank: u16,
+    status: u8,
+    controller: u8,
+    instruction_limit: u64,
+    schedule: VerificationSchedule,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +147,9 @@ pub(crate) fn verify(
             "verification cannot represent {switchable_banks} switchable PRG bank contexts"
         ));
     }
+    if program.functions.is_empty() {
+        return Err("verification requires at least one recovered function".to_owned());
+    }
 
     let semantic_limit = instruction_limit.min(u64::from(u16::MAX));
     let translated_limit = semantic_limit
@@ -118,51 +158,140 @@ pub(crate) fn verify(
     let profiles = [(0x20_u8, 0x00_u8), (0x21, 0x01), (0x6f, 0x80), (0xef, 0xff)];
     let mut executions = 0_usize;
     let mut compared_events = 0_usize;
+    let mut direct_executions = 0_usize;
+    let mut nmi_executions = 0_usize;
+    let mut irq_executions = 0_usize;
+    let mut frame_executions = 0_usize;
+
+    let mut verify_case = |case_index: usize,
+                           function: &Function,
+                           initial_bank: u16,
+                           status: u8,
+                           controller: u8,
+                           schedule: VerificationSchedule,
+                           context: String|
+     -> Result<(), String> {
+        let original_result = run_original(
+            original_rom,
+            function.entry.cpu_address,
+            ExecutionConfig {
+                initial_bank,
+                status,
+                controller,
+                instruction_limit: semantic_limit,
+                schedule,
+            },
+        )
+        .map_err(|error| format!("original execution failed for {context}: {error}"))?;
+        let translated_result = run_translated(
+            &translated.rom,
+            main_address,
+            case_index,
+            ExecutionConfig {
+                initial_bank,
+                status,
+                controller,
+                instruction_limit: translated_limit,
+                schedule,
+            },
+        )
+        .map_err(|error| format!("generated execution failed for {context}: {error}"))?;
+        compare_results(&original_result, &translated_result, &context)?;
+        executions += 1;
+        compared_events += original_result.events.len();
+        Ok(())
+    };
 
     for (case_index, function) in program.functions.iter().enumerate() {
-        let bank_contexts = if program.mapper == 2 && function.entry.cpu_address >= 0xc000 {
-            (0..switchable_banks)
-                .map(|bank| bank as u16)
-                .collect::<Vec<_>>()
-        } else if program.mapper == 2 {
-            vec![function.entry.bank]
-        } else {
-            vec![0]
-        };
-        for initial_bank in bank_contexts {
+        if is_interrupt_handler(function, program) {
+            continue;
+        }
+        for initial_bank in bank_contexts(program, function, switchable_banks) {
             for (status, controller) in profiles {
                 let context = format!(
                     "function {} at PRG bank {}, CPU ${:04X}, initial bank {}, status ${status:02X}, controller ${controller:02X}",
                     function.id.0, function.entry.bank, function.entry.cpu_address, initial_bank
                 );
-                let original_result = run_original(
-                    original_rom,
-                    function.entry.cpu_address,
-                    initial_bank,
-                    status,
-                    controller,
-                    semantic_limit,
-                )
-                .map_err(|error| format!("original execution failed for {context}: {error}"))?;
-                let translated_result = run_translated(
-                    &translated.rom,
-                    main_address,
+                verify_case(
                     case_index,
+                    function,
                     initial_bank,
                     status,
                     controller,
-                    translated_limit,
-                )
-                .map_err(|error| format!("generated execution failed for {context}: {error}"))?;
-                compare_results(&original_result, &translated_result, &context)?;
-                executions += 1;
-                compared_events += original_result.events.len();
+                    VerificationSchedule::None,
+                    context,
+                )?;
+                direct_executions += 1;
             }
         }
     }
 
+    let reset_case = program
+        .functions
+        .iter()
+        .position(|function| has_vector(function, VectorKind::Reset))
+        .unwrap_or(0);
+    let reset = &program.functions[reset_case];
+    let reset_banks = bank_contexts(program, reset, switchable_banks);
+    let has_nmi = program.functions.iter().any(|function| {
+        has_vector(function, VectorKind::Nmi) && is_interrupt_handler(function, program)
+    });
+    let has_irq = program.functions.iter().any(|function| {
+        has_vector(function, VectorKind::Irq) && is_interrupt_handler(function, program)
+    });
+    for initial_bank in reset_banks {
+        for (label, schedule) in [
+            (
+                "NMI",
+                has_nmi.then_some(VerificationSchedule::Nmi { instruction: 0 }),
+            ),
+            (
+                "IRQ",
+                has_irq.then_some(VerificationSchedule::Irq { instruction: 0 }),
+            ),
+        ] {
+            let Some(schedule) = schedule else {
+                continue;
+            };
+            let context = format!(
+                "reset function {} with {label} before semantic instruction 0, initial bank {initial_bank}",
+                reset.id.0
+            );
+            verify_case(reset_case, reset, initial_bank, 0x20, 0, schedule, context)?;
+            if label == "NMI" {
+                nmi_executions += 1;
+            } else {
+                irq_executions += 1;
+            }
+        }
+
+        if let Some(instruction) = discover_frame_checkpoint(
+            original_rom,
+            reset.entry.cpu_address,
+            initial_bank,
+            0x20,
+            0,
+            semantic_limit,
+        )? {
+            let context = format!(
+                "reset function {} at first frame boundary after semantic instruction {instruction}, initial bank {initial_bank}",
+                reset.id.0
+            );
+            verify_case(
+                reset_case,
+                reset,
+                initial_bank,
+                0x20,
+                0,
+                VerificationSchedule::FrameCheckpoint { instruction },
+                context,
+            )?;
+            frame_executions += 1;
+        }
+    }
+
     let json = format!(
-        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-nesc\",\n  \"status\": \"passed\",\n  \"mapper\": {},\n  \"prg_banks\": {},\n  \"functions\": {},\n  \"input_profiles_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {},\n  \"executions\": {executions},\n  \"observable_events_compared\": {compared_events},\n  \"ram_bytes_compared_per_completed_execution\": 2048,\n  \"prg_ram_bytes_compared_per_completed_execution\": 4096,\n  \"verification_workspace\": \"0x7000..0x7fff\",\n  \"semantic_instruction_limit_per_execution\": {semantic_limit},\n  \"generated_instruction_limit_per_execution\": {translated_limit}\n}}\n",
+        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-nesc\",\n  \"status\": \"passed\",\n  \"mapper\": {},\n  \"prg_banks\": {},\n  \"functions\": {},\n  \"input_profiles_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {},\n  \"executions\": {executions},\n  \"direct_function_executions\": {direct_executions},\n  \"nmi_schedule_executions\": {nmi_executions},\n  \"irq_schedule_executions\": {irq_executions},\n  \"frame_boundary_executions\": {frame_executions},\n  \"interrupt_schedule_instruction\": 0,\n  \"observable_events_compared\": {compared_events},\n  \"ram_bytes_compared_per_completed_execution\": 2048,\n  \"prg_ram_bytes_compared_per_completed_execution\": 4096,\n  \"verification_workspace\": \"0x7000..0x7fff\",\n  \"semantic_instruction_limit_per_execution\": {semantic_limit},\n  \"generated_instruction_limit_per_execution\": {translated_limit}\n}}\n",
         program.mapper,
         prg_bank_count,
         program.functions.len(),
@@ -171,33 +300,53 @@ pub(crate) fn verify(
     Ok(VerificationReport { json, executions })
 }
 
-fn run_original(
-    rom: &[u8],
-    entry: u16,
-    initial_bank: u16,
-    status: u8,
-    controller: u8,
-    instruction_limit: u64,
-) -> Result<OriginalResult, String> {
+fn has_vector(function: &Function, vector: VectorKind) -> bool {
+    function
+        .evidence
+        .iter()
+        .any(|evidence| matches!(evidence, FunctionEvidence::Vector(kind) if *kind == vector))
+}
+
+fn is_interrupt_handler(function: &Function, program: &Program) -> bool {
+    (has_vector(function, VectorKind::Nmi) || has_vector(function, VectorKind::Irq))
+        && function.blocks.iter().any(|block| {
+            matches!(
+                program.blocks[block].terminator,
+                Terminator::ReturnFromInterrupt
+            )
+        })
+}
+
+fn bank_contexts(program: &Program, function: &Function, switchable_banks: usize) -> Vec<u16> {
+    if program.mapper == 2 && function.entry.cpu_address >= 0xc000 {
+        (0..switchable_banks).map(|bank| bank as u16).collect()
+    } else if program.mapper == 2 {
+        vec![function.entry.bank]
+    } else {
+        vec![0]
+    }
+}
+
+fn run_original(rom: &[u8], entry: u16, config: ExecutionConfig) -> Result<OriginalResult, String> {
     let mut machine = machine(rom)?;
     machine.reset().map_err(|error| error.to_string())?;
     machine.set_mapper_state(MapperState {
-        prg_bank: initial_bank as u8,
+        prg_bank: config.initial_bank as u8,
         chr_bank: 0,
     });
     machine
-        .set_controller(0, controller)
+        .set_controller(0, config.controller)
         .map_err(|error| error.to_string())?;
     *machine.cpu_mut() = CpuState {
         a: 0,
         x: 0,
         y: 0,
         sp: 0xfd,
-        status,
+        status: config.status,
         pc: entry,
     };
     machine.clear_events();
-    let termination = run_root(&mut machine, instruction_limit)?;
+    let termination = run_root(&mut machine, config.instruction_limit, config.schedule)?;
     Ok(OriginalResult {
         termination,
         cpu: *machine.cpu(),
@@ -212,10 +361,7 @@ fn run_translated(
     rom: &[u8],
     main_address: u16,
     case_index: usize,
-    initial_bank: u16,
-    status: u8,
-    controller: u8,
-    instruction_limit: u64,
+    config: ExecutionConfig,
 ) -> Result<TranslatedResult, String> {
     let case_index = u16::try_from(case_index)
         .map_err(|_| format!("verification case {case_index} does not fit in u16"))?;
@@ -224,20 +370,28 @@ fn run_translated(
         let prg_ram = machine.prg_ram_mut();
         prg_ram[CONFIG_CASE_LOW] = case_index as u8;
         prg_ram[CONFIG_CASE_HIGH] = (case_index >> 8) as u8;
-        prg_ram[CONFIG_STATUS] = status;
-        prg_ram[CONFIG_PRG_BANK] = initial_bank as u8;
+        prg_ram[CONFIG_STATUS] = config.status;
+        prg_ram[CONFIG_PRG_BANK] = config.initial_bank as u8;
+        let (schedule_kind, schedule_step) = config.schedule.encoded();
+        prg_ram[CONFIG_SCHEDULE_KIND] = schedule_kind;
+        prg_ram[CONFIG_SCHEDULE_STEP_LOW] = schedule_step as u8;
+        prg_ram[CONFIG_SCHEDULE_STEP_HIGH] = (schedule_step >> 8) as u8;
     }
     machine.reset().map_err(|error| error.to_string())?;
     machine.set_mapper_state(MapperState {
-        prg_bank: initial_bank as u8,
+        prg_bank: config.initial_bank as u8,
         chr_bank: 0,
     });
     machine
-        .set_controller(0, controller)
+        .set_controller(0, config.controller)
         .map_err(|error| error.to_string())?;
     reach_main(&mut machine, main_address)?;
     machine.clear_events();
-    let termination = run_root(&mut machine, instruction_limit)?;
+    let termination = run_root(
+        &mut machine,
+        config.instruction_limit,
+        VerificationSchedule::None,
+    )?;
     decode_translation(machine.prg_ram(), termination)
 }
 
@@ -267,29 +421,147 @@ fn reach_main(machine: &mut Machine, main_address: u16) -> Result<(), String> {
     Err("generated startup did not reach `main` within 1024 instructions".to_owned())
 }
 
-fn run_root(machine: &mut Machine, instruction_limit: u64) -> Result<RootTermination, String> {
+fn run_root(
+    machine: &mut Machine,
+    instruction_limit: u64,
+    schedule: VerificationSchedule,
+) -> Result<RootTermination, String> {
     let mut call_depth = 0_u32;
+    let mut interrupt_depth = 0_u32;
     let mut instructions = 0_u64;
+    let mut schedule_triggered = false;
     loop {
+        if matches!(
+            schedule,
+            VerificationSchedule::FrameCheckpoint { instruction }
+                if u64::from(instruction) == instructions
+        ) {
+            return Ok(RootTermination::Checkpoint);
+        }
+        let scheduled_interrupt = match schedule {
+            VerificationSchedule::Nmi { instruction }
+                if !schedule_triggered && u64::from(instruction) == instructions =>
+            {
+                Some(InterruptKind::Nmi)
+            }
+            VerificationSchedule::Irq { instruction }
+                if !schedule_triggered && u64::from(instruction) == instructions =>
+            {
+                Some(InterruptKind::Irq)
+            }
+            _ => None,
+        };
+        if let Some(interrupt) = scheduled_interrupt {
+            match interrupt {
+                InterruptKind::Nmi => machine.request_nmi(),
+                InterruptKind::Irq => machine.set_irq_line(true),
+                InterruptKind::Brk => unreachable!("BRK is not an external schedule"),
+            }
+            let report = machine.step().map_err(|error| error.to_string())?;
+            machine.set_irq_line(false);
+            if report.interrupt != Some(interrupt) {
+                return Err(format!(
+                    "scheduled {interrupt:?} was not accepted at semantic instruction {instructions}"
+                ));
+            }
+            schedule_triggered = true;
+            interrupt_depth = interrupt_depth.saturating_add(1);
+            continue;
+        }
         let pc = machine.cpu().pc;
         let opcode = machine.peek(pc).map_err(|error| error.to_string())?;
-        if call_depth == 0 && matches!(opcode, 0x40 | 0x60) {
+        if call_depth == 0 && interrupt_depth == 0 && matches!(opcode, 0x40 | 0x60) {
             return Ok(RootTermination::Returned);
         }
         if instructions >= instruction_limit {
             return Ok(RootTermination::InstructionLimit);
         }
         let report = machine.step().map_err(|error| error.to_string())?;
-        instructions = instructions.saturating_add(1);
         if let Some(Termination::Trap { reason }) = report.termination {
             return Ok(RootTermination::Trap(reason));
         }
+        if report.interrupt.is_some() {
+            interrupt_depth = interrupt_depth.saturating_add(1);
+            continue;
+        }
+        instructions = instructions.saturating_add(1);
         if opcode == 0x20 {
             call_depth = call_depth.saturating_add(1);
-        } else if matches!(opcode, 0x40 | 0x60) && call_depth != 0 {
+        } else if opcode == 0x40 && interrupt_depth != 0 {
+            interrupt_depth -= 1;
+            if interrupt_depth == 0
+                && schedule_triggered
+                && matches!(
+                    schedule,
+                    VerificationSchedule::Nmi { .. } | VerificationSchedule::Irq { .. }
+                )
+            {
+                return Ok(RootTermination::Checkpoint);
+            }
+        } else if opcode == 0x60 && call_depth != 0 {
             call_depth -= 1;
         }
     }
+}
+
+fn discover_frame_checkpoint(
+    rom: &[u8],
+    entry: u16,
+    initial_bank: u16,
+    status: u8,
+    controller: u8,
+    instruction_limit: u64,
+) -> Result<Option<u16>, String> {
+    let mut machine = machine(rom)?;
+    machine.reset().map_err(|error| error.to_string())?;
+    machine.set_mapper_state(MapperState {
+        prg_bank: initial_bank as u8,
+        chr_bank: 0,
+    });
+    machine
+        .set_controller(0, controller)
+        .map_err(|error| error.to_string())?;
+    *machine.cpu_mut() = CpuState {
+        a: 0,
+        x: 0,
+        y: 0,
+        sp: 0xfd,
+        status,
+        pc: entry,
+    };
+    let initial_frame = machine.frames();
+    let mut call_depth = 0_u32;
+    let mut interrupt_depth = 0_u32;
+    let mut instructions = 0_u64;
+    while instructions < instruction_limit {
+        let pc = machine.cpu().pc;
+        let opcode = machine.peek(pc).map_err(|error| error.to_string())?;
+        if call_depth == 0 && interrupt_depth == 0 && matches!(opcode, 0x40 | 0x60) {
+            return Ok(None);
+        }
+        let report = machine.step().map_err(|error| error.to_string())?;
+        if report.termination.is_some() {
+            return Ok(None);
+        }
+        if report.interrupt.is_some() {
+            interrupt_depth = interrupt_depth.saturating_add(1);
+            continue;
+        }
+        instructions = instructions.saturating_add(1);
+        if opcode == 0x20 {
+            call_depth = call_depth.saturating_add(1);
+        } else if opcode == 0x40 && interrupt_depth != 0 {
+            interrupt_depth -= 1;
+        } else if opcode == 0x60 && call_depth != 0 {
+            call_depth -= 1;
+        }
+        if machine.frames() > initial_frame {
+            return u16::try_from(instructions)
+                .map(Some)
+                .map_err(|_| "frame checkpoint does not fit in u16".to_owned());
+        }
+    }
+    Ok(None)
 }
 
 fn original_events(events: &std::collections::VecDeque<ObservableEvent>) -> Vec<SemanticEvent> {
@@ -325,12 +597,15 @@ fn decode_translation(
                 .to_owned(),
         );
     }
-    let termination =
-        if prg_ram[BUDGET_EXHAUSTED] != 0 && matches!(termination, RootTermination::Trap(_)) {
-            RootTermination::InstructionLimit
-        } else {
-            termination
-        };
+    let termination = if prg_ram[CHECKPOINT_REACHED] != 0
+        && matches!(termination, RootTermination::Trap(_))
+    {
+        RootTermination::Checkpoint
+    } else if prg_ram[BUDGET_EXHAUSTED] != 0 && matches!(termination, RootTermination::Trap(_)) {
+        RootTermination::InstructionLimit
+    } else {
+        termination
+    };
     let count = usize::from(prg_ram[EVENT_COUNT]);
     if count > EVENT_LIMIT || prg_ram[EVENT_OVERFLOW] != 0 {
         return Err(format!(
@@ -392,7 +667,10 @@ fn compare_results(
             original.termination, translated.termination
         ));
     }
-    if original.termination == RootTermination::Returned {
+    if matches!(
+        original.termination,
+        RootTermination::Returned | RootTermination::Checkpoint
+    ) {
         let translated_cpu = translated.cpu.ok_or_else(|| {
             format!("generated execution returned without a completion record for {context}")
         })?;

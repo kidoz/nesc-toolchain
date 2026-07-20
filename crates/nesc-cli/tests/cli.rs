@@ -91,6 +91,50 @@ fn uxrom_with_duplicate_fallback_addresses() -> Vec<u8> {
     .expect("UxROM")
 }
 
+fn rom_with_interrupts_and_frame_boundary(mapper: u16) -> Vec<u8> {
+    let prg_banks = if mapper == 2 { 4 } else { 1 };
+    let mut prg = vec![0xff; prg_banks * 16 * 1024];
+    let fixed = (prg_banks - 1) * 16 * 1024;
+    prg[fixed..fixed + 14].copy_from_slice(&[
+        0xa2, 0x00, // ldx #0
+        0x58, // cli
+        0xa9, 0x00, // loop: lda #0
+        0x8d, 0x14, 0x40, // sta $4014
+        0xe8, // inx
+        0xe0, 0x3c, // cpx #60
+        0xd0, 0xf6, // bne loop
+        0x60, // rts
+    ]);
+    prg[fixed + 0x20..fixed + 0x23].copy_from_slice(&[
+        0xe6, 0x10, // inc $10
+        0x40, // rti
+    ]);
+    prg[fixed + 0x30..fixed + 0x33].copy_from_slice(&[
+        0xe6, 0x11, // inc $11
+        0x40, // rti
+    ]);
+    let vectors = prg.len() - 6;
+    prg[vectors..vectors + 2].copy_from_slice(&0xc020_u16.to_le_bytes());
+    prg[vectors + 2..vectors + 4].copy_from_slice(&0xc000_u16.to_le_bytes());
+    prg[vectors + 4..vectors + 6].copy_from_slice(&0xc030_u16.to_le_bytes());
+    nesc_rom::build(&Rom {
+        metadata: Metadata {
+            format: Format::Nes2,
+            mapper,
+            submapper: 0,
+            mirroring: Mirroring::Horizontal,
+            battery: false,
+            region: Region::Ntsc,
+            prg_rom_len: prg.len(),
+            chr_rom_len: 0,
+        },
+        trainer: None,
+        prg_rom: prg,
+        chr_rom: Vec::new(),
+    })
+    .expect("interrupt verification ROM")
+}
+
 #[test]
 fn new_then_check_generated_project() {
     let temporary = tempdir().expect("temporary directory");
@@ -723,6 +767,66 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
+}
+
+#[test]
+fn verifies_interrupt_schedules_and_frame_boundaries_for_supported_mappers() {
+    let temporary = tempdir().expect("temporary directory");
+    for (mapper, expected_contexts) in [(0_u16, 1_usize), (2, 3)] {
+        let rom_name = format!("interrupts-mapper-{mapper}.nes");
+        let output_name = format!("verified-mapper-{mapper}");
+        fs::write(
+            temporary.path().join(&rom_name),
+            rom_with_interrupts_and_frame_boundary(mapper),
+        )
+        .expect("write interrupt verification ROM");
+
+        let verified = nesc()
+            .current_dir(temporary.path())
+            .args([
+                "decompile",
+                &rom_name,
+                "--emit",
+                "nesc",
+                "--high-level-only",
+                "--verify",
+                "--output",
+                &output_name,
+            ])
+            .output()
+            .expect("verify scheduled interrupts and frame boundary");
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        let report = fs::read_to_string(
+            temporary
+                .path()
+                .join(&output_name)
+                .join("verification.json"),
+        )
+        .expect("verification report");
+        assert!(
+            report.contains(&format!("\"nmi_schedule_executions\": {expected_contexts}")),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("\"irq_schedule_executions\": {expected_contexts}")),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "\"frame_boundary_executions\": {expected_contexts}"
+            )),
+            "{report}"
+        );
+        let source = fs::read_to_string(temporary.path().join(&output_name).join("src/main.c"))
+            .expect("instrumented source");
+        assert!(source.contains("verification_observe(5, 0xfffa, 0)"));
+        assert!(source.contains("verification_observe(5, 0xfffe, 0)"));
+        assert!(source.contains("verification_store(0x7f0d, 1)"));
+    }
 }
 
 #[test]

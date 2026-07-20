@@ -253,6 +253,7 @@ impl Emitter<'_> {
         }
         if self.config.verification {
             self.line(0, "static void verification_dispatch(u16 test_case);")?;
+            self.emit_verification_schedule_service()?;
         }
         for function in &functions {
             self.emit_function(function)?;
@@ -282,6 +283,12 @@ impl Emitter<'_> {
             self.line(1, "cpu_a = 0;")?;
             self.line(1, "cpu_x = 0;")?;
             self.line(1, "cpu_y = 0;")?;
+            self.line(1, "verification_step = 0;")?;
+            self.line(1, "verification_schedule_kind = verification_load(0x7ff4);")?;
+            self.line(
+                1,
+                "verification_schedule_step = (u16)(verification_load(0x7ff5) | ((u16)verification_load(0x7ff6) << 8));",
+            )?;
         }
         self.line(1, "cpu_sp = 0xfd;")?;
         if self.config.verification {
@@ -309,12 +316,24 @@ impl Emitter<'_> {
             self.line(1, "verification_store(0x7f02, 0);")?;
             self.line(1, "verification_store(0x7f0b, 0);")?;
             self.line(1, "verification_store(0x7f0c, 0);")?;
+            self.line(1, "verification_store(0x7f0d, 0);")?;
             self.line(
                 1,
                 "verification_case = (u16)(verification_load(0x7ff0) | ((u16)verification_load(0x7ff1) << 8));",
             )?;
-            self.line(1, "verification_dispatch(verification_case);")?;
-            self.line(1, "verification_finish();")?;
+            self.line(
+                1,
+                "if ((verification_schedule_kind == 1) || (verification_schedule_kind == 2)) {",
+            )?;
+            self.line(2, "verification_prepare_case(verification_case);")?;
+            self.line(2, "verification_service_schedule();")?;
+            self.line(2, "verification_finish();")?;
+            self.line(2, "verification_store(0x7f0d, 1);")?;
+            self.line(2, "__nesc_trap();")?;
+            self.line(1, "} else {")?;
+            self.line(2, "verification_dispatch(verification_case);")?;
+            self.line(2, "verification_finish();")?;
+            self.line(1, "}")?;
         } else {
             self.line(1, &format!("cpu_pc = 0x{:04x};", reset.entry.cpu_address))?;
             self.line(1, &format!("{reset_name}();"))?;
@@ -342,6 +361,13 @@ impl Emitter<'_> {
                 "static u8 fallback_running;",
                 "static u8 fallback_call_depth;",
                 "static u8 fallback_interrupt_depth;",
+            ]);
+        }
+        if self.config.verification {
+            declarations.extend([
+                "static u8 verification_schedule_kind;",
+                "static u16 verification_schedule_step;",
+                "static u16 verification_step;",
             ]);
         }
         for declaration in declarations {
@@ -413,6 +439,11 @@ impl Emitter<'_> {
         self.line(0, "}")?;
         self.line(0, "static void cpu_step(void) {")?;
         if self.config.verification {
+            self.line(
+                1,
+                "if ((verification_schedule_kind == 3) && (verification_step == verification_schedule_step)) { verification_finish(); verification_store(0x7f0d, 1); __nesc_trap(); }",
+            )?;
+            self.line(1, "verification_step = (u16)(verification_step + 1);")?;
             self.line(
                 1,
                 "if (cpu_budget == 0) { verification_store(0x7f0b, 1); __nesc_trap(); }",
@@ -966,10 +997,75 @@ impl Emitter<'_> {
         }
     }
 
+    fn emit_verification_schedule_service(&mut self) -> Result<(), Vec<AnalysisError>> {
+        let nmi = self.interrupt_function_name(VectorKind::Nmi);
+        let irq = self.interrupt_function_name(VectorKind::Irq);
+        self.line(0, "")?;
+        self.line(0, "static void verification_service_schedule(void) {")?;
+        self.line(1, "u8 kind;")?;
+        self.line(1, "kind = verification_schedule_kind;")?;
+        self.line(1, "verification_schedule_kind = 0;")?;
+        if let Some(name) = nmi {
+            self.emit_verification_interrupt_case(1, 0xfffa, &name)?;
+        }
+        if let Some(name) = irq {
+            self.emit_verification_interrupt_case(2, 0xfffe, &name)?;
+        }
+        self.line(1, "__nesc_trap();")?;
+        self.line(0, "}")
+    }
+
+    fn emit_verification_interrupt_case(
+        &mut self,
+        kind: u8,
+        vector: u16,
+        function_name: &str,
+    ) -> Result<(), Vec<AnalysisError>> {
+        self.line(1, &format!("if (kind == {kind}) {{"))?;
+        self.line(2, &format!("verification_observe(5, 0x{vector:04x}, 0);"))?;
+        self.line(2, "cpu_push((u8)(cpu_pc >> 8));")?;
+        self.line(2, "cpu_push((u8)cpu_pc);")?;
+        self.line(2, "cpu_push((u8)((cpu_status & 0xef) | 0x20));")?;
+        self.line(2, "cpu_set_flag(0x04, 1);")?;
+        self.line(2, &format!("{function_name}();"))?;
+        self.line(2, "return;")?;
+        self.line(1, "}")
+    }
+
+    fn interrupt_function_name(&self, vector: VectorKind) -> Option<String> {
+        self.program
+            .functions
+            .iter()
+            .find(|function| {
+                function.evidence.iter().any(
+                    |evidence| matches!(evidence, super::FunctionEvidence::Vector(kind) if *kind == vector),
+                ) && function.blocks.iter().any(|block| {
+                    matches!(
+                        self.program.blocks[block].terminator,
+                        Terminator::ReturnFromInterrupt
+                    )
+                })
+            })
+            .and_then(|function| self.names.get(&function.id).cloned())
+    }
+
     fn emit_verification_dispatch(&mut self) -> Result<(), Vec<AnalysisError>> {
         self.line(0, "")?;
-        self.line(0, "static void verification_dispatch(u16 test_case) {")?;
+        self.line(0, "static void verification_prepare_case(u16 test_case) {")?;
         let functions = self.program.functions.clone();
+        for (index, function) in functions.iter().enumerate() {
+            self.line(1, &format!("if (test_case == {index}) {{"))?;
+            self.line(
+                2,
+                &format!("cpu_pc = 0x{:04x};", function.entry.cpu_address),
+            )?;
+            self.line(2, "return;")?;
+            self.line(1, "}")?;
+        }
+        self.line(1, "__nesc_trap();")?;
+        self.line(0, "}")?;
+        self.line(0, "")?;
+        self.line(0, "static void verification_dispatch(u16 test_case) {")?;
         for (index, function) in functions.iter().enumerate() {
             let name = self.names[&function.id].clone();
             self.line(1, &format!("if (test_case == {index}) {{"))?;
