@@ -83,6 +83,34 @@ impl TimingProfile {
             Region::MultiRegion => None,
         }
     }
+
+    /// Current PPU frame, scanline, and dot at a CPU-cycle boundary.
+    #[must_use]
+    pub const fn ppu_position(self, cycles: u64) -> PpuPosition {
+        let dots = match self {
+            Self::Ntsc | Self::Dendy => cycles.saturating_mul(3),
+            Self::Pal => cycles.saturating_mul(16) / 5,
+        };
+        let scanlines = match self {
+            Self::Ntsc => 262,
+            Self::Pal | Self::Dendy => 312,
+        };
+        let frame_dots = 341_u64 * scanlines;
+        let frame_offset = dots % frame_dots;
+        PpuPosition {
+            frame: dots / frame_dots,
+            scanline: (frame_offset / 341) as u16,
+            dot: (frame_offset % 341) as u16,
+        }
+    }
+}
+
+/// PPU beam position derived from the selected console timing profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PpuPosition {
+    pub frame: u64,
+    pub scanline: u16,
+    pub dot: u16,
 }
 
 /// Machine construction settings.
@@ -193,6 +221,14 @@ pub struct StepReport {
     pub termination: Option<Termination>,
 }
 
+/// Result of advancing exactly one CPU clock while an instruction is pending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CycleReport {
+    pub cycle: u64,
+    pub instruction_complete: bool,
+    pub step: Option<StepReport>,
+}
+
 /// Result of a bounded machine run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunReport {
@@ -260,6 +296,12 @@ struct AddressResult {
     page_crossed: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PendingStep {
+    report: StepReport,
+    remaining_cycles: u64,
+}
+
 /// Public deterministic NES machine.
 pub struct Machine {
     cpu: CpuState,
@@ -299,6 +341,7 @@ pub struct Machine {
     trap_address: Option<u16>,
     trap_reason_address: Option<u16>,
     last_bus_accesses: Vec<BusAccess>,
+    pending_step: Option<PendingStep>,
 }
 
 impl Machine {
@@ -380,6 +423,7 @@ impl Machine {
             trap_address: config.trap_address,
             trap_reason_address: config.trap_reason_address,
             last_bus_accesses: Vec::new(),
+            pending_step: None,
         })
     }
 
@@ -393,6 +437,7 @@ impl Machine {
         self.mapper_state = MapperState::default();
         self.pending_nmi = false;
         self.irq_line = false;
+        self.pending_step = None;
         self.cpu.pc = self.read_word(RESET_VECTOR)?;
         self.last_bus_accesses.clear();
         self.advance_cycles(7);
@@ -405,6 +450,59 @@ impl Machine {
     ///
     /// Fails on undocumented opcodes or required unmapped bus accesses.
     pub fn step(&mut self) -> Result<StepReport, EmulatorError> {
+        if self.pending_step.is_some() {
+            loop {
+                if let Some(report) = self.step_cycle()?.step {
+                    return Ok(report);
+                }
+            }
+        }
+        let report = self.begin_step()?;
+        self.advance_cycles(report.cycles);
+        Ok(report)
+    }
+
+    /// Advances exactly one CPU clock.
+    ///
+    /// Instruction-visible CPU and bus effects are applied when the first
+    /// clock begins; timing, stalls, vblank, and frame transitions then advance
+    /// one clock per call until the completed instruction report is returned.
+    pub fn step_cycle(&mut self) -> Result<CycleReport, EmulatorError> {
+        let mut pending = if let Some(pending) = self.pending_step.take() {
+            pending
+        } else {
+            let report = self.begin_step()?;
+            if report.cycles == 0 {
+                return Ok(CycleReport {
+                    cycle: self.cycles,
+                    instruction_complete: true,
+                    step: Some(report),
+                });
+            }
+            PendingStep {
+                report,
+                remaining_cycles: report.cycles,
+            }
+        };
+        self.advance_cycles(1);
+        pending.remaining_cycles -= 1;
+        if pending.remaining_cycles == 0 {
+            Ok(CycleReport {
+                cycle: self.cycles,
+                instruction_complete: true,
+                step: Some(pending.report),
+            })
+        } else {
+            self.pending_step = Some(pending);
+            Ok(CycleReport {
+                cycle: self.cycles,
+                instruction_complete: false,
+                step: None,
+            })
+        }
+    }
+
+    fn begin_step(&mut self) -> Result<StepReport, EmulatorError> {
         self.last_bus_accesses.clear();
         if self.trap_address == Some(self.cpu.pc) {
             let reason = self
@@ -465,7 +563,6 @@ impl Machine {
         let cycles = self.execute(instruction.mnemonic, instruction.mode)? + self.stall_cycles;
         self.cpu.status = (self.cpu.status & !FLAG_BREAK) | FLAG_UNUSED;
         self.instructions = self.instructions.saturating_add(1);
-        self.advance_cycles(cycles);
         Ok(StepReport {
             pc: instruction_pc,
             opcode: Some(opcode_byte),
@@ -620,6 +717,24 @@ impl Machine {
         self.frames
     }
 
+    /// Selected deterministic timing profile.
+    #[must_use]
+    pub const fn timing_profile(&self) -> TimingProfile {
+        self.timing
+    }
+
+    /// Current PPU beam position.
+    #[must_use]
+    pub const fn ppu_position(&self) -> PpuPosition {
+        self.timing.ppu_position(self.cycles)
+    }
+
+    /// Whether a cycle-stepped instruction or interrupt remains in progress.
+    #[must_use]
+    pub const fn instruction_pending(&self) -> bool {
+        self.pending_step.is_some()
+    }
+
     #[must_use]
     pub fn ram(&self) -> &[u8; 0x800] {
         &self.ram
@@ -724,7 +839,6 @@ impl Machine {
             self.cycles,
             pc,
         );
-        self.advance_cycles(7);
         Ok(StepReport {
             pc,
             opcode: None,

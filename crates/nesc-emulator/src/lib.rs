@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 pub use cpu::CpuState;
 pub use machine::{
-    BusAccess, BusAccessKind, EmulatorConfig, EmulatorError, EventKind, InterruptKind, Machine,
-    MachineSnapshot, ObservableEvent, RunLimits, RunReport, StepReport, Termination, TimingProfile,
+    BusAccess, BusAccessKind, CycleReport, EmulatorConfig, EmulatorError, EventKind, InterruptKind,
+    Machine, MachineSnapshot, ObservableEvent, PpuPosition, RunLimits, RunReport, StepReport,
+    Termination, TimingProfile,
 };
 
 /// First difference between two ordered observable-event traces.
@@ -426,5 +427,85 @@ mod tests {
         assert_eq!(machine.peek(0x0010).expect("observational read"), 0x2a);
         assert_eq!(machine.last_bus_accesses(), accesses);
         assert_eq!(machine.mapped_prg_bank(0x8000), Some(0));
+    }
+
+    #[test]
+    fn advances_instructions_interrupts_and_dma_one_cpu_clock_at_a_time() {
+        let rom = rom_with_program(
+            &[
+                0xa9, 0x00, // lda #0
+                0x8d, 0x14, 0x40, // sta $4014
+            ],
+            Region::Ntsc,
+        );
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        let initial_cycles = machine.cycles();
+        let first = machine.step_cycle().expect("first LDA clock");
+        assert!(!first.instruction_complete);
+        assert!(first.step.is_none());
+        assert_eq!(machine.cycles(), initial_cycles + 1);
+        assert!(machine.instruction_pending());
+        let second = machine.step_cycle().expect("second LDA clock");
+        assert!(second.instruction_complete);
+        assert_eq!(second.step.expect("LDA report").cycles, 2);
+        assert_eq!(machine.cycles(), initial_cycles + 2);
+        assert!(!machine.instruction_pending());
+
+        let dma_start = machine.cycles();
+        let mut dma_clocks = 0_u64;
+        let dma = loop {
+            dma_clocks += 1;
+            let cycle = machine.step_cycle().expect("DMA instruction clock");
+            if let Some(report) = cycle.step {
+                break report;
+            }
+        };
+        assert_eq!(dma_clocks, dma.cycles);
+        assert_eq!(dma.cycles, 518);
+        assert_eq!(machine.cycles(), dma_start + dma.cycles);
+
+        machine.request_nmi();
+        let interrupt_start = machine.cycles();
+        let mut interrupt_clocks = 0_u64;
+        let interrupt = loop {
+            interrupt_clocks += 1;
+            let cycle = machine.step_cycle().expect("NMI clock");
+            if let Some(report) = cycle.step {
+                break report;
+            }
+        };
+        assert_eq!(interrupt_clocks, 7);
+        assert_eq!(interrupt.interrupt, Some(InterruptKind::Nmi));
+        assert_eq!(machine.cycles(), interrupt_start + 7);
+    }
+
+    #[test]
+    fn reports_ppu_positions_for_every_timing_profile() {
+        assert_eq!(
+            TimingProfile::Ntsc.ppu_position(114),
+            super::PpuPosition {
+                frame: 0,
+                scanline: 1,
+                dot: 1,
+            }
+        );
+        assert_eq!(
+            TimingProfile::Pal.ppu_position(5),
+            super::PpuPosition {
+                frame: 0,
+                scanline: 0,
+                dot: 16,
+            }
+        );
+        assert_eq!(
+            TimingProfile::Dendy.ppu_position(114),
+            super::PpuPosition {
+                frame: 0,
+                scanline: 1,
+                dot: 1,
+            }
+        );
     }
 }
