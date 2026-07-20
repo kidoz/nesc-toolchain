@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use nesc_mir::{BinaryOperator, FunctionId, InstructionKind, Module};
+use nesc_mir::{BankPlacement, BinaryOperator, FunctionId, InstructionKind, Module};
 
 use crate::CodegenError;
 
@@ -17,12 +17,18 @@ pub struct StackReport {
     pub functions: BTreeMap<String, u16>,
 }
 
+struct CallGraph {
+    callees: HashMap<FunctionId, BTreeSet<FunctionId>>,
+    banked_overhead: HashMap<(FunctionId, FunctionId), u16>,
+}
+
 pub(crate) fn analyze(
     module: &Module,
     limit: u16,
     external_stack_bytes: &BTreeMap<String, u16>,
 ) -> Result<StackReport, Vec<CodegenError>> {
     let mut calls = HashMap::<FunctionId, BTreeSet<FunctionId>>::new();
+    let mut banked_call_overhead = HashMap::<(FunctionId, FunctionId), u16>::new();
     let mut helper_callers = HashSet::new();
     let mut inline_stack = HashMap::<FunctionId, u16>::new();
     let external_stack = module
@@ -43,8 +49,17 @@ pub(crate) fn analyze(
         let mut callees = BTreeSet::new();
         for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
             match &instruction.kind {
-                InstructionKind::Call { function, .. } => {
-                    callees.insert(*function);
+                InstructionKind::Call {
+                    function: callee, ..
+                } => {
+                    callees.insert(*callee);
+                    record_banked_call(
+                        module,
+                        function.id,
+                        function.placement,
+                        *callee,
+                        &mut banked_call_overhead,
+                    );
                 }
                 InstructionKind::Binary {
                     operator:
@@ -59,6 +74,15 @@ pub(crate) fn analyze(
                 }
                 InstructionKind::InlineAssembly(assembly) => {
                     callees.extend(assembly.calls.iter().copied());
+                    for callee in &assembly.calls {
+                        record_banked_call(
+                            module,
+                            function.id,
+                            function.placement,
+                            *callee,
+                            &mut banked_call_overhead,
+                        );
+                    }
                     inline_stack
                         .entry(function.id)
                         .and_modify(|bytes| *bytes = (*bytes).max(assembly.stack_bytes))
@@ -69,6 +93,10 @@ pub(crate) fn analyze(
         }
         calls.insert(function.id, callees);
     }
+    let call_graph = CallGraph {
+        callees: calls,
+        banked_overhead: banked_call_overhead,
+    };
     let mut memo = HashMap::new();
     let mut functions = BTreeMap::new();
     let mut maximum_call_path = 0;
@@ -83,7 +111,7 @@ pub(crate) fn analyze(
         }
         let usage = call_usage(
             function.id,
-            &calls,
+            &call_graph,
             &helper_callers,
             &inline_stack,
             &external_stack,
@@ -111,9 +139,29 @@ pub(crate) fn analyze(
     })
 }
 
+fn record_banked_call(
+    module: &Module,
+    caller: FunctionId,
+    caller_placement: BankPlacement,
+    callee: FunctionId,
+    overhead: &mut HashMap<(FunctionId, FunctionId), u16>,
+) {
+    let Some(target) = module.functions.get(callee.0 as usize) else {
+        return;
+    };
+    let crosses_to_switchable = match (caller_placement, target.placement) {
+        (_, BankPlacement::Fixed) => false,
+        (BankPlacement::Bank(left), BankPlacement::Bank(right)) => left != right,
+        (BankPlacement::Fixed, BankPlacement::Bank(_)) => true,
+    };
+    if crosses_to_switchable {
+        overhead.insert((caller, callee), 3);
+    }
+}
+
 fn call_usage(
     function: FunctionId,
-    calls: &HashMap<FunctionId, BTreeSet<FunctionId>>,
+    call_graph: &CallGraph,
     helper_callers: &HashSet<FunctionId>,
     inline_stack: &HashMap<FunctionId, u16>,
     external_stack: &HashMap<FunctionId, u16>,
@@ -131,12 +179,12 @@ fn call_usage(
         }]);
     }
     let mut nested = u16::from(helper_callers.contains(&function)) * 2;
-    if let Some(callees) = calls.get(&function) {
+    if let Some(callees) = call_graph.callees.get(&function) {
         for callee in callees {
-            let usage = if calls.contains_key(callee) {
+            let usage = if call_graph.callees.contains_key(callee) {
                 call_usage(
                     *callee,
-                    calls,
+                    call_graph,
                     helper_callers,
                     inline_stack,
                     external_stack,
@@ -146,7 +194,12 @@ fn call_usage(
             } else {
                 3_u16.saturating_add(external_stack.get(callee).copied().unwrap_or(0))
             };
-            nested = nested.max(usage);
+            let overhead = call_graph
+                .banked_overhead
+                .get(&(function, *callee))
+                .copied()
+                .unwrap_or(0);
+            nested = nested.max(usage.saturating_add(overhead));
         }
     }
     nested = nested.saturating_add(inline_stack.get(&function).copied().unwrap_or(0));
@@ -174,14 +227,22 @@ mod tests {
 
     use nesc_mir::FunctionId;
 
-    use super::call_usage;
+    use super::{CallGraph, call_usage};
+
+    fn call_graph(callees: HashMap<FunctionId, BTreeSet<FunctionId>>) -> CallGraph {
+        CallGraph {
+            callees,
+            banked_overhead: HashMap::new(),
+        }
+    }
 
     #[test]
     fn includes_external_leaf_calls() {
         let calls = HashMap::from([(FunctionId(0), BTreeSet::from([FunctionId(1)]))]);
+        let graph = call_graph(calls);
         let usage = call_usage(
             FunctionId(0),
-            &calls,
+            &graph,
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -195,9 +256,10 @@ mod tests {
     #[test]
     fn includes_declared_external_stack_use() {
         let calls = HashMap::from([(FunctionId(0), BTreeSet::from([FunctionId(1)]))]);
+        let graph = call_graph(calls);
         let usage = call_usage(
             FunctionId(0),
-            &calls,
+            &graph,
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::from([(FunctionId(1), 4)]),
@@ -209,11 +271,32 @@ mod tests {
     }
 
     #[test]
+    fn includes_cross_bank_trampoline_use() {
+        let calls = HashMap::from([(FunctionId(0), BTreeSet::from([FunctionId(1)]))]);
+        let graph = CallGraph {
+            callees: calls,
+            banked_overhead: HashMap::from([((FunctionId(0), FunctionId(1)), 3)]),
+        };
+        let usage = call_usage(
+            FunctionId(0),
+            &graph,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("acyclic graph");
+        assert_eq!(usage, 8);
+    }
+
+    #[test]
     fn rejects_recursive_graphs() {
         let calls = HashMap::from([(FunctionId(0), BTreeSet::from([FunctionId(0)]))]);
+        let graph = call_graph(calls);
         let errors = call_usage(
             FunctionId(0),
-            &calls,
+            &graph,
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -227,9 +310,10 @@ mod tests {
     #[test]
     fn includes_arithmetic_helper_calls() {
         let calls = HashMap::from([(FunctionId(0), BTreeSet::new())]);
+        let graph = call_graph(calls);
         let usage = call_usage(
             FunctionId(0),
-            &calls,
+            &graph,
             &HashSet::from([FunctionId(0)]),
             &HashMap::new(),
             &HashMap::new(),

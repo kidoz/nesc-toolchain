@@ -21,6 +21,18 @@ pub enum SectionKind {
     ReadOnlyData,
 }
 
+/// Mapper-aware PRG-ROM placement requirement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SectionPlacement {
+    /// Let the linker choose a safe location.
+    #[default]
+    Any,
+    /// Place the section in the permanently mapped PRG-ROM bank.
+    Fixed,
+    /// Place the section in a numbered switchable PRG-ROM bank.
+    Bank(u16),
+}
+
 /// Symbol visibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Binding {
@@ -48,6 +60,8 @@ pub struct Section {
     pub name: String,
     /// Placement class.
     pub kind: SectionKind,
+    /// Mapper-aware PRG-ROM placement requirement.
+    pub placement: SectionPlacement,
     /// Required power-of-two alignment.
     pub alignment: u16,
     /// Encoded bytes with zero placeholders at relocation sites.
@@ -126,6 +140,17 @@ impl Object {
         kind: SectionKind,
         alignment: u16,
     ) -> Result<SectionId, ObjectError> {
+        self.add_section_with_placement(name, kind, alignment, SectionPlacement::Any)
+    }
+
+    /// Adds a section with an explicit mapper-aware placement requirement.
+    pub fn add_section_with_placement(
+        &mut self,
+        name: impl Into<String>,
+        kind: SectionKind,
+        alignment: u16,
+        placement: SectionPlacement,
+    ) -> Result<SectionId, ObjectError> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(ObjectError(
                 "section alignment must be a power of two".to_owned(),
@@ -139,6 +164,7 @@ impl Object {
             id,
             name: name.into(),
             kind,
+            placement,
             alignment,
             bytes: Vec::new(),
         });

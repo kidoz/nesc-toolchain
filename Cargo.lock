@@ -228,6 +228,7 @@ dependencies = [
  "nesc-hir",
  "nesc-linker",
  "nesc-mir",
+ "nesc-object",
  "nesc-opt",
  "nesc-project",
  "nesc-rom",

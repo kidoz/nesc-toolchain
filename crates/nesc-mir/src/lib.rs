@@ -47,6 +47,16 @@ pub struct Module {
     pub globals: Vec<Type>,
 }
 
+/// Mapper-aware placement requirement retained through machine-code emission.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BankPlacement {
+    /// Place in the fixed bank. This is the safe default for callable code.
+    #[default]
+    Fixed,
+    /// Place in a numbered switchable PRG-ROM bank.
+    Bank(u16),
+}
+
 /// MIR function.
 #[derive(Clone, Debug)]
 pub struct Function {
@@ -54,6 +64,8 @@ pub struct Function {
     pub id: FunctionId,
     /// Linker-visible name.
     pub name: String,
+    /// Mapper-aware PRG-ROM placement requirement.
+    pub placement: BankPlacement,
     /// Return type.
     pub return_type: Type,
     /// Parameter slots.
@@ -353,6 +365,13 @@ pub fn lower_with_config(
     let mut errors = Vec::new();
     let mut functions = Vec::with_capacity(hir.functions.len());
     for function in &hir.functions {
+        let placement = match function_placement(function) {
+            Ok(placement) => placement,
+            Err(error) => {
+                errors.push(error);
+                BankPlacement::Fixed
+            }
+        };
         let Some(body) = &function.body else {
             let locals = function
                 .parameters
@@ -371,6 +390,7 @@ pub fn lower_with_config(
             functions.push(Function {
                 id: function.id,
                 name: function.name.clone(),
+                placement,
                 return_type: function.signature.return_type.clone(),
                 parameters: locals.iter().map(|local| local.id).collect(),
                 locals,
@@ -380,7 +400,7 @@ pub fn lower_with_config(
             });
             continue;
         };
-        let mut builder = Builder::new(hir, function, config);
+        let mut builder = Builder::new(hir, function, placement, config);
         builder.lower_block(body, false);
         builder.finish();
         errors.append(&mut builder.errors);
@@ -421,13 +441,19 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(hir: &'a HirModule, source: &nesc_hir::Function, config: LoweringConfig) -> Self {
+    fn new(
+        hir: &'a HirModule,
+        source: &nesc_hir::Function,
+        placement: BankPlacement,
+        config: LoweringConfig,
+    ) -> Self {
         let entry = BlockId(0);
         let mut builder = Self {
             hir,
             function: Function {
                 id: source.id,
                 name: source.name.clone(),
+                placement,
                 return_type: source.signature.return_type.clone(),
                 parameters: Vec::new(),
                 locals: Vec::new(),
@@ -1419,6 +1445,71 @@ impl<'a> Builder<'a> {
             span,
         });
     }
+}
+
+fn function_placement(function: &nesc_hir::Function) -> Result<BankPlacement, LoweringError> {
+    let fixed_attributes = function
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.name == "fixed_bank")
+        .collect::<Vec<_>>();
+    let bank_attributes = function
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.name == "bank")
+        .collect::<Vec<_>>();
+    if bank_attributes.len() > 1 {
+        return Err(LoweringError {
+            message: format!(
+                "function `{}` declares NES_BANK more than once",
+                function.name
+            ),
+            span: bank_attributes[1].span,
+        });
+    }
+    let bank = bank_attributes.first().copied();
+    if !fixed_attributes.is_empty()
+        && let Some(attribute) = bank
+    {
+        return Err(LoweringError {
+            message: format!(
+                "function `{}` cannot use both NES_FIXED_BANK and NES_BANK",
+                function.name
+            ),
+            span: attribute.span,
+        });
+    }
+    if let Some(attribute) = bank
+        && function
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute.name.as_str(), "main" | "reset" | "nmi" | "irq"))
+    {
+        return Err(LoweringError {
+            message: format!(
+                "entry or interrupt function `{}` must remain in the fixed bank",
+                function.name
+            ),
+            span: attribute.span,
+        });
+    }
+    let Some(attribute) = bank else {
+        return Ok(BankPlacement::Fixed);
+    };
+    let Some(argument) = attribute.arguments.first() else {
+        return Ok(BankPlacement::Fixed);
+    };
+    let nesc_hir::ExpressionKind::Integer(literal) = &argument.kind else {
+        return Err(LoweringError {
+            message: "NES_BANK requires an integer literal bank number".to_owned(),
+            span: argument.span,
+        });
+    };
+    let bank = u16::try_from(literal.value).map_err(|_| LoweringError {
+        message: "NES_BANK number exceeds the supported 16-bit range".to_owned(),
+        span: argument.span,
+    })?;
+    Ok(BankPlacement::Bank(bank))
 }
 
 fn type_size(ty: &Type) -> u16 {

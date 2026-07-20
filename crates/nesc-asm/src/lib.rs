@@ -5,7 +5,10 @@ use std::error::Error;
 use std::fmt;
 
 use nesc_disasm::{AddressingMode, Opcode, opcode};
-use nesc_object::{Binding, Object, Relocation, RelocationKind, SectionKind, SymbolId, SymbolKind};
+use nesc_object::{
+    Binding, Object, Relocation, RelocationKind, SectionKind, SectionPlacement, SymbolId,
+    SymbolKind,
+};
 
 /// Resource bounds applied while parsing generated recovery assembly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +127,7 @@ enum Statement {
     Segment(String),
     Export(String),
     Import(String),
+    Bank(SectionPlacement),
     Stack {
         symbol: String,
         bytes: u16,
@@ -182,7 +186,10 @@ pub fn assemble_recovery(
                     format!("recovery assembly does not support segment `{name}`"),
                 ));
             }
-            Statement::Export(_) | Statement::Import(_) | Statement::Stack { .. } => {
+            Statement::Export(_)
+            | Statement::Import(_)
+            | Statement::Bank(_)
+            | Statement::Stack { .. } => {
                 return Err(AssemblyError::at(
                     located.line,
                     "module directives are not valid in recovery assembly",
@@ -285,6 +292,7 @@ pub fn assemble_inline_with_calls(
             | Statement::Label(_)
             | Statement::Export(_)
             | Statement::Import(_)
+            | Statement::Bank(_)
             | Statement::Stack { .. } => {
                 return Err(AssemblyError::at(
                     located.line,
@@ -312,9 +320,10 @@ pub fn assemble_inline_with_calls(
 /// Assembles one standalone source file into the shared relocatable object
 /// representation.
 ///
-/// Modules use `.segment "CODE"`, `.export name`, `.import name`, and one
-/// `.nesc_stack name, bytes` contract for every exported function. Symbolic
-/// 16-bit operands and branch targets become linker relocations.
+/// Modules use `.segment "CODE"`, `.export name`, `.import name`, an optional
+/// module-wide `.nesc_bank fixed|number`, and one `.nesc_stack name, bytes`
+/// contract for every exported function. Symbolic 16-bit operands and branch
+/// targets become linker relocations.
 ///
 /// # Errors
 ///
@@ -337,6 +346,8 @@ pub fn assemble_module(
     let mut exports = BTreeMap::<String, (String, usize)>::new();
     let mut imports = BTreeMap::<String, (String, usize)>::new();
     let mut stack_contracts = BTreeMap::<String, (u16, usize)>::new();
+    let mut placement = SectionPlacement::Any;
+    let mut bank_directive = None;
     let mut in_code = false;
     let mut offset = 0_u32;
 
@@ -384,6 +395,15 @@ pub fn assemble_module(
             }
             Statement::Import(name) => {
                 insert_module_directive(&mut imports, name, located.line, ".import")?;
+            }
+            Statement::Bank(requested) => {
+                if bank_directive.replace(located.line).is_some() {
+                    return Err(AssemblyError::at(
+                        located.line,
+                        "`.nesc_bank` appears more than once",
+                    ));
+                }
+                placement = *requested;
             }
             Statement::Stack { symbol, bytes } => {
                 let key = symbol.to_ascii_lowercase();
@@ -464,7 +484,12 @@ pub fn assemble_module(
 
     let mut object = Object::default();
     let section = object
-        .add_section(format!(".text.{module_name}"), SectionKind::Code, 1)
+        .add_section_with_placement(
+            format!(".text.{module_name}"),
+            SectionKind::Code,
+            1,
+            placement,
+        )
         .map_err(|error| AssemblyError::global(error.to_string()))?;
     let mut symbol_ids = BTreeMap::<String, SymbolId>::new();
     let mut export_locations = Vec::new();
@@ -570,6 +595,7 @@ pub fn assemble_module(
             | Statement::Label(_)
             | Statement::Export(_)
             | Statement::Import(_)
+            | Statement::Bank(_)
             | Statement::Stack { .. } => {}
         }
     }
@@ -758,6 +784,14 @@ fn parse_statement(text: &str, line: usize) -> Result<Statement, AssemblyError> 
             bytes: parse_u16(bytes.trim(), line)?,
         });
     }
+    if let Some(bank) = text.strip_prefix(".nesc_bank ") {
+        let bank = bank.trim();
+        return if bank.eq_ignore_ascii_case("fixed") {
+            Ok(Statement::Bank(SectionPlacement::Fixed))
+        } else {
+            parse_u16(bank, line).map(|bank| Statement::Bank(SectionPlacement::Bank(bank)))
+        };
+    }
     if let Some(value) = text.strip_prefix(".org ") {
         return parse_u16(value.trim(), line).map(Statement::Origin);
     }
@@ -845,6 +879,7 @@ fn collect_symbols(
             | Statement::Segment(_)
             | Statement::Export(_)
             | Statement::Import(_)
+            | Statement::Bank(_)
             | Statement::Stack { .. } => {}
         }
     }
@@ -925,6 +960,7 @@ fn emit(
             | Statement::Label(_)
             | Statement::Export(_)
             | Statement::Import(_)
+            | Statement::Bank(_)
             | Statement::Stack { .. } => {}
         }
     }
@@ -1231,6 +1267,7 @@ mod tests {
             .segment "CODE"
             .export fast_collision
             .import helper
+            .nesc_bank 1
             .nesc_stack fast_collision, 2
             fast_collision:
                 jsr helper
@@ -1241,6 +1278,10 @@ mod tests {
         let module = assemble_module(source, "collision", AssemblyLimits::default())
             .expect("assembly module");
         assert_eq!(module.object.sections[0].bytes, [0x20, 0, 0, 0xd0, 0, 0x60]);
+        assert_eq!(
+            module.object.sections[0].placement,
+            nesc_object::SectionPlacement::Bank(1)
+        );
         assert_eq!(module.object.relocations.len(), 2);
         assert_eq!(
             module.object.relocations[0].kind,

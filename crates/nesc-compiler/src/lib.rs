@@ -205,6 +205,12 @@ fn validate_assembly_abi(
     hir: &nesc_hir::Module,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let assembly_placement = module
+        .object
+        .sections
+        .first()
+        .map(|section| section.placement)
+        .unwrap_or(nesc_object::SectionPlacement::Any);
     for exported in &module.exports {
         match hir
             .function_names
@@ -212,7 +218,43 @@ fn validate_assembly_abi(
             .and_then(|id| hir.function(*id))
         {
             Some(function)
-                if function.body.is_none() && function.linkage == nesc_hir::Linkage::External => {}
+                if function.body.is_none() && function.linkage == nesc_hir::Linkage::External =>
+            {
+                let declared_placement = function
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute.name.as_str() {
+                        "fixed_bank" => Some(nesc_object::SectionPlacement::Fixed),
+                        "bank" => attribute.arguments.first().and_then(|argument| {
+                            if let nesc_hir::ExpressionKind::Integer(literal) = &argument.kind {
+                                u16::try_from(literal.value)
+                                    .ok()
+                                    .map(nesc_object::SectionPlacement::Bank)
+                            } else {
+                                None
+                            }
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or(nesc_object::SectionPlacement::Fixed);
+                let effective_assembly_placement = match assembly_placement {
+                    nesc_object::SectionPlacement::Any => nesc_object::SectionPlacement::Fixed,
+                    placement => placement,
+                };
+                if effective_assembly_placement != declared_placement {
+                    diagnostics.push(assembly_source_diagnostic(
+                        path,
+                        source,
+                        exported.line,
+                        "E2103",
+                        format!(
+                            "assembly export `{}` does not match its NesC bank declaration",
+                            exported.name
+                        ),
+                        "bank placement mismatch",
+                    ));
+                }
+            }
             Some(_) => diagnostics.push(assembly_source_diagnostic(
                 path,
                 source,
@@ -326,7 +368,7 @@ fn line_span(source: &str, line: usize) -> (usize, usize) {
     )
 }
 
-/// Compiles and links a project into Mapper 0 artifacts.
+/// Compiles and links a project into supported NES cartridge artifacts.
 ///
 /// # Errors
 ///
@@ -378,10 +420,17 @@ pub fn build_project(
             .map(|error| Diagnostic::error("E3001", error.to_string()))
             .collect::<Vec<_>>()
     })?;
+    let banked_symbols = project.manifest().cartridge.mapper == 2;
     let symbols = linked
         .symbols
         .iter()
-        .map(|(name, address)| format!("{address:04X} {name}\n"))
+        .map(|(name, address)| {
+            if banked_symbols {
+                format!("{:03}:{address:04X} {name}\n", linked.symbol_banks[name])
+            } else {
+                format!("{address:04X} {name}\n")
+            }
+        })
         .collect::<String>();
     let mut source_map = String::new();
     for function in &checked.hir.functions {
@@ -389,8 +438,13 @@ pub fn build_project(
             continue;
         };
         if let Some(source) = checked.hir.sources.get(function.span.source) {
+            let location = if banked_symbols {
+                format!("{:03}:{address:04X}", linked.symbol_banks[&function.name])
+            } else {
+                format!("{address:04X}")
+            };
             source_map.push_str(&format!(
-                "{address:04X} {}:{}:{} {}\n",
+                "{location} {}:{}:{} {}\n",
                 source.path().display(),
                 function.span.start,
                 function.span.len,
@@ -403,8 +457,13 @@ pub fn build_project(
             let Some(address) = linked.symbols.get(&exported.name) else {
                 continue;
             };
+            let location = if banked_symbols {
+                format!("{:03}:{address:04X}", linked.symbol_banks[&exported.name])
+            } else {
+                format!("{address:04X}")
+            };
             source_map.push_str(&format!(
-                "{address:04X} {}:{}:1 {}\n",
+                "{location} {}:{}:1 {}\n",
                 assembly.path.display(),
                 exported.line,
                 exported.name
@@ -494,11 +553,16 @@ fn linker_config(project: &Project) -> Result<nesc_linker::LinkConfig, Vec<Diagn
         Mirroring::SingleScreenLower | Mirroring::SingleScreenUpper => {
             return Err(vec![Diagnostic::error(
                 "E3002",
-                "Mapper 0 does not support single-screen mirroring",
+                format!(
+                    "Mapper {} does not support single-screen mirroring",
+                    cartridge.mapper
+                ),
             )]);
         }
     };
     Ok(nesc_linker::LinkConfig {
+        mapper: cartridge.mapper,
+        submapper: cartridge.submapper,
         format: match project.manifest().build.format {
             RomFormat::Ines => nesc_rom::Format::Ines,
             RomFormat::Nes2 => nesc_rom::Format::Nes2,
@@ -578,6 +642,70 @@ NES_MAIN int main(void) {
         .expect("boot oracle");
         assert_eq!(boot.background_color, 0x21);
         assert!(boot.frames >= 2);
+    }
+
+    #[test]
+    fn builds_and_executes_a_cross_bank_uxrom_call() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("uxrom-call");
+        create_project("uxrom-call", &project_path).expect("project");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path)
+            .expect("manifest source")
+            .replace("\nmapper = 0\n", "\nmapper = 2\n")
+            .replace("prg-rom-kib = 32", "prg-rom-kib = 64");
+        fs::write(&manifest_path, manifest).expect("Mapper 2 manifest");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+NES_BANK(1) NES_NOINLINE u8 banked_color(void) {
+    return 0x2Au8;
+}
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    nes_set_background_color(banked_color());
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("Mapper 2 source");
+        let project = Project::load(&manifest_path).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        let rom = nesc_rom::parse(&artifacts.rom).expect("parse generated ROM");
+        assert_eq!(rom.metadata.mapper, 2);
+        assert!(artifacts.symbols.contains("001:8000 banked_color"));
+        assert!(artifacts.map.contains("__nesc_bankcall_banked_color"));
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x2a,
+            200_000,
+        )
+        .expect("Mapper 2 boot oracle");
+        assert_eq!(boot.background_color, 0x2a);
+    }
+
+    #[test]
+    fn rejects_switchable_entry_functions() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("banked-entry");
+        create_project("banked-entry", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            "#include <nes.h>\nNES_MAIN NES_BANK(0) int main(void) { return 0; }\n",
+        )
+        .expect("banked entry source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let diagnostics = check_project(&project, &CompilerConfig::bundled_sdk())
+            .expect_err("switchable entry rejected");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code() == "E2000"
+                && diagnostic
+                    .render()
+                    .contains("entry or interrupt function `main` must remain in the fixed bank")
+        }));
     }
 
     #[test]
@@ -673,6 +801,60 @@ assembly_double:
             200_000,
         )
         .expect("standalone assembly boot oracle");
+        assert_eq!(boot.background_color, 0x2a);
+    }
+
+    #[test]
+    fn links_switchable_uxrom_assembly_functions() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("banked-assembly");
+        create_project("banked-assembly", &project_path).expect("project");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path)
+            .expect("manifest source")
+            .replace("assembly = []", "assembly = [\"src/color.s\"]")
+            .replace("\nmapper = 0\n", "\nmapper = 2\n")
+            .replace("prg-rom-kib = 32", "prg-rom-kib = 64");
+        fs::write(&manifest_path, manifest).expect("Mapper 2 assembly manifest");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+NES_BANK(1) extern u8 assembly_color(void);
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    nes_set_background_color(assembly_color());
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("NesC source");
+        fs::write(
+            project_path.join("src/color.s"),
+            r#".setcpu "6502"
+.segment "CODE"
+.export assembly_color
+.nesc_bank 1
+.nesc_stack assembly_color, 0
+
+assembly_color:
+    lda #$2A
+    rts
+"#,
+        )
+        .expect("assembly source");
+        let project = Project::load(&manifest_path).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        assert!(artifacts.symbols.contains("001:8000 assembly_color"));
+        assert!(artifacts.map.contains("__nesc_bankcall_assembly_color"));
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x2a,
+            200_000,
+        )
+        .expect("banked assembly boot oracle");
         assert_eq!(boot.background_color, 0x2a);
     }
 

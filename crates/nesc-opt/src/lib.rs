@@ -285,8 +285,8 @@ fn sign_extend(value: u64, width: u8) -> i64 {
 #[cfg(test)]
 mod tests {
     use nesc_mir::{
-        BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionKind, Module,
-        Terminator, Type, TypeKind, ValueId,
+        BankPlacement, BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionKind,
+        Module, Terminator, Type, TypeKind, ValueId,
     };
 
     use super::{Effect, optimize};
@@ -299,6 +299,7 @@ mod tests {
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "main".to_owned(),
+                placement: BankPlacement::Fixed,
                 return_type: ty.clone(),
                 parameters: Vec::new(),
                 locals: Vec::new(),

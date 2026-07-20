@@ -13,7 +13,8 @@ use nesc_mir::{
     Instruction, InstructionKind, Module, SourceSpan, Terminator, TypeKind, UnaryOperator, ValueId,
 };
 use nesc_object::{
-    Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SymbolId, SymbolKind,
+    Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SectionPlacement,
+    SymbolId, SymbolKind,
 };
 
 pub use abi::{
@@ -117,6 +118,7 @@ pub fn generate_with_config(
 struct Emitter {
     object: Object,
     code: SectionId,
+    function_sections: Vec<Option<SectionId>>,
     function_symbols: Vec<SymbolId>,
     block_symbols: HashMap<(u32, u32), SymbolId>,
     helper_symbols: HashMap<String, SymbolId>,
@@ -130,17 +132,42 @@ struct Emitter {
 impl Emitter {
     fn new(module: &Module, allocation: allocation::Allocation) -> Result<Self, Vec<CodegenError>> {
         let mut object = Object::default();
-        let code = object
-            .add_section(".text", SectionKind::Code, 1)
-            .map_err(|error| {
-                vec![CodegenError {
-                    message: error.to_string(),
-                    span: None,
-                }]
-            })?;
+        let mut function_sections = Vec::with_capacity(module.functions.len());
+        for function in &module.functions {
+            let section = if function.blocks.is_empty() {
+                None
+            } else {
+                let placement = match function.placement {
+                    nesc_mir::BankPlacement::Fixed => SectionPlacement::Fixed,
+                    nesc_mir::BankPlacement::Bank(bank) => SectionPlacement::Bank(bank),
+                };
+                Some(
+                    object
+                        .add_section_with_placement(
+                            format!(".text.{}", function.name),
+                            SectionKind::Code,
+                            1,
+                            placement,
+                        )
+                        .map_err(|error| {
+                            vec![CodegenError {
+                                message: error.to_string(),
+                                span: None,
+                            }]
+                        })?,
+                )
+            };
+            function_sections.push(section);
+        }
+        let code = function_sections
+            .iter()
+            .flatten()
+            .copied()
+            .next()
+            .unwrap_or(SectionId(0));
         let mut function_symbols = Vec::with_capacity(module.functions.len());
         for function in &module.functions {
-            let section = (!function.blocks.is_empty()).then_some(code);
+            let section = function_sections[function.id.0 as usize];
             let symbol = object
                 .add_symbol(
                     &function.name,
@@ -164,7 +191,7 @@ impl Emitter {
                 let symbol = object
                     .add_symbol(
                         format!("{}.block{}", function.name, block.id.0),
-                        Some(code),
+                        function_sections[function.id.0 as usize],
                         0,
                         SymbolKind::Label,
                         Binding::Local,
@@ -188,6 +215,7 @@ impl Emitter {
         Ok(Self {
             object,
             code,
+            function_sections,
             function_symbols,
             block_symbols,
             helper_symbols: HashMap::new(),
@@ -200,6 +228,8 @@ impl Emitter {
     }
 
     fn function(&mut self, function: &Function) {
+        self.code = self.function_sections[function.id.0 as usize]
+            .expect("defined function has a code section");
         let function_symbol = self.function_symbols[function.id.0 as usize];
         self.define(function_symbol);
         self.assembly.push_str(&format!(
@@ -1397,9 +1427,9 @@ impl Emitter {
 mod tests {
     use nesc_mir::{
         AssemblyClobbers, AssemblyInput, AssemblyOutput, AssemblyOutputTarget, AssemblyRegister,
-        BasicBlock, BinaryOperator, BlockId, Effect, Function, FunctionId, InlineAssembly,
-        Instruction, InstructionKind, Local, LocalId, Module, SourceId, SourceSpan, Terminator,
-        Type, TypeKind, ValueId,
+        BankPlacement, BasicBlock, BinaryOperator, BlockId, Effect, Function, FunctionId,
+        InlineAssembly, Instruction, InstructionKind, Local, LocalId, Module, SourceId, SourceSpan,
+        Terminator, Type, TypeKind, ValueId,
     };
 
     use super::generate;
@@ -1413,6 +1443,7 @@ mod tests {
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "main".to_owned(),
+                placement: BankPlacement::Fixed,
                 return_type: ty.clone(),
                 parameters: Vec::new(),
                 locals: Vec::new(),
@@ -1453,6 +1484,7 @@ mod tests {
                 Function {
                     id: FunctionId(0),
                     name: "main".to_owned(),
+                    placement: BankPlacement::Fixed,
                     return_type: void.clone(),
                     parameters: Vec::new(),
                     locals: vec![Local {
@@ -1504,6 +1536,7 @@ mod tests {
                 Function {
                     id: FunctionId(1),
                     name: "helper".to_owned(),
+                    placement: BankPlacement::Fixed,
                     return_type: void,
                     parameters: Vec::new(),
                     locals: Vec::new(),
@@ -1538,6 +1571,7 @@ mod tests {
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "multiply".to_owned(),
+                placement: BankPlacement::Fixed,
                 return_type: ty.clone(),
                 parameters: vec![nesc_mir::LocalId(0), nesc_mir::LocalId(1)],
                 locals: vec![

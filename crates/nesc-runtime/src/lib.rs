@@ -5,7 +5,8 @@ mod arithmetic;
 use std::collections::BTreeSet;
 
 use nesc_object::{
-    Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SymbolId, SymbolKind,
+    Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SectionPlacement,
+    SymbolId, SymbolKind,
 };
 
 /// Generated startup/runtime object and symbolic assembly.
@@ -61,7 +62,7 @@ impl RuntimeEmitter {
     fn new() -> Self {
         let mut object = Object::default();
         let code = object
-            .add_section(".runtime", SectionKind::Code, 1)
+            .add_section_with_placement(".runtime", SectionKind::Code, 1, SectionPlacement::Fixed)
             .expect("runtime section");
         let main = object
             .add_symbol("main", None, 0, SymbolKind::Function, Binding::Global)
@@ -81,6 +82,7 @@ impl RuntimeEmitter {
         self.emit(&[0xa2, 0xff], "ldx #$ff");
         self.emit(&[0x9a], "txs");
         self.emit(&[0xe8], "inx");
+        self.emit(&[0x86, 0xfc], "stx $fc ; selected PRG bank shadow");
         self.emit(&[0x8e, 0x00, 0x20], "stx $2000");
         self.emit(&[0x8e, 0x01, 0x20], "stx $2001");
         self.absolute(0x20, "jsr", self.main);

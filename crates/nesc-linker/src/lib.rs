@@ -4,12 +4,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
-use nesc_object::{Binding, Object, RelocationKind, SectionId, SymbolId};
+use nesc_object::{Binding, Object, RelocationKind, SectionId, SectionPlacement, SymbolId};
 use nesc_rom::{Format, Metadata, Mirroring, Region, Rom};
 
-/// Mapper 0 link settings.
+/// NES cartridge link settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkConfig {
+    /// Cartridge mapper number.
+    pub mapper: u16,
+    /// NES 2.0 submapper number.
+    pub submapper: u8,
     /// Header encoding.
     pub format: Format,
     /// PRG-ROM capacity in bytes.
@@ -33,6 +37,8 @@ pub struct LinkedImage {
     pub prg_rom: Vec<u8>,
     /// Global symbol addresses.
     pub symbols: BTreeMap<String, u16>,
+    /// Physical PRG-ROM bank containing each global symbol.
+    pub symbol_banks: BTreeMap<String, u16>,
     /// Human-readable placement report.
     pub map: String,
 }
@@ -73,7 +79,7 @@ impl fmt::Display for LinkError {
 
 impl Error for LinkError {}
 
-/// Links objects into a Mapper 0 cartridge.
+/// Links objects into a supported NES cartridge.
 ///
 /// Runtime/startup objects must precede generated program objects so reset
 /// code remains at the beginning of PRG-ROM.
@@ -83,6 +89,20 @@ impl Error for LinkError {}
 /// Returns deterministic failures for invalid objects, duplicate or missing
 /// symbols, overflowing sections, branch range, or invalid vectors.
 pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
+    match (config.mapper, config.submapper) {
+        (0, 0) => link_nrom(objects, config),
+        (2, 0) => link_uxrom(objects, config),
+        (0, submapper) | (2, submapper) => Err(vec![LinkError(format!(
+            "Mapper {} requires submapper 0, not {submapper}",
+            config.mapper
+        ))]),
+        (mapper, _) => Err(vec![LinkError(format!(
+            "Mapper {mapper} is not supported by the compiler linker"
+        ))]),
+    }
+}
+
+fn link_nrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
     if !matches!(config.prg_rom_len, 0x4000 | 0x8000) {
         return Err(vec![LinkError(
             "Mapper 0 PRG-ROM must be 16 or 32 KiB".to_owned(),
@@ -101,6 +121,16 @@ pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<L
                     .into_iter()
                     .map(|error| LinkError(error.to_string())),
             );
+        }
+    }
+    for object in objects {
+        for section in &object.sections {
+            if let SectionPlacement::Bank(bank) = section.placement {
+                errors.push(LinkError(format!(
+                    "section `{}` requests switchable bank {bank}, but Mapper 0 has no switchable PRG-ROM window",
+                    section.name
+                )));
+            }
         }
     }
     if !errors.is_empty() {
@@ -246,11 +276,15 @@ pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<L
         .iter()
         .map(|(name, (object, symbol))| (name.clone(), symbol_addresses[&(*object, *symbol)]))
         .collect::<BTreeMap<_, _>>();
+    let symbol_banks = symbols
+        .keys()
+        .map(|name| (name.clone(), 0))
+        .collect::<BTreeMap<_, _>>();
     let cartridge = Rom {
         metadata: Metadata {
             format: config.format,
-            mapper: 0,
-            submapper: 0,
+            mapper: config.mapper,
+            submapper: config.submapper,
             mirroring: config.mirroring,
             battery: config.battery,
             region: config.region,
@@ -267,8 +301,350 @@ pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<L
         rom,
         prg_rom: prg,
         symbols,
+        symbol_banks,
         map,
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UxromPlacement {
+    physical_offset: usize,
+    cpu_address: u16,
+    bank: u16,
+}
+
+fn link_uxrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
+    if config.prg_rom_len < 0x8000 || config.prg_rom_len % 0x4000 != 0 {
+        return Err(vec![LinkError(
+            "Mapper 2 PRG-ROM must contain at least two complete 16 KiB banks".to_owned(),
+        )]);
+    }
+    if !matches!(config.chr_rom_len, 0 | 0x2000) {
+        return Err(vec![LinkError(
+            "Mapper 2 CHR-ROM must be 0 or 8 KiB".to_owned(),
+        )]);
+    }
+    let bank_count = config.prg_rom_len / 0x4000;
+    if bank_count > 256 {
+        return Err(vec![LinkError(
+            "Mapper 2 supports at most 256 PRG-ROM banks".to_owned(),
+        )]);
+    }
+    let fixed_bank = u16::try_from(bank_count - 1).expect("bank count is bounded");
+    let mut errors = Vec::new();
+    for object in objects {
+        if let Err(object_errors) = object.validate() {
+            errors.extend(
+                object_errors
+                    .into_iter()
+                    .map(|error| LinkError(error.to_string())),
+            );
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let mut prg = vec![0xff; config.prg_rom_len];
+    let mut cursors = vec![0_usize; bank_count];
+    let mut placements = HashMap::<(usize, SectionId), UxromPlacement>::new();
+    let mut map = format!(
+        "Mapper 2 bank layout\nfixed bank: {fixed_bank} at $C000-$FFFF\nswitchable banks: 0-{} at $8000-$BFFF\n",
+        fixed_bank - 1
+    );
+    for (object_index, object) in objects.iter().enumerate() {
+        for section in &object.sections {
+            let bank = match section.placement {
+                SectionPlacement::Any | SectionPlacement::Fixed => fixed_bank,
+                SectionPlacement::Bank(bank) if bank < fixed_bank => bank,
+                SectionPlacement::Bank(bank) => {
+                    errors.push(LinkError(format!(
+                        "section `{}` requests switchable bank {bank}, but Mapper 2 provides banks 0 through {}",
+                        section.name,
+                        fixed_bank - 1
+                    )));
+                    continue;
+                }
+            };
+            let bank_index = usize::from(bank);
+            let cursor = align(cursors[bank_index], usize::from(section.alignment));
+            let limit = if bank == fixed_bank { 0x3ffa } else { 0x4000 };
+            let end = cursor.saturating_add(section.bytes.len());
+            if end > limit {
+                let window = if bank == fixed_bank {
+                    "fixed"
+                } else {
+                    "switchable"
+                };
+                errors.push(LinkError(format!(
+                    "section `{}` exceeds Mapper 2 {window} bank {bank} capacity",
+                    section.name
+                )));
+                continue;
+            }
+            let physical_offset = bank_index * 0x4000 + cursor;
+            prg[physical_offset..physical_offset + section.bytes.len()]
+                .copy_from_slice(&section.bytes);
+            let cpu_base = if bank == fixed_bank { 0xc000 } else { 0x8000 };
+            let cpu_address = cpu_base + u16::try_from(cursor).expect("bank cursor fits u16");
+            placements.insert(
+                (object_index, section.id),
+                UxromPlacement {
+                    physical_offset,
+                    cpu_address,
+                    bank,
+                },
+            );
+            let end_address = u32::from(cpu_address) + section.bytes.len().saturating_sub(1) as u32;
+            map.push_str(&format!(
+                "bank {bank:03} ${cpu_address:04X}-${end_address:04X} {}\n",
+                section.name
+            ));
+            cursors[bank_index] = end;
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let mut global_definitions = BTreeMap::<String, (usize, SymbolId)>::new();
+    let mut symbol_locations = HashMap::<(usize, SymbolId), (u16, u16)>::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        for symbol in &object.symbols {
+            let Some(section) = symbol.section else {
+                continue;
+            };
+            let placement = placements[&(object_index, section)];
+            let address = match u16::try_from(u32::from(placement.cpu_address) + symbol.offset) {
+                Ok(address) => address,
+                Err(_) => {
+                    errors.push(LinkError(format!(
+                        "symbol `{}` exceeds CPU address space",
+                        symbol.name
+                    )));
+                    continue;
+                }
+            };
+            symbol_locations.insert((object_index, symbol.id), (address, placement.bank));
+            if symbol.binding == Binding::Global
+                && global_definitions
+                    .insert(symbol.name.clone(), (object_index, symbol.id))
+                    .is_some()
+            {
+                errors.push(LinkError(format!(
+                    "duplicate global symbol `{}`",
+                    symbol.name
+                )));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let mut trampolines = BTreeMap::<(usize, SymbolId), u16>::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        for relocation in &object.relocations {
+            let source = placements[&(object_index, relocation.section)];
+            let patch = source.physical_offset + relocation.offset as usize;
+            let symbol = &object.symbols[relocation.symbol.0 as usize];
+            let definition = if symbol.section.is_some() {
+                (object_index, symbol.id)
+            } else {
+                let Some(definition) = global_definitions.get(&symbol.name).copied() else {
+                    errors.push(LinkError(format!(
+                        "undefined global symbol `{}`",
+                        symbol.name
+                    )));
+                    continue;
+                };
+                definition
+            };
+            let (mut target, target_bank) = symbol_locations[&definition];
+            let crosses_switchable_banks = target_bank != fixed_bank && source.bank != target_bank;
+            if crosses_switchable_banks {
+                let source_section = &object.sections[relocation.section.0 as usize];
+                let is_call = relocation.kind == RelocationKind::Absolute16
+                    && relocation.addend == 0
+                    && relocation.offset > 0
+                    && source_section.bytes[relocation.offset as usize - 1] == 0x20;
+                if !is_call {
+                    errors.push(LinkError(format!(
+                        "reference to `{}` crosses from bank {} to switchable bank {target_bank}; only direct JSR calls can use a Mapper 2 trampoline",
+                        symbol.name, source.bank
+                    )));
+                    continue;
+                }
+                target = if let Some(address) = trampolines.get(&definition).copied() {
+                    address
+                } else {
+                    let bytes = uxrom_trampoline(target_bank as u8, target);
+                    let cursor = cursors[usize::from(fixed_bank)];
+                    let end = cursor.saturating_add(bytes.len());
+                    if end > 0x3ffa {
+                        errors.push(LinkError(format!(
+                            "Mapper 2 trampoline for `{}` overlaps the interrupt vectors",
+                            symbol.name
+                        )));
+                        continue;
+                    }
+                    let physical = usize::from(fixed_bank) * 0x4000 + cursor;
+                    prg[physical..physical + bytes.len()].copy_from_slice(&bytes);
+                    let address = 0xc000 + u16::try_from(cursor).expect("fixed cursor fits u16");
+                    map.push_str(&format!(
+                        "bank {fixed_bank:03} ${address:04X}-${:04X} __nesc_bankcall_{}\n",
+                        u32::from(address) + bytes.len() as u32 - 1,
+                        symbol.name
+                    ));
+                    cursors[usize::from(fixed_bank)] = end;
+                    trampolines.insert(definition, address);
+                    address
+                };
+            }
+            let target = i32::from(target) + relocation.addend;
+            match relocation.kind {
+                RelocationKind::Absolute16 => match u16::try_from(target) {
+                    Ok(target) => {
+                        prg[patch] = target as u8;
+                        prg[patch + 1] = (target >> 8) as u8;
+                    }
+                    Err(_) => errors.push(LinkError(format!(
+                        "absolute relocation to `{}` exceeds 16 bits",
+                        symbol.name
+                    ))),
+                },
+                RelocationKind::Relative8 => {
+                    if source.bank != target_bank {
+                        errors.push(LinkError(format!(
+                            "relative branch to `{}` crosses PRG-ROM banks",
+                            symbol.name
+                        )));
+                        continue;
+                    }
+                    let operand_address = i32::from(source.cpu_address) + relocation.offset as i32;
+                    let displacement = target - (operand_address + 1);
+                    match i8::try_from(displacement) {
+                        Ok(displacement) => prg[patch] = displacement as u8,
+                        Err(_) => errors.push(LinkError(format!(
+                            "branch to `{}` is outside the signed 8-bit range",
+                            symbol.name
+                        ))),
+                    }
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let vector_start = config.prg_rom_len - 6;
+    for (index, name) in ["__nesc_nmi", "__nesc_reset", "__nesc_irq"]
+        .iter()
+        .enumerate()
+    {
+        let Some(definition) = global_definitions.get(*name).copied() else {
+            errors.push(LinkError(format!(
+                "required vector symbol `{name}` is undefined"
+            )));
+            continue;
+        };
+        let (address, bank) = symbol_locations[&definition];
+        if bank != fixed_bank {
+            errors.push(LinkError(format!(
+                "required vector symbol `{name}` must be in Mapper 2 fixed bank {fixed_bank}"
+            )));
+            continue;
+        }
+        let offset = vector_start + index * 2;
+        prg[offset] = address as u8;
+        prg[offset + 1] = (address >> 8) as u8;
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let symbols = global_definitions
+        .iter()
+        .map(|(name, definition)| (name.clone(), symbol_locations[definition].0))
+        .collect::<BTreeMap<_, _>>();
+    let symbol_banks = global_definitions
+        .iter()
+        .map(|(name, definition)| (name.clone(), symbol_locations[definition].1))
+        .collect::<BTreeMap<_, _>>();
+    let cartridge = Rom {
+        metadata: Metadata {
+            format: config.format,
+            mapper: config.mapper,
+            submapper: config.submapper,
+            mirroring: config.mirroring,
+            battery: config.battery,
+            region: config.region,
+            prg_rom_len: prg.len(),
+            chr_rom_len: config.chr_rom_len,
+        },
+        trainer: None,
+        prg_rom: prg.clone(),
+        chr_rom: vec![0; config.chr_rom_len],
+    };
+    let rom = nesc_rom::build(&cartridge).map_err(|error| vec![LinkError(error.to_string())])?;
+    nesc_rom::parse(&rom).map_err(|error| vec![LinkError(error.to_string())])?;
+    Ok(LinkedImage {
+        rom,
+        prg_rom: prg,
+        symbols,
+        symbol_banks,
+        map,
+    })
+}
+
+fn uxrom_trampoline(bank: u8, target: u16) -> Vec<u8> {
+    vec![
+        0x85,
+        0xfd, // sta $fd
+        0x86,
+        0xfe, // stx $fe
+        0x84,
+        0xff, // sty $ff
+        0xa5,
+        0xfc, // lda $fc
+        0x48, // pha
+        0xa9,
+        bank, // lda #bank
+        0x85,
+        0xfc, // sta $fc
+        0x8d,
+        0x00,
+        0x80, // sta $8000
+        0xa5,
+        0xfd, // lda $fd
+        0xa6,
+        0xfe, // ldx $fe
+        0xa4,
+        0xff, // ldy $ff
+        0x20,
+        target as u8,
+        (target >> 8) as u8, // jsr target
+        0x85,
+        0xfd, // sta $fd
+        0x86,
+        0xfe, // stx $fe
+        0x84,
+        0xff, // sty $ff
+        0x68, // pla
+        0x85,
+        0xfc, // sta $fc
+        0x8d,
+        0x00,
+        0x80, // sta $8000
+        0xa5,
+        0xfd, // lda $fd
+        0xa6,
+        0xfe, // ldx $fe
+        0xa4,
+        0xff, // ldy $ff
+        0x60, // rts
+    ]
 }
 
 /// Relinks an exact Mapper 0 recovery image through the shared ROM builder.
@@ -316,7 +692,9 @@ fn align(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use nesc_object::{Binding, Object, SectionKind, SymbolKind};
+    use nesc_object::{
+        Binding, Object, Relocation, RelocationKind, SectionKind, SectionPlacement, SymbolKind,
+    };
     use nesc_rom::{Format, Mirroring, Region};
 
     use super::{LinkConfig, RecoveryLinkInput, link, relink_nrom};
@@ -335,6 +713,8 @@ mod tests {
         let linked = link(
             &[runtime.object, program],
             LinkConfig {
+                mapper: 0,
+                submapper: 0,
                 format: Format::Nes2,
                 prg_rom_len: 0x8000,
                 chr_rom_len: 0,
@@ -347,6 +727,81 @@ mod tests {
         let reset = u16::from_le_bytes([linked.prg_rom[0x7ffc], linked.prg_rom[0x7ffd]]);
         assert_eq!(reset, linked.symbols["__nesc_reset"]);
         assert!(linked.symbols["main"] > reset);
+    }
+
+    #[test]
+    fn places_uxrom_functions_and_inserts_cross_bank_trampoline() {
+        let runtime = nesc_runtime::build();
+        let mut program = Object::default();
+        let fixed = program
+            .add_section_with_placement(".text.main", SectionKind::Code, 1, SectionPlacement::Fixed)
+            .expect("fixed section");
+        program
+            .section_bytes_mut(fixed)
+            .unwrap()
+            .extend_from_slice(&[0x20, 0x00, 0x00, 0x60]);
+        program
+            .add_symbol(
+                "main",
+                Some(fixed),
+                0,
+                SymbolKind::Function,
+                Binding::Global,
+            )
+            .unwrap();
+        let banked = program
+            .add_section_with_placement(
+                ".text.banked",
+                SectionKind::Code,
+                1,
+                SectionPlacement::Bank(1),
+            )
+            .expect("banked section");
+        program.section_bytes_mut(banked).unwrap().push(0x60);
+        let banked_symbol = program
+            .add_symbol(
+                "banked",
+                Some(banked),
+                0,
+                SymbolKind::Function,
+                Binding::Global,
+            )
+            .unwrap();
+        program.add_relocation(Relocation {
+            section: fixed,
+            offset: 1,
+            kind: RelocationKind::Absolute16,
+            symbol: banked_symbol,
+            addend: 0,
+        });
+
+        let linked = link(
+            &[runtime.object, program],
+            LinkConfig {
+                mapper: 2,
+                submapper: 0,
+                format: Format::Nes2,
+                prg_rom_len: 0x10000,
+                chr_rom_len: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+            },
+        )
+        .expect("Mapper 2 link");
+        assert_eq!(linked.symbol_banks["banked"], 1);
+        assert_eq!(linked.symbols["banked"], 0x8000);
+        assert_eq!(linked.symbol_banks["main"], 3);
+        let main_offset = 3 * 0x4000 + usize::from(linked.symbols["main"] - 0xc000);
+        let trampoline = u16::from_le_bytes([
+            linked.prg_rom[main_offset + 1],
+            linked.prg_rom[main_offset + 2],
+        ]);
+        assert!((0xc000..=0xfff9).contains(&trampoline));
+        assert_ne!(trampoline, linked.symbols["banked"]);
+        assert!(linked.map.contains("__nesc_bankcall_banked"));
+        let parsed = nesc_rom::parse(&linked.rom).expect("valid Mapper 2 ROM");
+        assert_eq!(parsed.metadata.mapper, 2);
     }
 
     #[test]

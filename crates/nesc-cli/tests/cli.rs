@@ -50,7 +50,7 @@ fn check_rejects_unimplemented_mapper() {
     let manifest_path = temporary.path().join("mapper-demo/NesC.toml");
     let manifest = fs::read_to_string(&manifest_path)
         .expect("read manifest")
-        .replace("mapper = 0", "mapper = 2");
+        .replace("\nmapper = 0\n", "\nmapper = 3\n");
     fs::write(&manifest_path, manifest).expect("write manifest");
 
     let checked = nesc()

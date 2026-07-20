@@ -15,6 +15,7 @@ nesc-frontend = { path = "../nesc-frontend" }
 nesc-hir = { path = "../nesc-hir" }
 nesc-mir = { path = "../nesc-mir" }
 nesc-opt = { path = "../nesc-opt" }
+nesc-object = { path = "../nesc-object" }
 nesc-project = { path = "../nesc-project" }
 nesc-linker = { path = "../nesc-linker" }
 nesc-rom = { path = "../nesc-rom" }

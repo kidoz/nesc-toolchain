@@ -374,19 +374,16 @@ fn validate_manifest(document: &ManifestDocument) -> Vec<Diagnostic> {
 fn validate_cartridge(document: &ManifestDocument, diagnostics: &mut Vec<Diagnostic>) {
     let cartridge = &document.manifest().cartridge;
 
-    if cartridge.mapper != 0 {
+    if !matches!(cartridge.mapper, 0 | 2) {
         diagnostics.push(
             document
                 .field_error(
                     "E0103",
-                    format!(
-                        "mapper {} is not implemented in the current milestone",
-                        cartridge.mapper
-                    ),
+                    format!("mapper {} is not implemented", cartridge.mapper),
                     "mapper",
-                    "only Mapper 0 (NROM) is currently accepted",
+                    "only Mapper 0 (NROM) and Mapper 2 (UxROM) are accepted",
                 )
-                .with_help("set `cartridge.mapper = 0` until mapper-aware support lands"),
+                .with_help("set `cartridge.mapper` to 0 or 2"),
         );
         return;
     }
@@ -394,25 +391,36 @@ fn validate_cartridge(document: &ManifestDocument, diagnostics: &mut Vec<Diagnos
     if cartridge.submapper != 0 {
         diagnostics.push(document.field_error(
             "E0104",
-            "Mapper 0 requires submapper 0",
+            format!("Mapper {} requires submapper 0", cartridge.mapper),
             "submapper",
-            "unsupported NROM submapper",
+            "unsupported cartridge submapper",
         ));
     }
 
-    if !matches!(cartridge.prg_rom_kib, 16 | 32) {
-        diagnostics.push(document.field_error(
-            "E0104",
-            "Mapper 0 PRG-ROM must be 16 or 32 KiB",
-            "prg-rom-kib",
-            "invalid NROM PRG-ROM capacity",
-        ));
+    match cartridge.mapper {
+        0 if !matches!(cartridge.prg_rom_kib, 16 | 32) => {
+            diagnostics.push(document.field_error(
+                "E0104",
+                "Mapper 0 PRG-ROM must be 16 or 32 KiB",
+                "prg-rom-kib",
+                "invalid NROM PRG-ROM capacity",
+            ));
+        }
+        2 if cartridge.prg_rom_kib < 32 || cartridge.prg_rom_kib % 16 != 0 => {
+            diagnostics.push(document.field_error(
+                "E0104",
+                "Mapper 2 PRG-ROM must be at least 32 KiB in complete 16 KiB banks",
+                "prg-rom-kib",
+                "invalid UxROM PRG-ROM capacity",
+            ));
+        }
+        _ => {}
     }
 
     if !matches!(cartridge.chr_rom_kib, 0 | 8) {
         diagnostics.push(document.field_error(
             "E0104",
-            "Mapper 0 CHR-ROM must be 0 or 8 KiB",
+            format!("Mapper {} CHR-ROM must be 0 or 8 KiB", cartridge.mapper),
             "chr-rom-kib",
             "use zero for CHR RAM or eight for CHR ROM",
         ));
