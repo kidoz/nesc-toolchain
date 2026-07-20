@@ -44,6 +44,10 @@ ROM. The toolkit is written in stable Rust 2024.
 - `nesc debug` inspection of verification summaries, interrupt and frame
   checkpoints, sparse PPU/APU state, cartridge banks, event traces, and the
   first structured divergence
+- Interactive and scripted Mapper 0/2 ROM debugging with instruction stepping,
+  call stepping, bank-qualified breakpoints, CPU-bus watchpoints, source and
+  symbol lookup, hardware state, disassembly, stack inspection, and bounded
+  execution
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
 - Bank-qualified call graphs, recursive-component detection, evidence-scored
@@ -83,8 +87,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | Mapper 0/2 original-versus-Rust differential verification | Available |
 | Mapper 0/2 original-versus-NesC differential verification with interrupt and multi-frame hardware checkpoints | Available |
 | Structured verification artifact inspection with `nesc debug` | Available |
+| Interactive and scripted Mapper 0/2 ROM debugger | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Complete PPU/APU timing and interactive source debugger | Planned |
+| Cycle stepping and complete PPU/APU timing | Planned |
 
 ## Quick start
 
@@ -104,6 +109,8 @@ cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
   decompile target/demo.nes --emit=nesc --verify --output target/demo-nesc
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
   debug target/demo-nesc --view checkpoints
+cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
+  debug target/demo.nes --command "break main" --command continue
 ```
 
 Expected output:
@@ -116,6 +123,8 @@ Disassembled `target/demo.nes` into target/demo-disassembly (..., exact ROM roun
 Decompiled `target/demo.nes` into target/demo-rust as host-side stable Rust (..., verified)
 Decompiled `target/demo.nes` into target/demo-nesc as hybrid NesC (..., verified with ... executions)
 No verification checkpoints recorded.
+Loaded Mapper 0 ROM with ... PRG banks at ...
+Stopped: breakpoint 1 at ...
 ```
 
 The generated project contains:
@@ -262,6 +271,53 @@ Target-side NesC verification reserves `$7000-$7FFF` for its isolated RAM
 shadow, event log, and result record; an exercised source access to that
 workspace is rejected instead of being compared unsafely.
 
+## ROM debugger
+
+Pass a `.nes` file to `nesc debug` to open the command shell. Sibling `.sym`
+and `.source-map` files are loaded automatically; explicit files can be passed
+with `--symbols` and `--source-map`.
+
+```bash
+nesc debug target/demo.nes
+```
+
+The shell supports:
+
+```text
+run                  continue              pause
+step                 step-frame            next                 finish
+break main           break 001:$8000       delete 1
+watch $0010          watch-read $2002      watch-write $4000
+registers            memory $0000 64       disassemble main 12
+stack                source                symbols
+ppu                  apu                   cartridge
+trace on             trace off             trace show
+reset                quit
+```
+
+Breakpoint addresses may include a physical PRG bank, which prevents repeated
+Mapper 2 CPU-window addresses from being confused. Memory inspection uses
+observational reads, so reading PPU, controller, or mapper state through the
+debugger does not trigger emulated side effects. Watchpoints inspect the exact
+CPU-bus accesses made by the most recent instruction, including mirrored RAM,
+PPU/APU registers, DMA reads, stack traffic, and mapper writes.
+
+For automation, repeat `--command` to run a bounded command sequence without
+the shell:
+
+```bash
+nesc debug target/demo.nes \
+  --command "break main" \
+  --command continue \
+  --command registers \
+  --command "disassemble main 8"
+```
+
+Every resume command enforces instruction and cycle limits. The current CPU
+core executes instructions atomically, so single-cycle stepping and pausing a
+resume command from another thread are not yet available. `pause` confirms the
+shell is already stopped at a command boundary.
+
 ## Verification artifact inspection
 
 Verified hybrid NesC output contains a versioned `verification.json`. Pass the
@@ -352,7 +408,7 @@ concerns. Core implementation crates include:
 | `nesc-codegen-6502`, `nesc-runtime` | Machine-code selection and runtime support |
 | `nesc-object`, `nesc-linker`, `nesc-rom` | Relocatable objects, linking, and cartridge containers |
 | `nesc-emulator` | Deterministic generated-ROM verification |
-| `nesc-debug` | Structured verification artifact inspection |
+| `nesc-debug` | ROM debugger sessions and verification artifact inspection |
 | `nesc-decompiler`, `nesc-decompile-runtime` | ROM analysis, stable Rust emission, and host execution |
 
 SDK declarations live under `sdk/include/`.
@@ -371,9 +427,10 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Add interactive execution, breakpoints, watchpoints, and source mapping to the debugger
+1. Add single-cycle stepping, asynchronous pause, and complete PPU/APU timing
 2. Add Mapper 3 compilation and recovery
-3. Expand optimization quality and generated-code cost modeling
+3. Add emulator-backed `NES_TEST` discovery and execution
+4. Expand optimization quality and generated-code cost modeling
 
 ## License
 
