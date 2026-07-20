@@ -1,14 +1,46 @@
-//! Deterministic NES boot harness for compiler-generated Mapper 0 ROMs.
+//! Deterministic NES execution, observable traces, and compiler verification.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::error::Error;
-use std::fmt;
+mod cpu;
+mod machine;
 
-use nesc_rom::{CpuAddress, Mapper, MapperState};
+use std::collections::BTreeMap;
 
-const NTSC_FRAME_CYCLES: u64 = 29_781;
-const NTSC_VBLANK_CYCLE: u64 = 27_394;
-const TRACE_LIMIT: usize = 16;
+pub use cpu::CpuState;
+pub use machine::{
+    EmulatorConfig, EmulatorError, EventKind, InterruptKind, Machine, MachineSnapshot,
+    ObservableEvent, RunLimits, RunReport, StepReport, Termination, TimingProfile,
+};
+
+/// First difference between two ordered observable-event traces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventDivergence {
+    pub index: usize,
+    pub original: Option<ObservableEvent>,
+    pub translated: Option<ObservableEvent>,
+}
+
+/// Finds the first value or length difference between two event traces.
+#[must_use]
+pub fn first_divergent_event(
+    original: &[ObservableEvent],
+    translated: &[ObservableEvent],
+) -> Option<EventDivergence> {
+    let shared = original.len().min(translated.len());
+    for index in 0..shared {
+        if original[index] != translated[index] {
+            return Some(EventDivergence {
+                index,
+                original: Some(original[index].clone()),
+                translated: Some(translated[index].clone()),
+            });
+        }
+    }
+    (original.len() != translated.len()).then(|| EventDivergence {
+        index: shared,
+        original: original.get(shared).cloned(),
+        translated: translated.get(shared).cloned(),
+    })
+}
 
 /// Successful compiler boot observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,41 +55,12 @@ pub struct BootReport {
     pub background_color: u8,
 }
 
-/// Bounded boot-oracle failure with recent bus/control trace.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmulatorError {
-    /// First failure explanation.
-    pub message: String,
-    /// Program counter at failure.
-    pub pc: u16,
-    /// CPU cycle at failure.
-    pub cycle: u64,
-    /// Recent deterministic events.
-    pub trace: Vec<String>,
-}
-
-impl fmt::Display for EmulatorError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} at PC ${:04X}, cycle {}",
-            self.message, self.pc, self.cycle
-        )?;
-        for event in &self.trace {
-            write!(formatter, "\n  {event}")?;
-        }
-        Ok(())
-    }
-}
-
-impl Error for EmulatorError {}
-
 /// Runs the first compiler milestone boot oracle.
 ///
 /// # Errors
 ///
 /// Fails on malformed ROMs, missing symbols, illegal instructions, unmapped
-/// accesses, wrong palette output, or the cycle bound.
+/// accesses, wrong palette output, unexpected traps, or the cycle bound.
 pub fn verify_compiler_boot(
     rom_bytes: &[u8],
     symbols: &BTreeMap<String, u16>,
@@ -70,616 +73,339 @@ pub fn verify_compiler_boot(
         cycle: 0,
         trace: Vec::new(),
     })?;
-    let rom = nesc_rom::parse(rom_bytes).map_err(|error| EmulatorError {
-        message: error.to_string(),
-        pc: 0,
-        cycle: 0,
-        trace: Vec::new(),
-    })?;
-    let mapper = Mapper::new(
-        rom.metadata.mapper,
-        rom.metadata.prg_rom_len,
-        rom.metadata.chr_rom_len,
-    )
-    .map_err(|error| EmulatorError {
-        message: error.to_string(),
-        pc: 0,
-        cycle: 0,
-        trace: Vec::new(),
-    })?;
-    let mut machine = Machine::new(rom.prg_rom, mapper);
+    if cycle_limit == 0 {
+        return Err(EmulatorError {
+            message: "boot cycle limit must be greater than zero".to_owned(),
+            pc: 0,
+            cycle: 0,
+            trace: Vec::new(),
+        });
+    }
+    let mut machine = Machine::from_rom_bytes(rom_bytes, EmulatorConfig::default())?;
     machine.reset()?;
     let mut reached_main = false;
     let mut palette_frame = None;
-    while machine.cycles < cycle_limit {
-        if machine.pc == main {
+    while machine.cycles() < cycle_limit {
+        if machine.cpu().pc == main {
             reached_main = true;
-            machine.record(format!("reached main at ${main:04X}"));
         }
-        machine.step()?;
-        if machine.palette[0] == expected_color && palette_frame.is_none() {
-            palette_frame = Some(machine.frames);
-            machine.record(format!("palette[$3F00] = ${expected_color:02X}"));
+        let report = machine.step()?;
+        if let Some(Termination::Trap { reason }) = report.termination {
+            return Err(EmulatorError {
+                message: format!("runtime trap {reason} reached during boot"),
+                pc: machine.cpu().pc,
+                cycle: machine.cycles(),
+                trace: machine.events().iter().rev().take(16).cloned().collect(),
+            });
+        }
+        if machine.palette()[0] == expected_color && palette_frame.is_none() {
+            palette_frame = Some(machine.frames());
         }
         if reached_main
-            && palette_frame.is_some_and(|frame| machine.frames >= frame.saturating_add(2))
+            && palette_frame.is_some_and(|frame| machine.frames() >= frame.saturating_add(2))
         {
             return Ok(BootReport {
-                cycles: machine.cycles,
-                frames: machine.frames,
+                cycles: machine.cycles(),
+                frames: machine.frames(),
                 main_address: main,
-                background_color: machine.palette[0],
+                background_color: machine.palette()[0],
             });
         }
     }
-    Err(machine.failure(format!(
-        "boot oracle timed out; reached_main={reached_main}, palette=${:02X}",
-        machine.palette[0]
-    )))
-}
-
-struct Machine {
-    a: u8,
-    x: u8,
-    y: u8,
-    sp: u8,
-    status: u8,
-    pc: u16,
-    cycles: u64,
-    frames: u64,
-    vblank: bool,
-    ram: [u8; 0x800],
-    palette: [u8; 32],
-    ppu_address: u16,
-    ppu_high_byte: bool,
-    prg: Vec<u8>,
-    mapper: Mapper,
-    mapper_state: MapperState,
-    trace: VecDeque<String>,
-}
-
-impl Machine {
-    fn new(prg: Vec<u8>, mapper: Mapper) -> Self {
-        Self {
-            a: 0,
-            x: 0,
-            y: 0,
-            sp: 0xfd,
-            status: 0x24,
-            pc: 0,
-            cycles: 0,
-            frames: 0,
-            vblank: false,
-            ram: [0; 0x800],
-            palette: [0; 32],
-            ppu_address: 0,
-            ppu_high_byte: true,
-            prg,
-            mapper,
-            mapper_state: MapperState::default(),
-            trace: VecDeque::new(),
-        }
-    }
-
-    fn reset(&mut self) -> Result<(), EmulatorError> {
-        let low = self.read(0xfffc)?;
-        let high = self.read(0xfffd)?;
-        self.pc = u16::from_le_bytes([low, high]);
-        self.record(format!("reset vector -> ${:04X}", self.pc));
-        Ok(())
-    }
-
-    fn step(&mut self) -> Result<(), EmulatorError> {
-        let instruction_pc = self.pc;
-        let opcode = self.fetch()?;
-        self.record(format!("${instruction_pc:04X}: ${opcode:02X}"));
-        let cycles = match opcode {
-            0x78 => {
-                self.status |= 0x04;
-                2
-            }
-            0xd8 => {
-                self.status &= !0x08;
-                2
-            }
-            0xa9 => {
-                self.a = self.fetch()?;
-                self.set_nz(self.a);
-                2
-            }
-            0xa2 => {
-                self.x = self.fetch()?;
-                self.set_nz(self.x);
-                2
-            }
-            0xa0 => {
-                self.y = self.fetch()?;
-                self.set_nz(self.y);
-                2
-            }
-            0xa4..=0xa6 => {
-                let address = u16::from(self.fetch()?);
-                let value = self.read(address)?;
-                match opcode {
-                    0xa5 => self.a = value,
-                    0xa6 => self.x = value,
-                    0xa4 => self.y = value,
-                    _ => unreachable!(),
-                }
-                self.set_nz(value);
-                3
-            }
-            0xad => {
-                let address = self.fetch_word()?;
-                self.a = self.read(address)?;
-                self.set_nz(self.a);
-                4
-            }
-            0xae => {
-                let address = self.fetch_word()?;
-                self.x = self.read(address)?;
-                self.set_nz(self.x);
-                4
-            }
-            0xac => {
-                let address = self.fetch_word()?;
-                self.y = self.read(address)?;
-                self.set_nz(self.y);
-                4
-            }
-            0x8d => {
-                let address = self.fetch_word()?;
-                self.write(address, self.a)?;
-                4
-            }
-            0x8e => {
-                let address = self.fetch_word()?;
-                self.write(address, self.x)?;
-                4
-            }
-            0x8c => {
-                let address = self.fetch_word()?;
-                self.write(address, self.y)?;
-                4
-            }
-            0x84..=0x86 => {
-                let address = u16::from(self.fetch()?);
-                let value = match opcode {
-                    0x85 => self.a,
-                    0x86 => self.x,
-                    0x84 => self.y,
-                    _ => unreachable!(),
-                };
-                self.write(address, value)?;
-                3
-            }
-            0xb1 => {
-                let pointer = self.fetch()?;
-                let low = self.read(u16::from(pointer))?;
-                let high = self.read(u16::from(pointer.wrapping_add(1)))?;
-                let base = u16::from_le_bytes([low, high]);
-                let address = base.wrapping_add(u16::from(self.y));
-                self.a = self.read(address)?;
-                self.set_nz(self.a);
-                5 + u64::from((base & 0xff00) != (address & 0xff00))
-            }
-            0x91 => {
-                let pointer = self.fetch()?;
-                let low = self.read(u16::from(pointer))?;
-                let high = self.read(u16::from(pointer.wrapping_add(1)))?;
-                let address = u16::from_le_bytes([low, high]).wrapping_add(u16::from(self.y));
-                self.write(address, self.a)?;
-                6
-            }
-            0x9a => {
-                self.sp = self.x;
-                2
-            }
-            0xe8 => {
-                self.x = self.x.wrapping_add(1);
-                self.set_nz(self.x);
-                2
-            }
-            0x18 => {
-                self.status &= !1;
-                2
-            }
-            0x38 => {
-                self.status |= 1;
-                2
-            }
-            0x69 => {
-                let value = self.fetch()?;
-                self.adc(value);
-                2
-            }
-            0xe9 => {
-                let value = self.fetch()?;
-                self.sbc(value);
-                2
-            }
-            0x09 | 0x29 | 0x49 | 0xc9 => {
-                let value = self.fetch()?;
-                match opcode {
-                    0x09 => {
-                        self.a |= value;
-                        self.set_nz(self.a);
-                    }
-                    0x29 => {
-                        self.a &= value;
-                        self.set_nz(self.a);
-                    }
-                    0x49 => {
-                        self.a ^= value;
-                        self.set_nz(self.a);
-                    }
-                    0xc9 => self.compare(self.a, value),
-                    _ => unreachable!(),
-                }
-                2
-            }
-            0x0a => {
-                let value = self.a;
-                self.set_carry(value & 0x80 != 0);
-                self.a = value << 1;
-                self.set_nz(self.a);
-                2
-            }
-            0x6d | 0xed | 0x2d | 0x0d | 0x4d | 0xcd => {
-                let address = self.fetch_word()?;
-                let value = self.read(address)?;
-                match opcode {
-                    0x6d => self.adc(value),
-                    0xed => self.sbc(value),
-                    0x2d => {
-                        self.a &= value;
-                        self.set_nz(self.a);
-                    }
-                    0x0d => {
-                        self.a |= value;
-                        self.set_nz(self.a);
-                    }
-                    0x4d => {
-                        self.a ^= value;
-                        self.set_nz(self.a);
-                    }
-                    0xcd => self.compare(self.a, value),
-                    _ => unreachable!(),
-                }
-                4
-            }
-            0x65 | 0xe5 | 0x25 | 0x05 | 0x45 | 0xc5 => {
-                let address = u16::from(self.fetch()?);
-                let value = self.read(address)?;
-                match opcode {
-                    0x65 => self.adc(value),
-                    0xe5 => self.sbc(value),
-                    0x25 => {
-                        self.a &= value;
-                        self.set_nz(self.a);
-                    }
-                    0x05 => {
-                        self.a |= value;
-                        self.set_nz(self.a);
-                    }
-                    0x45 => {
-                        self.a ^= value;
-                        self.set_nz(self.a);
-                    }
-                    0xc5 => self.compare(self.a, value),
-                    _ => unreachable!(),
-                }
-                3
-            }
-            0x06 | 0x26 | 0x46 | 0x66 | 0x0e | 0x2e | 0x4e | 0x6e | 0xce => {
-                let (address, cycles) = if matches!(opcode, 0x06 | 0x26 | 0x46 | 0x66) {
-                    (u16::from(self.fetch()?), 5)
-                } else {
-                    (self.fetch_word()?, 6)
-                };
-                let value = self.read(address)?;
-                let output = match opcode {
-                    0x06 | 0x0e => {
-                        self.set_carry(value & 0x80 != 0);
-                        value << 1
-                    }
-                    0x26 | 0x2e => {
-                        let carry = self.status & 1;
-                        self.set_carry(value & 0x80 != 0);
-                        (value << 1) | carry
-                    }
-                    0x46 | 0x4e => {
-                        self.set_carry(value & 1 != 0);
-                        value >> 1
-                    }
-                    0x66 | 0x6e => {
-                        let carry = (self.status & 1) << 7;
-                        self.set_carry(value & 1 != 0);
-                        (value >> 1) | carry
-                    }
-                    0xce => value.wrapping_sub(1),
-                    _ => unreachable!(),
-                };
-                self.write(address, output)?;
-                self.set_nz(output);
-                cycles
-            }
-            0x2c => {
-                let address = self.fetch_word()?;
-                let value = self.read(address)?;
-                self.status = (self.status & !(0x80 | 0x40 | 0x02))
-                    | (value & (0x80 | 0x40))
-                    | (u8::from(self.a & value == 0) * 0x02);
-                4
-            }
-            0x20 => {
-                let target = self.fetch_word()?;
-                let return_address = self.pc.wrapping_sub(1);
-                self.push((return_address >> 8) as u8)?;
-                self.push(return_address as u8)?;
-                self.pc = target;
-                6
-            }
-            0x60 => {
-                let low = self.pop()?;
-                let high = self.pop()?;
-                self.pc = u16::from_le_bytes([low, high]).wrapping_add(1);
-                6
-            }
-            0x4c => {
-                self.pc = self.fetch_word()?;
-                3
-            }
-            0x48 => {
-                self.push(self.a)?;
-                3
-            }
-            0x68 => {
-                self.a = self.pop()?;
-                self.set_nz(self.a);
-                4
-            }
-            0x10 | 0x30 | 0xf0 | 0xd0 | 0x90 | 0xb0 => {
-                let displacement = self.fetch()? as i8;
-                let taken = match opcode {
-                    0x10 => self.status & 0x80 == 0,
-                    0x30 => self.status & 0x80 != 0,
-                    0xf0 => self.status & 0x02 != 0,
-                    0xd0 => self.status & 0x02 == 0,
-                    0x90 => self.status & 1 == 0,
-                    0xb0 => self.status & 1 != 0,
-                    _ => unreachable!(),
-                };
-                if taken {
-                    self.pc = self.pc.wrapping_add_signed(i16::from(displacement));
-                    3
-                } else {
-                    2
-                }
-            }
-            0x40 => return Err(self.failure("unexpected interrupt return")),
-            0x02 => return Err(self.failure("generated runtime trap or unreachable instruction")),
-            _ => {
-                return Err(self.failure(format!("illegal or unsupported opcode ${opcode:02X}")));
-            }
-        };
-        self.advance(cycles);
-        Ok(())
-    }
-
-    fn fetch(&mut self) -> Result<u8, EmulatorError> {
-        let value = self.read(self.pc)?;
-        self.pc = self.pc.wrapping_add(1);
-        Ok(value)
-    }
-
-    fn fetch_word(&mut self) -> Result<u16, EmulatorError> {
-        let low = self.fetch()?;
-        let high = self.fetch()?;
-        Ok(u16::from_le_bytes([low, high]))
-    }
-
-    fn read(&mut self, address: u16) -> Result<u8, EmulatorError> {
-        match address {
-            0x0000..=0x1fff => Ok(self.ram[usize::from(address & 0x07ff)]),
-            0x2000..=0x3fff => match 0x2000 | (address & 7) {
-                0x2002 => {
-                    let value = u8::from(self.vblank) << 7;
-                    self.vblank = false;
-                    self.ppu_high_byte = true;
-                    Ok(value)
-                }
-                register => Err(self.failure(format!("unsupported PPU read ${register:04X}"))),
-            },
-            0x8000..=0xffff => self
-                .mapper
-                .map_cpu(CpuAddress(address), self.mapper_state)
-                .and_then(|offset| self.prg.get(offset.0).copied())
-                .ok_or_else(|| self.failure(format!("unmapped PRG read ${address:04X}"))),
-            _ => Err(self.failure(format!("unmapped CPU read ${address:04X}"))),
-        }
-    }
-
-    fn write(&mut self, address: u16, value: u8) -> Result<(), EmulatorError> {
-        match address {
-            0x0000..=0x1fff => self.ram[usize::from(address & 0x07ff)] = value,
-            0x2000..=0x3fff => match 0x2000 | (address & 7) {
-                0x2000 | 0x2001 => {}
-                0x2006 => {
-                    if self.ppu_high_byte {
-                        self.ppu_address = u16::from(value & 0x3f) << 8;
-                    } else {
-                        self.ppu_address = (self.ppu_address & 0xff00) | u16::from(value);
-                    }
-                    self.ppu_high_byte = !self.ppu_high_byte;
-                }
-                0x2007 => {
-                    if (0x3f00..=0x3fff).contains(&self.ppu_address) {
-                        let index = usize::from((self.ppu_address - 0x3f00) & 0x1f);
-                        self.palette[index] = value;
-                    }
-                    self.ppu_address = self.ppu_address.wrapping_add(1);
-                }
-                register => {
-                    return Err(self.failure(format!("unsupported PPU write ${register:04X}")));
-                }
-            },
-            0x8000..=0xffff => {
-                self.mapper
-                    .cpu_write(CpuAddress(address), value, &mut self.mapper_state);
-            }
-            _ => return Err(self.failure(format!("unmapped CPU write ${address:04X}"))),
-        }
-        self.record(format!("write ${address:04X} = ${value:02X}"));
-        Ok(())
-    }
-
-    fn push(&mut self, value: u8) -> Result<(), EmulatorError> {
-        self.write(0x0100 | u16::from(self.sp), value)?;
-        self.sp = self.sp.wrapping_sub(1);
-        Ok(())
-    }
-
-    fn pop(&mut self) -> Result<u8, EmulatorError> {
-        self.sp = self.sp.wrapping_add(1);
-        self.read(0x0100 | u16::from(self.sp))
-    }
-
-    fn adc(&mut self, value: u8) {
-        let carry = u16::from(self.status & 1);
-        let result = u16::from(self.a) + u16::from(value) + carry;
-        let output = result as u8;
-        let overflow = (!(self.a ^ value) & (self.a ^ output) & 0x80) != 0;
-        self.status =
-            (self.status & !(1 | 0x40)) | u8::from(result > 0xff) | (u8::from(overflow) << 6);
-        self.a = output;
-        self.set_nz(output);
-    }
-
-    fn sbc(&mut self, value: u8) {
-        self.adc(!value);
-    }
-
-    fn compare(&mut self, left: u8, right: u8) {
-        self.status = (self.status & !1) | u8::from(left >= right);
-        self.set_nz(left.wrapping_sub(right));
-    }
-
-    fn set_carry(&mut self, carry: bool) {
-        self.status = (self.status & !1) | u8::from(carry);
-    }
-
-    fn set_nz(&mut self, value: u8) {
-        self.status = (self.status & !(0x80 | 0x02)) | (value & 0x80) | (u8::from(value == 0) << 1);
-    }
-
-    fn advance(&mut self, cycles: u64) {
-        let before = self.cycles % NTSC_FRAME_CYCLES;
-        self.cycles += cycles;
-        let new_frames = self.cycles / NTSC_FRAME_CYCLES;
-        if new_frames > self.frames {
-            self.frames = new_frames;
-            self.vblank = false;
-            self.record(format!("frame {}", self.frames));
-        }
-        let after = self.cycles % NTSC_FRAME_CYCLES;
-        if (before < NTSC_VBLANK_CYCLE && after >= NTSC_VBLANK_CYCLE)
-            || (before > after && after >= NTSC_VBLANK_CYCLE)
-        {
-            self.vblank = true;
-            self.record(format!("vblank frame {}", self.frames));
-        }
-    }
-
-    fn record(&mut self, event: String) {
-        if self.trace.len() == TRACE_LIMIT {
-            self.trace.pop_front();
-        }
-        self.trace
-            .push_back(format!("cycle {}: {event}", self.cycles));
-    }
-
-    fn failure(&self, message: impl Into<String>) -> EmulatorError {
-        EmulatorError {
-            message: message.into(),
-            pc: self.pc,
-            cycle: self.cycles,
-            trace: self.trace.iter().cloned().collect(),
-        }
-    }
+    Err(EmulatorError {
+        message: format!(
+            "boot oracle timed out; reached_main={reached_main}, palette=${:02X}",
+            machine.palette()[0]
+        ),
+        pc: machine.cpu().pc,
+        cycle: machine.cycles(),
+        trace: machine.events().iter().rev().take(16).cloned().collect(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use nesc_rom::Mapper;
+    use nesc_disasm::opcode;
+    use nesc_rom::{Format, Metadata, Mirroring, Region, Rom, build};
 
-    use super::Machine;
+    use super::{
+        EmulatorConfig, EventKind, InterruptKind, Machine, RunLimits, Termination, TimingProfile,
+        first_divergent_event,
+    };
 
-    #[test]
-    fn executes_codegen_zero_page_and_register_sequences() {
-        let program = [
-            0xa9, 0x80, 0x85, 0x10, 0xa2, 0x22, 0x86, 0x11, 0xa4, 0x10, 0x84, 0x12, 0x8c, 0x00,
-            0x02, 0xa6, 0x11, 0xa5, 0x10, 0x18, 0x65, 0x11, 0x38, 0xe5, 0x11, 0x25, 0x12, 0x05,
-            0x11, 0x45, 0x11, 0xc5, 0x10, 0xa5, 0x10, 0x30, 0x02, 0xa9, 0x00, 0xa9, 0x01, 0x8d,
-            0x01, 0x02,
-        ];
-        let mut prg = vec![0; 32 * 1024];
-        prg[..program.len()].copy_from_slice(&program);
-        let mapper = Mapper::new(0, prg.len(), 0).expect("NROM mapper");
-        let mut machine = Machine::new(prg, mapper);
-        machine.pc = 0x8000;
-
-        for _ in 0..21 {
-            machine.step().expect("supported instruction");
-        }
-
-        assert_eq!(machine.a, 1);
-        assert_eq!(machine.x, 0x22);
-        assert_eq!(machine.y, 0x80);
-        assert_eq!(machine.ram[0x12], 0x80);
-        assert_eq!(machine.ram[0x200], 0x80);
-        assert_eq!(machine.ram[0x201], 1);
+    fn rom_with_program(program: &[u8], region: Region) -> Vec<u8> {
+        let mut prg = vec![0xea; 32 * 1024];
+        prg[..program.len()].copy_from_slice(program);
+        let vectors = prg.len() - 6;
+        prg[vectors..vectors + 2].copy_from_slice(&0x9000_u16.to_le_bytes());
+        prg[vectors + 2..vectors + 4].copy_from_slice(&0x8000_u16.to_le_bytes());
+        prg[vectors + 4..vectors + 6].copy_from_slice(&0xa000_u16.to_le_bytes());
+        build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 0,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 0,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: Vec::new(),
+        })
+        .expect("ROM")
     }
 
     #[test]
-    fn executes_codegen_shift_and_immediate_sequences() {
-        let program = [
-            0xa9, 0x81, 0x85, 0x20, 0x06, 0x20, 0x26, 0x20, 0x46, 0x20, 0x38, 0x66, 0x20, 0xa5,
-            0x20, 0x29, 0x0f, 0xc9, 0x01, 0x38, 0xe9, 0x01, 0x85, 0x21,
-        ];
-        let mut prg = vec![0; 32 * 1024];
-        prg[..program.len()].copy_from_slice(&program);
-        let mapper = Mapper::new(0, prg.len(), 0).expect("NROM mapper");
-        let mut machine = Machine::new(prg, mapper);
-        machine.pc = 0x8000;
-
-        for _ in 0..13 {
-            machine.step().expect("supported instruction");
+    fn executes_every_official_opcode_without_an_unsupported_path() {
+        let mut count = 0;
+        for byte in 0..=u8::MAX {
+            if opcode(byte).is_none() {
+                continue;
+            }
+            count += 1;
+            let rom = rom_with_program(&[byte, 0, 0], Region::Ntsc);
+            let mut machine =
+                Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+            machine.reset().expect("reset");
+            let report = machine
+                .step()
+                .unwrap_or_else(|error| panic!("official opcode ${byte:02X} failed: {error}"));
+            assert!(report.cycles > 0, "opcode ${byte:02X} consumed no cycles");
         }
-
-        assert_eq!(machine.ram[0x20], 0x81);
-        assert_eq!(machine.ram[0x21], 0);
-        assert_ne!(machine.status & 0x02, 0);
+        assert_eq!(count, 151);
     }
 
     #[test]
-    fn executes_indexed_indirect_loads_and_stores_with_zero_page_wrap() {
-        let program = [
-            0xa9, 0x10, 0x85, 0xff, 0xa9, 0x02, 0x85, 0x00, 0xa9, 0x5a, 0x8d, 0x11, 0x02, 0xa0,
-            0x01, 0xb1, 0xff, 0xa0, 0x02, 0x91, 0xff,
-        ];
-        let mut prg = vec![0; 32 * 1024];
-        prg[..program.len()].copy_from_slice(&program);
-        let mapper = Mapper::new(0, prg.len(), 0).expect("NROM mapper");
-        let mut machine = Machine::new(prg, mapper);
-        machine.pc = 0x8000;
-
-        for _ in 0..10 {
-            machine.step().expect("supported indirect instruction");
+    fn executes_register_memory_stack_and_page_crossing_semantics() {
+        let rom = rom_with_program(
+            &[
+                0xa2, 0x01, // ldx #1
+                0xa9, 0x80, // lda #$80
+                0x9d, 0xff, 0x01, // sta $01ff,x
+                0x48, // pha
+                0xa9, 0x00, // lda #0
+                0x68, // pla
+                0x1d, 0xff, 0x01, // ora $01ff,x
+            ],
+            Region::Ntsc,
+        );
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        let initial_sp = machine.cpu().sp;
+        for _ in 0..7 {
+            machine.step().expect("instruction");
         }
+        assert_eq!(machine.cpu().a, 0x80);
+        assert_eq!(machine.cpu().sp, initial_sp);
+        assert_eq!(machine.ram()[0x200], 0x80);
+        assert_eq!(machine.cycles(), 7 + 2 + 2 + 5 + 3 + 2 + 4 + 5);
+    }
 
-        assert_eq!(machine.a, 0x5a);
-        assert_eq!(machine.y, 2);
-        assert_eq!(machine.ram[0x212], 0x5a);
+    #[test]
+    fn handles_irq_nmi_and_rti_with_hardware_stack_frames() {
+        let mut program = vec![0xea; 0x2001];
+        program[..2].copy_from_slice(&[0x58, 0xea]); // cli; nop
+        program[0x1000] = 0x40; // NMI handler at $9000: rti
+        program[0x2000] = 0x40; // IRQ handler at $a000: rti
+        let rom = rom_with_program(&program, Region::Ntsc);
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        machine.step().expect("cli");
+        let return_pc = machine.cpu().pc;
+        machine.set_irq_line(true);
+        let irq = machine.step().expect("IRQ");
+        assert_eq!(irq.interrupt, Some(InterruptKind::Irq));
+        assert_eq!(machine.cpu().pc, 0xa000);
+        machine.set_irq_line(false);
+        machine.step().expect("RTI");
+        assert_eq!(machine.cpu().pc, return_pc);
+
+        machine.request_nmi();
+        let nmi = machine.step().expect("NMI");
+        assert_eq!(nmi.interrupt, Some(InterruptKind::Nmi));
+        assert_eq!(machine.cpu().pc, 0x9000);
+        machine.step().expect("RTI");
+        assert_eq!(machine.cpu().pc, return_pc);
+    }
+
+    #[test]
+    fn records_controller_ppu_and_dma_events_with_bounded_storage() {
+        let rom = rom_with_program(
+            &[
+                0xa9, 0x01, 0x8d, 0x16, 0x40, // strobe on
+                0xa9, 0x00, 0x8d, 0x16, 0x40, // strobe off
+                0xad, 0x16, 0x40, // read controller
+                0xa9, 0x00, 0x8d, 0x14, 0x40, // DMA page zero
+            ],
+            Region::Ntsc,
+        );
+        let mut machine = Machine::from_rom_bytes(
+            &rom,
+            EmulatorConfig {
+                event_capacity: 12,
+                ..EmulatorConfig::default()
+            },
+        )
+        .expect("machine");
+        machine.reset().expect("reset");
+        machine.set_controller(0, 1).expect("controller");
+        for _ in 0..8 {
+            machine.step().expect("instruction");
+        }
+        assert_eq!(machine.cpu().a, 0);
+        assert!(machine.events().len() <= 12);
+        assert!(
+            machine
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::Dma)
+        );
+        assert!(
+            machine
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::VolatileRead)
+        );
+    }
+
+    #[test]
+    fn keeps_region_timing_explicit_and_stops_at_bounds() {
+        let rom = rom_with_program(&[0x4c, 0x00, 0x80], Region::MultiRegion);
+        assert!(Machine::from_rom_bytes(&rom, EmulatorConfig::default()).is_err());
+        let mut machine = Machine::from_rom_bytes(
+            &rom,
+            EmulatorConfig {
+                timing: Some(TimingProfile::Dendy),
+                ..EmulatorConfig::default()
+            },
+        )
+        .expect("explicit timing");
+        machine.reset().expect("reset");
+        let report = machine
+            .run(RunLimits {
+                instruction_limit: 4,
+                cycle_limit: 100,
+            })
+            .expect("bounded run");
+        assert_eq!(report.termination, Termination::InstructionLimit);
+        assert_eq!(report.instructions, 4);
+        assert_eq!(report.frames, 0);
+    }
+
+    #[test]
+    fn applies_distinct_ntsc_and_dendy_frame_timing() {
+        assert_eq!(TimingProfile::Ntsc.frame_cycle_ratio(), (89_342, 3));
+        assert_eq!(TimingProfile::Pal.frame_cycle_ratio(), (531_960, 16));
+        assert_eq!(TimingProfile::Dendy.frame_cycle_ratio(), (106_392, 3));
+        assert_eq!(TimingProfile::Dendy.vblank_cycle_ratio(), (99_232, 3));
+        let rom = rom_with_program(&[0x4c, 0x00, 0x80], Region::MultiRegion);
+        let run = |timing| {
+            let mut machine = Machine::from_rom_bytes(
+                &rom,
+                EmulatorConfig {
+                    timing: Some(timing),
+                    ..EmulatorConfig::default()
+                },
+            )
+            .expect("machine");
+            machine.reset().expect("reset");
+            machine
+                .run(RunLimits {
+                    instruction_limit: 20_000,
+                    cycle_limit: 30_000,
+                })
+                .expect("run");
+            machine
+        };
+        let ntsc = run(TimingProfile::Ntsc);
+        let dendy = run(TimingProfile::Dendy);
+        assert_eq!(ntsc.frames(), 1);
+        assert_eq!(dendy.frames(), 0);
+        assert!(
+            ntsc.events()
+                .iter()
+                .any(|event| event.kind == EventKind::Frame)
+        );
+    }
+
+    #[test]
+    fn executes_uxrom_mapper_writes_with_physical_bank_events() {
+        let mut prg = vec![0xea; 4 * 16 * 1024];
+        prg[16 * 1024..16 * 1024 + 2].copy_from_slice(&[0xa9, 0x42]);
+        let fixed = 3 * 16 * 1024;
+        prg[fixed..fixed + 8].copy_from_slice(&[
+            0xa9, 0x01, // lda #1
+            0x8d, 0x00, 0x80, // sta $8000
+            0x4c, 0x00, 0x80, // jmp $8000
+        ]);
+        let vectors = prg.len() - 6;
+        for offset in [0, 2, 4] {
+            prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+        }
+        let rom = build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 2,
+                submapper: 0,
+                mirroring: Mirroring::Vertical,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 0,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: Vec::new(),
+        })
+        .expect("UxROM");
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        for _ in 0..4 {
+            machine.step().expect("instruction");
+        }
+        assert_eq!(machine.cpu().a, 0x42);
+        assert!(
+            machine
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::MapperWrite)
+        );
+        assert!(machine.events().iter().any(|event| {
+            event.kind == EventKind::Instruction
+                && event.address == Some(0x8000)
+                && event.physical_bank == Some(1)
+        }));
+    }
+
+    #[test]
+    fn captures_comparable_checkpoints_and_first_event_divergence() {
+        let rom = rom_with_program(&[0xa9, 0x21, 0x85, 0x10], Region::Ntsc);
+        let mut original =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        let mut translated =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        original.reset().expect("reset");
+        translated.reset().expect("reset");
+        for _ in 0..2 {
+            original.step().expect("instruction");
+            translated.step().expect("instruction");
+        }
+        assert_eq!(original.snapshot(), translated.snapshot());
+        let original_events = original.events().iter().cloned().collect::<Vec<_>>();
+        let mut translated_events = translated.events().iter().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            first_divergent_event(&original_events, &translated_events),
+            None
+        );
+        translated_events[1].value = Some(0xff);
+        let divergence =
+            first_divergent_event(&original_events, &translated_events).expect("first divergence");
+        assert_eq!(divergence.index, 1);
     }
 }

@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+nesc-disasm = { path = "../nesc-disasm" }
 nesc-rom = { path = "../nesc-rom" }
 
 [lints]
