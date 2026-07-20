@@ -10,9 +10,10 @@ publish = false
 [dependencies]
 nesc-codegen-6502 = { path = "../nesc-codegen-6502" }
 nesc-disasm = { path = "../nesc-disasm" }
+nesc-rom = { path = "../nesc-rom" }
 
 [dev-dependencies]
-nesc-rom = { path = "../nesc-rom" }
+tempfile.workspace = true
 
 [lints]
 workspace = true

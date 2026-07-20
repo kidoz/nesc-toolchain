@@ -1,13 +1,20 @@
 //! Provenance-rich 6502 semantic lifting, value, ABI, and type recovery.
 
+mod nesc_emitter;
 mod recovery_analysis;
+mod rust_emitter;
 mod structuring;
 mod value_analysis;
 
+pub use nesc_emitter::{NesCEmissionLimits, NesCEmitConfig, NesCProject, emit_nesc_project};
 pub use recovery_analysis::{
     AbiByte, CallEdge, CallGraphCycle, CallingConvention, FunctionRecovery, PointerFact,
     RecoveredType, RecoveryAnalysis, RecoveryEvidence, RecoveryEvidenceKind, RecoveryLimits,
     Signedness, TypeFact, TypeSubject, Volatility, analyze_recovery,
+};
+pub use rust_emitter::{
+    RustEmissionLimits, RustEmitConfig, RustProject, RustVerificationLimits, emit_rust_project,
+    emit_rust_verification,
 };
 pub use structuring::{
     ControlEdge, ControlFlowAnalysis, ControlFlowLimits, CountedLoop, FallbackReason, LoopForm,
