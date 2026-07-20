@@ -27,6 +27,9 @@ ROM. The toolkit is written in stable Rust 2024.
   indirect access, and configurable bounds checks
 - Mapper 0 linking, iNES/NES 2.0 ROM construction, symbols, source maps, and
   deterministic emulator boot verification
+- Public bounded emulator execution for all 151 official CPU opcodes, reset,
+  interrupts, controller I/O, DMA, mapper writes, region timing, checkpoints,
+  and first-divergence event traces
 - `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0
   `nesc disassemble`, `nesc decompile --emit=nesc`, and
   `nesc decompile --emit=rust` workflows
@@ -61,8 +64,8 @@ ROM. The toolkit is written in stable Rust 2024.
 | Stable Rust host-side translation with bounded fallback | Available |
 | Hybrid NesC translation with bounded dispatcher fallback | Available |
 | Original-versus-Rust differential verification | Available |
-| Deterministic emulator boot verification | Available as a library |
-| Debugger integration | Planned |
+| Deterministic CPU/bus execution and boot verification | Available as a library |
+| Complete PPU/APU timing and debugger integration | Planned |
 
 ## Quick start
 
@@ -180,7 +183,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Complete debugger integration and richer emulator timing coverage
+1. Complete PPU/APU timing and debugger integration
 2. Add mapper-aware compilation for UxROM and CNROM
 3. Extend recovery and verification to bank-switched cartridges and compiled
    NesC output
