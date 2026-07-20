@@ -120,8 +120,8 @@ fn rom_with_interrupts_and_frame_boundary(mapper: u16) -> Vec<u8> {
         0x8d, 0x06, 0x20, // sta $2006
         0xa9, 0x55, // lda #$55
         0x8d, 0x07, 0x20, // sta $2007
-        0xa9, 0x7f, // lda #$7f
-        0x8d, 0x00, 0x40, // sta $4000
+        0xa9, 0x7f, // lda #$7f; select four-step mode and inhibit frame IRQ
+        0x8d, 0x17, 0x40, // sta $4017
         0xa9, 0x00, // lda #0
         0x8d, 0x14, 0x40, // sta $4014
         0x58, // cli

@@ -7,6 +7,7 @@ use std::fmt;
 use nesc_disasm::{AddressingMode, Mnemonic, opcode};
 use nesc_rom::{CpuAddress, Mapper, MapperState, Mirroring, PpuAddress, Region, Rom};
 
+use crate::apu::{Apu, ApuState, ApuTiming};
 use crate::cpu::{
     CpuState, FLAG_BREAK, FLAG_CARRY, FLAG_DECIMAL, FLAG_INTERRUPT_DISABLE, FLAG_NEGATIVE,
     FLAG_OVERFLOW, FLAG_UNUSED, FLAG_ZERO,
@@ -250,6 +251,7 @@ pub struct MachineSnapshot {
     pub ram: Box<[u8; 0x800]>,
     pub prg_ram: Box<[u8; 0x2000]>,
     pub apu_io: Box<[u8; 0x18]>,
+    pub apu: ApuState,
     pub chr_ram: Box<[u8; 0x2000]>,
     pub palette: Box<[u8; 32]>,
     pub oam: Box<[u8; 256]>,
@@ -364,6 +366,7 @@ pub struct Machine {
     ram: Box<[u8; 0x800]>,
     prg_ram: Box<[u8; 0x2000]>,
     apu_io: Box<[u8; 0x18]>,
+    apu: Apu,
     prg_rom: Vec<u8>,
     chr_rom: Vec<u8>,
     chr_ram: Box<[u8; 0x2000]>,
@@ -450,6 +453,11 @@ impl Machine {
             rom.metadata.chr_rom_len,
         )
         .map_err(|error| construction_error(error.to_string()))?;
+        let apu_timing = match timing {
+            TimingProfile::Ntsc => ApuTiming::Ntsc,
+            TimingProfile::Pal => ApuTiming::Pal,
+            TimingProfile::Dendy => ApuTiming::Dendy,
+        };
         Ok(Self {
             cpu: CpuState::default(),
             cycles: 0,
@@ -459,6 +467,7 @@ impl Machine {
             ram: Box::new([0; 0x800]),
             prg_ram: Box::new([0; 0x2000]),
             apu_io: Box::new([0; 0x18]),
+            apu: Apu::new(apu_timing),
             prg_rom: rom.prg_rom,
             chr_rom: rom.chr_rom,
             chr_ram: Box::new([0; 0x2000]),
@@ -513,6 +522,8 @@ impl Machine {
     pub fn reset(&mut self) -> Result<(), EmulatorError> {
         self.cpu = CpuState::default();
         self.mapper_state = MapperState::default();
+        self.apu.reset();
+        self.apu_io.fill(0);
         self.pending_nmi = false;
         self.irq_line = false;
         self.pending_step = None;
@@ -730,7 +741,7 @@ impl Machine {
             self.pending_nmi = false;
             return self.handle_external_interrupt(InterruptKind::Nmi, NMI_VECTOR);
         }
-        if self.irq_line && !self.cpu.flag(FLAG_INTERRUPT_DISABLE) {
+        if (self.irq_line || self.apu.irq_pending()) && !self.cpu.flag(FLAG_INTERRUPT_DISABLE) {
             return self.handle_external_interrupt(InterruptKind::Irq, IRQ_VECTOR);
         }
 
@@ -872,7 +883,8 @@ impl Machine {
                 0x2007 => self.peek_ppu(self.ppu_address),
                 _ => Ok(0),
             },
-            0x4000..=0x4015 => Ok(self.apu_io[usize::from(address - 0x4000)]),
+            0x4000..=0x4014 => Ok(self.apu_io[usize::from(address - 0x4000)]),
+            0x4015 => Ok(self.apu.peek_status()),
             0x4016 | 0x4017 => {
                 let port = usize::from(address - 0x4016);
                 Ok((self.controller_shift[port] & 1) | 0x40)
@@ -1031,6 +1043,12 @@ impl Machine {
         &self.apu_io
     }
 
+    /// Current non-DMC channel, frame-counter, IRQ, and output state.
+    #[must_use]
+    pub fn apu_state(&self) -> ApuState {
+        self.apu.state()
+    }
+
     #[must_use]
     pub fn chr_ram(&self) -> &[u8; 0x2000] {
         &self.chr_ram
@@ -1070,6 +1088,7 @@ impl Machine {
             ram: self.ram.clone(),
             prg_ram: self.prg_ram.clone(),
             apu_io: self.apu_io.clone(),
+            apu: self.apu.state(),
             chr_ram: self.chr_ram.clone(),
             palette: self.palette.clone(),
             oam: self.oam.clone(),
@@ -1490,7 +1509,8 @@ impl Machine {
             match address {
                 0x0000..=0x1fff => self.ram[usize::from(address & 0x07ff)],
                 0x2000..=0x3fff => self.read_ppu_register(0x2000 | (address & 7))?,
-                0x4000..=0x4015 => self.apu_io[usize::from(address - 0x4000)],
+                0x4000..=0x4014 => self.apu_io[usize::from(address - 0x4000)],
+                0x4015 => self.apu.read_status(),
                 0x4016 | 0x4017 => self.read_controller(usize::from(address - 0x4016)),
                 0x4018..=0x5fff => 0,
                 0x6000..=0x7fff => self.prg_ram[usize::from(address - 0x6000)],
@@ -1522,6 +1542,7 @@ impl Machine {
             0x2000..=0x3fff => self.write_ppu_register(0x2000 | (address & 7), value)?,
             0x4000..=0x4013 | 0x4015 | 0x4017 => {
                 self.apu_io[usize::from(address - 0x4000)] = value;
+                self.apu.write_register(address, value);
             }
             0x4014 if self.defer_dma => {
                 self.record(EventKind::Dma, Some(0x4014), Some(value), None);
@@ -1789,6 +1810,7 @@ impl Machine {
         };
         for _ in 0..cycles {
             self.cycles = self.cycles.saturating_add(1);
+            self.apu.clock();
             self.ppu_dot_accumulator = self.ppu_dot_accumulator.saturating_add(dots_per_cycle);
             while self.ppu_dot_accumulator >= denominator {
                 self.ppu_dot_accumulator -= denominator;
@@ -2886,7 +2908,7 @@ fn palette_index(address: u16) -> usize {
 }
 
 #[cfg(test)]
-mod ppu_tests {
+mod hardware_tests {
     use nesc_rom::{Format, Metadata};
 
     use super::*;
@@ -3095,5 +3117,26 @@ mod ppu_tests {
         assert_eq!(vertical.peek_ppu(0x2800).expect("vertical mirror"), 0x53);
         vertical.write_ppu(0x2400, 0x64).expect("second nametable");
         assert_eq!(vertical.peek_ppu(0x2c00).expect("vertical mirror"), 0x64);
+    }
+
+    #[test]
+    fn exposes_and_clears_apu_frame_irq_through_status_reads() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.advance_cycles(29_829);
+        assert!(machine.apu_state().frame_irq_pending);
+        assert_ne!(
+            machine.peek(0x4015).expect("observational APU status") & 0x40,
+            0
+        );
+        assert!(machine.apu_state().frame_irq_pending);
+
+        assert_ne!(machine.cpu_read(0x4015).expect("APU status read") & 0x40, 0);
+        assert!(!machine.apu_state().frame_irq_pending);
+
+        machine.advance_cycles(29_829);
+        machine.cpu.set_flag(FLAG_INTERRUPT_DISABLE, false);
+        let report = machine.step().expect("APU frame IRQ entry");
+        assert_eq!(report.interrupt, Some(InterruptKind::Irq));
+        assert_eq!(machine.snapshot().apu, machine.apu_state());
     }
 }

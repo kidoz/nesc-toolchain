@@ -1,10 +1,12 @@
 //! Deterministic NES execution, observable traces, and compiler verification.
 
+mod apu;
 mod cpu;
 mod machine;
 
 use std::collections::BTreeMap;
 
+pub use apu::ApuState;
 pub use cpu::CpuState;
 pub use machine::{
     BusAccess, BusAccessKind, CycleReport, EmulatorConfig, EmulatorError, EventKind, FRAME_HEIGHT,
