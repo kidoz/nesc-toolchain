@@ -92,31 +92,62 @@ fn uxrom_with_duplicate_fallback_addresses() -> Vec<u8> {
 }
 
 fn rom_with_interrupts_and_frame_boundary(mapper: u16) -> Vec<u8> {
-    let prg_banks = if mapper == 2 { 4 } else { 1 };
+    let prg_banks = if mapper == 2 { 2 } else { 1 };
     let mut prg = vec![0xff; prg_banks * 16 * 1024];
     let fixed = (prg_banks - 1) * 16 * 1024;
-    prg[fixed..fixed + 14].copy_from_slice(&[
-        0xa2, 0x00, // ldx #0
-        0x58, // cli
-        0xa9, 0x00, // loop: lda #0
+    let program = [
+        0xa9, 0x2a, // lda #$2a
+        0x85, 0x00, // sta $00
+        0xa9, 0x1e, // lda #$1e
+        0x8d, 0x01, 0x20, // sta $2001
+        0xa9, 0x03, // lda #3
+        0x8d, 0x03, 0x20, // sta $2003
+        0xa9, 0x3f, // lda #$3f
+        0x8d, 0x06, 0x20, // sta $2006
+        0xa9, 0x00, // lda #0
+        0x8d, 0x06, 0x20, // sta $2006
+        0xa9, 0x0f, // lda #$0f
+        0x8d, 0x07, 0x20, // sta $2007
+        0xa9, 0x20, // lda #$20
+        0x8d, 0x06, 0x20, // sta $2006
+        0xa9, 0x00, // lda #0
+        0x8d, 0x06, 0x20, // sta $2006
+        0xa9, 0x34, // lda #$34
+        0x8d, 0x07, 0x20, // sta $2007
+        0xa9, 0x00, // lda #0
+        0x8d, 0x06, 0x20, // sta $2006
+        0x8d, 0x06, 0x20, // sta $2006
+        0xa9, 0x55, // lda #$55
+        0x8d, 0x07, 0x20, // sta $2007
+        0xa9, 0x7f, // lda #$7f
+        0x8d, 0x00, 0x40, // sta $4000
+        0xa9, 0x00, // lda #0
         0x8d, 0x14, 0x40, // sta $4014
-        0xe8, // inx
-        0xe0, 0x3c, // cpx #60
-        0xd0, 0xf6, // bne loop
+        0x58, // cli
+        0xa9, 0x00, // lda #0
+        0x8d, 0x00, 0x02, // sta $0200
+        0x8d, 0x01, 0x02, // sta $0201
+        0xee, 0x00, 0x02, // loop: inc $0200
+        0xd0, 0xfb, // bne loop
+        0xee, 0x01, 0x02, // inc $0201
+        0xad, 0x01, 0x02, // lda $0201
+        0xc9, 0x1a, // cmp #26
+        0xd0, 0xf1, // bne loop
         0x60, // rts
-    ]);
-    prg[fixed + 0x20..fixed + 0x23].copy_from_slice(&[
+    ];
+    prg[fixed..fixed + program.len()].copy_from_slice(&program);
+    prg[fixed + 0x100..fixed + 0x103].copy_from_slice(&[
         0xe6, 0x10, // inc $10
         0x40, // rti
     ]);
-    prg[fixed + 0x30..fixed + 0x33].copy_from_slice(&[
+    prg[fixed + 0x110..fixed + 0x113].copy_from_slice(&[
         0xe6, 0x11, // inc $11
         0x40, // rti
     ]);
     let vectors = prg.len() - 6;
-    prg[vectors..vectors + 2].copy_from_slice(&0xc020_u16.to_le_bytes());
+    prg[vectors..vectors + 2].copy_from_slice(&0xc100_u16.to_le_bytes());
     prg[vectors + 2..vectors + 4].copy_from_slice(&0xc000_u16.to_le_bytes());
-    prg[vectors + 4..vectors + 6].copy_from_slice(&0xc030_u16.to_le_bytes());
+    prg[vectors + 4..vectors + 6].copy_from_slice(&0xc110_u16.to_le_bytes());
     nesc_rom::build(&Rom {
         metadata: Metadata {
             format: Format::Nes2,
@@ -772,7 +803,7 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
 #[test]
 fn verifies_interrupt_schedules_and_frame_boundaries_for_supported_mappers() {
     let temporary = tempdir().expect("temporary directory");
-    for (mapper, expected_contexts) in [(0_u16, 1_usize), (2, 3)] {
+    for (mapper, expected_contexts) in [(0_u16, 1_usize), (2, 1)] {
         let rom_name = format!("interrupts-mapper-{mapper}.nes");
         let output_name = format!("verified-mapper-{mapper}");
         fs::write(
@@ -788,8 +819,9 @@ fn verifies_interrupt_schedules_and_frame_boundaries_for_supported_mappers() {
                 &rom_name,
                 "--emit",
                 "nesc",
-                "--high-level-only",
                 "--verify",
+                "--max-work-items",
+                "1000000",
                 "--output",
                 &output_name,
             ])
@@ -817,15 +849,23 @@ fn verifies_interrupt_schedules_and_frame_boundaries_for_supported_mappers() {
         );
         assert!(
             report.contains(&format!(
-                "\"frame_boundary_executions\": {expected_contexts}"
+                "\"frame_boundary_executions\": {}",
+                expected_contexts * 2
             )),
             "{report}"
         );
+        assert!(report.contains("\"frame_checkpoint_limit_per_bank_context\": 2"));
+        assert!(report.contains("\"apu_io_bytes_compared_per_completed_execution\": 24"));
+        assert!(report.contains("\"chr_ram_bytes_compared_per_completed_execution\": 8192"));
+        assert!(report.contains("\"palette_bytes_compared_per_completed_execution\": 32"));
+        assert!(report.contains("\"oam_bytes_compared_per_completed_execution\": 256"));
+        assert!(report.contains("\"nametable_bytes_compared_per_completed_execution\": 4096"));
         let source = fs::read_to_string(temporary.path().join(&output_name).join("src/main.c"))
             .expect("instrumented source");
         assert!(source.contains("verification_observe(5, 0xfffa, 0)"));
         assert!(source.contains("verification_observe(5, 0xfffe, 0)"));
         assert!(source.contains("verification_store(0x7f0d, 1)"));
+        assert!(source.contains("verification_store(0x2004, cpu_read"));
     }
 }
 

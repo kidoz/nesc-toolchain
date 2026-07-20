@@ -8,8 +8,8 @@ use nesc_emulator::{
 };
 use nesc_rom::MapperState;
 
-const EVENT_BASE: usize = 0x1c00;
-const EVENT_LIMIT: usize = 192;
+const EVENT_BASE: usize = 0x1b00;
+const EVENT_LIMIT: usize = 255;
 const EVENT_COUNT: usize = 0x1f00;
 const EVENT_OVERFLOW: usize = 0x1f01;
 const COMPLETION: usize = 0x1f02;
@@ -33,6 +33,7 @@ const CONFIG_SCHEDULE_STEP_LOW: usize = 0x1ff5;
 const CONFIG_SCHEDULE_STEP_HIGH: usize = 0x1ff6;
 const COMPLETION_MARKER: u8 = 0xa5;
 const PHYSICAL_INSTRUCTION_MULTIPLIER: u64 = 128;
+const FRAME_CHECKPOINT_LIMIT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RootTermination {
@@ -88,6 +89,27 @@ struct SemanticEvent {
     value: u8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HardwareState {
+    apu_io: Box<[u8; 0x18]>,
+    chr_ram: Box<[u8; 0x2000]>,
+    palette: Box<[u8; 32]>,
+    oam: Box<[u8; 256]>,
+    nametable_ram: Box<[u8; 0x1000]>,
+}
+
+impl HardwareState {
+    fn capture(machine: &Machine) -> Self {
+        Self {
+            apu_io: Box::new(*machine.apu_io()),
+            chr_ram: Box::new(*machine.chr_ram()),
+            palette: Box::new(*machine.palette()),
+            oam: Box::new(*machine.oam()),
+            nametable_ram: Box::new(*machine.nametable_ram()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OriginalResult {
     termination: RootTermination,
@@ -95,6 +117,7 @@ struct OriginalResult {
     ram: Box<[u8; 0x800]>,
     prg_ram: Box<[u8; 0x2000]>,
     prg_bank: u8,
+    hardware: HardwareState,
     events: Vec<SemanticEvent>,
 }
 
@@ -105,6 +128,7 @@ struct TranslatedResult {
     ram: Box<[u8; 0x800]>,
     prg_ram: Box<[u8; 0x2000]>,
     prg_bank: Option<u8>,
+    hardware: HardwareState,
     events: Vec<SemanticEvent>,
 }
 
@@ -265,16 +289,18 @@ pub(crate) fn verify(
             }
         }
 
-        if let Some(instruction) = discover_frame_checkpoint(
+        let frame_checkpoints = discover_frame_checkpoints(
             original_rom,
             reset.entry.cpu_address,
             initial_bank,
             0x20,
             0,
             semantic_limit,
-        )? {
+        )?;
+        for (frame_index, instruction) in frame_checkpoints.into_iter().enumerate() {
+            let frame = frame_index + 1;
             let context = format!(
-                "reset function {} at first frame boundary after semantic instruction {instruction}, initial bank {initial_bank}",
+                "reset function {} at frame boundary {frame} after semantic instruction {instruction}, initial bank {initial_bank}",
                 reset.id.0
             );
             verify_case(
@@ -291,7 +317,7 @@ pub(crate) fn verify(
     }
 
     let json = format!(
-        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-nesc\",\n  \"status\": \"passed\",\n  \"mapper\": {},\n  \"prg_banks\": {},\n  \"functions\": {},\n  \"input_profiles_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {},\n  \"executions\": {executions},\n  \"direct_function_executions\": {direct_executions},\n  \"nmi_schedule_executions\": {nmi_executions},\n  \"irq_schedule_executions\": {irq_executions},\n  \"frame_boundary_executions\": {frame_executions},\n  \"interrupt_schedule_instruction\": 0,\n  \"observable_events_compared\": {compared_events},\n  \"ram_bytes_compared_per_completed_execution\": 2048,\n  \"prg_ram_bytes_compared_per_completed_execution\": 4096,\n  \"verification_workspace\": \"0x7000..0x7fff\",\n  \"semantic_instruction_limit_per_execution\": {semantic_limit},\n  \"generated_instruction_limit_per_execution\": {translated_limit}\n}}\n",
+        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-nesc\",\n  \"status\": \"passed\",\n  \"mapper\": {},\n  \"prg_banks\": {},\n  \"functions\": {},\n  \"input_profiles_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {},\n  \"executions\": {executions},\n  \"direct_function_executions\": {direct_executions},\n  \"nmi_schedule_executions\": {nmi_executions},\n  \"irq_schedule_executions\": {irq_executions},\n  \"frame_checkpoint_limit_per_bank_context\": {FRAME_CHECKPOINT_LIMIT},\n  \"frame_boundary_executions\": {frame_executions},\n  \"interrupt_schedule_instruction\": 0,\n  \"observable_events_compared\": {compared_events},\n  \"semantic_event_capacity\": {EVENT_LIMIT},\n  \"ram_bytes_compared_per_completed_execution\": 2048,\n  \"prg_ram_bytes_compared_per_completed_execution\": 4096,\n  \"apu_io_bytes_compared_per_completed_execution\": 24,\n  \"chr_ram_bytes_compared_per_completed_execution\": 8192,\n  \"palette_bytes_compared_per_completed_execution\": 32,\n  \"oam_bytes_compared_per_completed_execution\": 256,\n  \"nametable_bytes_compared_per_completed_execution\": 4096,\n  \"verification_workspace\": \"0x7000..0x7fff\",\n  \"semantic_instruction_limit_per_execution\": {semantic_limit},\n  \"generated_instruction_limit_per_execution\": {translated_limit}\n}}\n",
         program.mapper,
         prg_bank_count,
         program.functions.len(),
@@ -353,6 +379,7 @@ fn run_original(rom: &[u8], entry: u16, config: ExecutionConfig) -> Result<Origi
         ram: Box::new(*machine.ram()),
         prg_ram: Box::new(*machine.prg_ram()),
         prg_bank: machine.mapper_state().prg_bank,
+        hardware: HardwareState::capture(&machine),
         events: original_events(machine.events()),
     })
 }
@@ -392,7 +419,8 @@ fn run_translated(
         config.instruction_limit,
         VerificationSchedule::None,
     )?;
-    decode_translation(machine.prg_ram(), termination)
+    let hardware = HardwareState::capture(&machine);
+    decode_translation(machine.prg_ram(), termination, hardware)
 }
 
 fn machine(rom: &[u8]) -> Result<Machine, String> {
@@ -504,14 +532,14 @@ fn run_root(
     }
 }
 
-fn discover_frame_checkpoint(
+fn discover_frame_checkpoints(
     rom: &[u8],
     entry: u16,
     initial_bank: u16,
     status: u8,
     controller: u8,
     instruction_limit: u64,
-) -> Result<Option<u16>, String> {
+) -> Result<Vec<u16>, String> {
     let mut machine = machine(rom)?;
     machine.reset().map_err(|error| error.to_string())?;
     machine.set_mapper_state(MapperState {
@@ -533,15 +561,16 @@ fn discover_frame_checkpoint(
     let mut call_depth = 0_u32;
     let mut interrupt_depth = 0_u32;
     let mut instructions = 0_u64;
+    let mut checkpoints = Vec::new();
     while instructions < instruction_limit {
         let pc = machine.cpu().pc;
         let opcode = machine.peek(pc).map_err(|error| error.to_string())?;
         if call_depth == 0 && interrupt_depth == 0 && matches!(opcode, 0x40 | 0x60) {
-            return Ok(None);
+            return Ok(checkpoints);
         }
         let report = machine.step().map_err(|error| error.to_string())?;
         if report.termination.is_some() {
-            return Ok(None);
+            return Ok(checkpoints);
         }
         if report.interrupt.is_some() {
             interrupt_depth = interrupt_depth.saturating_add(1);
@@ -555,13 +584,19 @@ fn discover_frame_checkpoint(
         } else if opcode == 0x60 && call_depth != 0 {
             call_depth -= 1;
         }
-        if machine.frames() > initial_frame {
-            return u16::try_from(instructions)
-                .map(Some)
-                .map_err(|_| "frame checkpoint does not fit in u16".to_owned());
+        while machine.frames() > initial_frame.saturating_add(checkpoints.len() as u64)
+            && checkpoints.len() < FRAME_CHECKPOINT_LIMIT
+        {
+            checkpoints.push(
+                u16::try_from(instructions)
+                    .map_err(|_| "frame checkpoint does not fit in u16".to_owned())?,
+            );
+        }
+        if checkpoints.len() == FRAME_CHECKPOINT_LIMIT {
+            return Ok(checkpoints);
         }
     }
-    Ok(None)
+    Ok(checkpoints)
 }
 
 fn original_events(events: &std::collections::VecDeque<ObservableEvent>) -> Vec<SemanticEvent> {
@@ -590,6 +625,7 @@ fn original_events(events: &std::collections::VecDeque<ObservableEvent>) -> Vec<
 fn decode_translation(
     prg_ram: &[u8; 0x2000],
     termination: RootTermination,
+    hardware: HardwareState,
 ) -> Result<TranslatedResult, String> {
     if prg_ram[WORKSPACE_CONFLICT] != 0 {
         return Err(
@@ -614,7 +650,9 @@ fn decode_translation(
     }
     let mut observable = Vec::new();
     let mut ram = Box::new([0_u8; 0x800]);
+    ram.copy_from_slice(&prg_ram[0x1000..0x1800]);
     let mut logical_prg_ram = Box::new([0_u8; 0x2000]);
+    logical_prg_ram[..0x1000].copy_from_slice(&prg_ram[..0x1000]);
     for index in 0..count {
         let base = EVENT_BASE + index * 4;
         let event = SemanticEvent {
@@ -624,16 +662,6 @@ fn decode_translation(
         };
         match event.kind {
             1..=5 => observable.push(event),
-            6 => ram[usize::from(event.address & 0x07ff)] = event.value,
-            7 => {
-                if !(0x6000..=0x7fff).contains(&event.address) {
-                    return Err(format!(
-                        "semantic PRG-RAM event uses invalid address ${:04X}",
-                        event.address
-                    ));
-                }
-                logical_prg_ram[usize::from(event.address - 0x6000)] = event.value;
-            }
             kind => return Err(format!("semantic event log contains unknown kind {kind}")),
         }
     }
@@ -652,6 +680,7 @@ fn decode_translation(
         ram,
         prg_ram: logical_prg_ram,
         prg_bank: completed.then_some(prg_ram[RESULT_PRG_BANK]),
+        hardware,
         events: observable,
     })
 }
@@ -698,6 +727,41 @@ fn compare_results(
             &original.prg_ram[..0x1000],
             &translated.prg_ram[..0x1000],
             0x6000,
+            context,
+        )?;
+        compare_memory(
+            "APU I/O",
+            &original.hardware.apu_io[..],
+            &translated.hardware.apu_io[..],
+            0x4000,
+            context,
+        )?;
+        compare_memory(
+            "CHR RAM",
+            &original.hardware.chr_ram[..],
+            &translated.hardware.chr_ram[..],
+            0x0000,
+            context,
+        )?;
+        compare_memory(
+            "palette",
+            &original.hardware.palette[..],
+            &translated.hardware.palette[..],
+            0x3f00,
+            context,
+        )?;
+        compare_memory(
+            "OAM",
+            &original.hardware.oam[..],
+            &translated.hardware.oam[..],
+            0x0000,
+            context,
+        )?;
+        compare_memory(
+            "nametable RAM",
+            &original.hardware.nametable_ram[..],
+            &translated.hardware.nametable_ram[..],
+            0x2000,
             context,
         )?;
     }

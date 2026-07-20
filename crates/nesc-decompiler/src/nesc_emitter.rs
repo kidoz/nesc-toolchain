@@ -515,8 +515,8 @@ impl Emitter<'_> {
         self.line(1, "u8 count;")?;
         self.line(1, "u16 base;")?;
         self.line(1, "count = verification_load(0x7f00);")?;
-        self.line(1, "if (count < 192) {")?;
-        self.line(2, "base = (u16)(0x7c00 + ((u16)count << 2));")?;
+        self.line(1, "if (count < 255) {")?;
+        self.line(2, "base = (u16)(0x7b00 + ((u16)count << 2));")?;
         self.line(2, "verification_store(base, kind);")?;
         self.line(2, "verification_store((u16)(base + 1), (u8)address);")?;
         self.line(
@@ -533,11 +533,7 @@ impl Emitter<'_> {
             0,
             "static void verification_observe_write(u16 address, u8 value) {",
         )?;
-        self.line(1, "if (address < 0x2000) {")?;
-        self.line(2, "verification_observe(6, address, value);")?;
-        self.line(1, "} else if ((address >= 0x6000) && (address < 0x8000)) {")?;
-        self.line(2, "verification_observe(7, address, value);")?;
-        self.line(1, "} else if (address >= 0x8000) {")?;
+        self.line(1, "if (address >= 0x8000) {")?;
         self.line(2, "verification_observe(3, address, value);")?;
         self.line(
             1,
@@ -549,11 +545,25 @@ impl Emitter<'_> {
         self.line(2, "verification_observe(2, address, value);")?;
         self.line(1, "}")?;
         self.line(0, "}")?;
+        self.line(0, "static void verification_dma(u8 page) {")?;
+        self.line(1, "u16 address;")?;
+        self.line(1, "u8 offset;")?;
+        self.line(1, "address = (u16)((u16)page << 8);")?;
+        self.line(1, "offset = 0;")?;
+        self.line(1, "while (offset != 0xff) {")?;
+        self.line(2, "verification_store(0x2004, cpu_read(address));")?;
+        self.line(2, "address = (u16)(address + 1);")?;
+        self.line(2, "offset = (u8)(offset + 1);")?;
+        self.line(1, "}")?;
+        self.line(1, "verification_store(0x2004, cpu_read(address));")?;
+        self.line(0, "}")?;
         self.line(
             0,
             "static void verification_bus_write(u16 address, u8 value) {",
         )?;
-        self.line(1, "if (address < 0x2000) {")?;
+        self.line(1, "if (address == 0x4014) {")?;
+        self.line(2, "verification_dma(value);")?;
+        self.line(1, "} else if (address < 0x2000) {")?;
         self.line(
             2,
             "*((ptr<unknown, volatile u8>)(0x7000 + (address & 0x07ff))) = value;",
