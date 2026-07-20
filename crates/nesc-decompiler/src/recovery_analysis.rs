@@ -337,7 +337,7 @@ fn recover_calls(program: &Program, limit: usize) -> Result<Vec<CallEdge>, Vec<A
                     RecoveryEvidenceKind::UnresolvedControl
                 },
             ),
-            BlockTarget::Unresolved { cpu_address } => (
+            BlockTarget::Unresolved { cpu_address, .. } => (
                 None,
                 *cpu_address,
                 Confidence::Unknown,
@@ -882,6 +882,7 @@ fn operation_reads(operation: &SemanticOperation, variable: StateVariable) -> bo
         }
         SemanticOperation::Pull { .. }
         | SemanticOperation::SetFlag { .. }
+        | SemanticOperation::MapperWrite { .. }
         | SemanticOperation::NoOperation => false,
     }
 }
@@ -910,6 +911,7 @@ fn operation_writes(operation: &SemanticOperation, variable: StateVariable) -> b
         }
         SemanticOperation::Compare { .. }
         | SemanticOperation::TestBits { .. }
+        | SemanticOperation::MapperWrite { .. }
         | SemanticOperation::NoOperation => false,
     }
 }
@@ -1166,6 +1168,7 @@ fn operation_memories(operation: &SemanticOperation) -> Vec<&MemoryOperand> {
         | SemanticOperation::Transfer { .. }
         | SemanticOperation::SetFlag { .. }
         | SemanticOperation::StackControl(_)
+        | SemanticOperation::MapperWrite { .. }
         | SemanticOperation::NoOperation => Vec::new(),
     }
 }

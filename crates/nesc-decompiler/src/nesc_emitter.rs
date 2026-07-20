@@ -635,6 +635,7 @@ impl Emitter<'_> {
             | SemanticOperation::StackControl(StackControl::PopReturnAddress)
             | SemanticOperation::StackControl(StackControl::PushInterruptFrame)
             | SemanticOperation::StackControl(StackControl::PopInterruptFrame)
+            | SemanticOperation::MapperWrite { .. }
             | SemanticOperation::NoOperation => {}
         }
         Ok(())
@@ -953,7 +954,7 @@ const fn branch_text(condition: BranchCondition) -> &'static str {
 fn target_address(target: &BlockTarget) -> u16 {
     match target {
         BlockTarget::Resolved(block) => block.cpu_address,
-        BlockTarget::Unresolved { cpu_address } => *cpu_address,
+        BlockTarget::Unresolved { cpu_address, .. } => *cpu_address,
     }
 }
 

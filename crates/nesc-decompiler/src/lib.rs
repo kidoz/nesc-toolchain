@@ -35,7 +35,7 @@ use std::fmt;
 
 use nesc_disasm::{
     AddressingMode, BankAddress, Disassembly, FlowControl, Instruction as DisassembledInstruction,
-    Mnemonic, VectorKind,
+    MapperWrite, Mnemonic, VectorKind,
 };
 
 /// Resource limits for untrusted decompilation inputs.
@@ -272,6 +272,15 @@ pub enum SemanticOperation {
         update_negative_zero: bool,
     },
     StackControl(StackControl),
+    /// Mapper-register write and its statically recovered bank effect.
+    MapperWrite {
+        /// Exact CPU register address, when statically known.
+        register_address: Option<u16>,
+        /// Stored byte, when proven by abstract interpretation.
+        value: Option<u8>,
+        /// Selected physical PRG bank, when proven by mapper semantics.
+        resulting_prg_bank: Option<u16>,
+    },
     NoOperation,
 }
 
@@ -301,11 +310,16 @@ pub enum BranchCondition {
     OverflowSet,
 }
 
-/// A resolved block or explicit unresolved CPU destination.
+/// A resolved block or explicit unresolved bank-qualified destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockTarget {
     Resolved(BlockId),
-    Unresolved { cpu_address: u16 },
+    Unresolved {
+        /// Physical PRG bank when mapper state proves it.
+        bank: Option<u16>,
+        /// CPU-visible destination encoded by control flow.
+        cpu_address: u16,
+    },
 }
 
 /// Reason a block cannot continue with a proven edge.
@@ -368,6 +382,8 @@ pub struct Edge {
     pub target: Option<BlockId>,
     /// Encoded CPU destination when resolution failed.
     pub unresolved_cpu_address: Option<u16>,
+    /// Proven physical PRG bank for an unresolved destination, if any.
+    pub unresolved_bank: Option<u16>,
 }
 
 /// Proven reason a recovered function root exists.
@@ -445,9 +461,9 @@ pub fn analyze(
     disassembly: &Disassembly,
     limits: AnalysisLimits,
 ) -> Result<Program, Vec<AnalysisError>> {
-    if disassembly.rom.metadata.mapper != 0 {
+    if !matches!(disassembly.rom.metadata.mapper, 0 | 2) {
         return Err(vec![AnalysisError::new(format!(
-            "semantic lifting currently supports Mapper 0, not Mapper {}",
+            "semantic lifting supports Mapper 0 and Mapper 2, not Mapper {}",
             disassembly.rom.metadata.mapper
         ))]);
     }
@@ -477,6 +493,13 @@ pub fn analyze(
         })
         .collect::<BTreeMap<_, _>>();
     let mut operation_count = 0_usize;
+    let mapper_writes = disassembly.mapper_writes.iter().fold(
+        BTreeMap::<usize, Vec<&MapperWrite>>::new(),
+        |mut writes, write| {
+            writes.entry(write.prg_offset).or_default().push(write);
+            writes
+        },
+    );
     let mut blocks = BTreeMap::new();
     for offset in &leaders {
         let Some(first) = disassembly.instructions.get(offset) else {
@@ -487,6 +510,7 @@ pub fn analyze(
             first,
             &leaders,
             &block_ids,
+            &mapper_writes,
             &mut operation_count,
             limits,
         )?;
@@ -562,6 +586,17 @@ impl Program {
                         instruction.provenance.prg_offset
                     )));
                 }
+                if self.mapper != 2
+                    && instruction
+                        .operations
+                        .iter()
+                        .any(|operation| matches!(operation, SemanticOperation::MapperWrite { .. }))
+                {
+                    errors.push(AnalysisError::new(format!(
+                        "instruction at PRG offset ${:05X} has a Mapper 2 effect in Mapper {}",
+                        instruction.provenance.prg_offset, self.mapper
+                    )));
+                }
             }
             verify_targets(&block.terminator, &self.blocks, &mut errors);
         }
@@ -583,6 +618,11 @@ impl Program {
             if edge.target.is_some() == edge.unresolved_cpu_address.is_some() {
                 errors.push(AnalysisError::new(
                     "edge must contain exactly one resolved or unresolved destination",
+                ));
+            }
+            if edge.target.is_some() && edge.unresolved_bank.is_some() {
+                errors.push(AnalysisError::new(
+                    "resolved edge must not retain an unresolved bank",
                 ));
             }
         }
@@ -667,23 +707,29 @@ fn discover_leaders(disassembly: &Disassembly) -> BTreeSet<usize> {
         }
     }
     for instruction in disassembly.instructions.values() {
-        let offset = instruction.prg_offset;
-        let next_offset = offset + instruction.decoded.bytes().len();
+        let physical_next = instruction.prg_offset + instruction.decoded.bytes().len();
+        let continuation = fallthrough_destination(disassembly, instruction);
+        if continuation
+            .prg_offset
+            .is_some_and(|offset| offset != physical_next)
+        {
+            leaders.insert(continuation.prg_offset.expect("known continuation"));
+        }
         match instruction.decoded.opcode.flow() {
             FlowControl::Branch => {
                 if let Some(target) = direct_target(disassembly, instruction) {
                     leaders.insert(target);
                 }
-                if disassembly.instructions.contains_key(&next_offset) {
-                    leaders.insert(next_offset);
+                if let Some(offset) = continuation.prg_offset {
+                    leaders.insert(offset);
                 }
             }
             FlowControl::Call => {
                 if let Some(target) = direct_target(disassembly, instruction) {
                     leaders.insert(target);
                 }
-                if disassembly.instructions.contains_key(&next_offset) {
-                    leaders.insert(next_offset);
+                if let Some(offset) = continuation.prg_offset {
+                    leaders.insert(offset);
                 }
             }
             FlowControl::Jump => {
@@ -709,7 +755,21 @@ fn direct_target(
     disassembly: &Disassembly,
     instruction: &DisassembledInstruction,
 ) -> Option<usize> {
-    let target = match instruction.decoded.opcode.flow() {
+    direct_destination(disassembly, instruction).prg_offset
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControlDestination {
+    bank: Option<u16>,
+    cpu_address: u16,
+    prg_offset: Option<usize>,
+}
+
+fn direct_destination(
+    disassembly: &Disassembly,
+    instruction: &DisassembledInstruction,
+) -> ControlDestination {
+    let cpu_address = match instruction.decoded.opcode.flow() {
         FlowControl::Branch => {
             let next = instruction
                 .address
@@ -718,9 +778,101 @@ fn direct_target(
             next.wrapping_add_signed(i16::from(instruction.decoded.bytes()[1] as i8))
         }
         FlowControl::Call | FlowControl::Jump => instruction.decoded.operand(),
-        _ => return None,
+        _ => unreachable!("only direct control flow has a direct destination"),
     };
-    offset_for_cpu(disassembly, target)
+    destination_for_cpu(disassembly, instruction, cpu_address, true)
+}
+
+fn fallthrough_destination(
+    disassembly: &Disassembly,
+    instruction: &DisassembledInstruction,
+) -> ControlDestination {
+    let cpu_address = instruction
+        .address
+        .cpu_address
+        .wrapping_add(u16::from(instruction.decoded.opcode.len()));
+    destination_for_cpu(disassembly, instruction, cpu_address, false)
+}
+
+fn destination_for_cpu(
+    disassembly: &Disassembly,
+    instruction: &DisassembledInstruction,
+    cpu_address: u16,
+    direct: bool,
+) -> ControlDestination {
+    if disassembly.rom.metadata.mapper == 2 {
+        let bank = if cpu_address >= 0xc000 {
+            u16::try_from(disassembly.rom.prg_rom.len() / (16 * 1024) - 1).ok()
+        } else if cpu_address < 0x8000 {
+            None
+        } else if !direct {
+            mapper_bank_after_instruction(disassembly, instruction).unwrap_or_else(|| {
+                if instruction.address.cpu_address < 0xc000 {
+                    Some(instruction.address.bank)
+                } else {
+                    unique_selected_prg_bank(instruction)
+                }
+            })
+        } else if instruction.decoded.opcode.flow() == FlowControl::Branch
+            && instruction.address.cpu_address < 0xc000
+        {
+            Some(instruction.address.bank)
+        } else {
+            unique_selected_prg_bank(instruction)
+        };
+        let prg_offset = bank.and_then(|bank| offset_for_bank_cpu(disassembly, bank, cpu_address));
+        return ControlDestination {
+            bank,
+            cpu_address,
+            prg_offset,
+        };
+    }
+
+    let prg_offset = offset_for_cpu(disassembly, cpu_address);
+    let bank = prg_offset
+        .and_then(|offset| disassembly.instructions.get(&offset))
+        .map(|target| target.address.bank);
+    ControlDestination {
+        bank,
+        cpu_address,
+        prg_offset,
+    }
+}
+
+fn mapper_bank_after_instruction(
+    disassembly: &Disassembly,
+    instruction: &DisassembledInstruction,
+) -> Option<Option<u16>> {
+    let mut writes = disassembly
+        .mapper_writes
+        .iter()
+        .filter(|write| write.prg_offset == instruction.prg_offset)
+        .peekable();
+    writes.peek()?;
+    let banks = writes
+        .map(|write| write.resulting_bank)
+        .collect::<BTreeSet<_>>();
+    if banks.len() == 1 {
+        Some(banks.into_iter().next().flatten())
+    } else {
+        Some(None)
+    }
+}
+
+fn unique_selected_prg_bank(instruction: &DisassembledInstruction) -> Option<u16> {
+    (instruction.selected_prg_banks.len() == 1)
+        .then(|| instruction.selected_prg_banks[0])
+        .flatten()
+}
+
+fn offset_for_bank_cpu(disassembly: &Disassembly, bank: u16, cpu_address: u16) -> Option<usize> {
+    disassembly
+        .instructions
+        .values()
+        .find(|instruction| {
+            instruction.address.bank == bank && instruction.address.cpu_address == cpu_address
+        })
+        .map(|instruction| instruction.prg_offset)
 }
 
 fn offset_for_cpu(disassembly: &Disassembly, cpu_address: u16) -> Option<usize> {
@@ -759,6 +911,7 @@ fn build_block(
     first: &DisassembledInstruction,
     leaders: &BTreeSet<usize>,
     block_ids: &BTreeMap<usize, BlockId>,
+    mapper_writes: &BTreeMap<usize, Vec<&MapperWrite>>,
     operation_count: &mut usize,
     limits: AnalysisLimits,
 ) -> Result<BasicBlock, Vec<AnalysisError>> {
@@ -767,7 +920,12 @@ fn build_block(
     let mut current_offset = first.prg_offset;
     loop {
         let instruction = &disassembly.instructions[&current_offset];
-        let lifted = lift_instruction(instruction);
+        let lifted = lift_instruction_with_mapper_writes(
+            instruction,
+            mapper_writes
+                .get(&current_offset)
+                .map_or(&[][..], Vec::as_slice),
+        );
         *operation_count = operation_count.saturating_add(lifted.operations.len());
         if *operation_count > limits.max_operations {
             return Err(vec![AnalysisError::new(format!(
@@ -776,40 +934,38 @@ fn build_block(
             ))]);
         }
         instructions.push(lifted);
-        let next_offset = current_offset + instruction.decoded.bytes().len();
-        let next_cpu = instruction
-            .address
-            .cpu_address
-            .wrapping_add(u16::from(instruction.decoded.opcode.len()));
+        let continuation = fallthrough_destination(disassembly, instruction);
         let flow = instruction.decoded.opcode.flow();
         if flow != FlowControl::Fallthrough {
-            let terminator = terminator_for(disassembly, instruction, next_offset, block_ids);
+            let terminator = terminator_for(disassembly, instruction, continuation, block_ids);
             return Ok(BasicBlock {
                 id,
                 instructions,
                 terminator,
             });
         }
-        if leaders.contains(&next_offset) {
+        if continuation
+            .prg_offset
+            .is_some_and(|offset| leaders.contains(&offset))
+        {
             return Ok(BasicBlock {
                 id,
                 instructions,
-                terminator: Terminator::Fallthrough(target_from_offset(
+                terminator: Terminator::Fallthrough(target_from_destination(
                     block_ids,
-                    next_offset,
-                    next_cpu,
+                    continuation,
                 )),
             });
         }
-        if !disassembly.instructions.contains_key(&next_offset) {
+        let Some(next_offset) = continuation.prg_offset else {
             return Ok(BasicBlock {
                 id,
                 instructions,
                 terminator: Terminator::Stop(StopReason::MissingInstruction {
-                    cpu_address: next_cpu,
+                    cpu_address: continuation.cpu_address,
                 }),
             });
-        }
+        };
         current_offset = next_offset;
     }
 }
@@ -817,31 +973,20 @@ fn build_block(
 fn terminator_for(
     disassembly: &Disassembly,
     instruction: &DisassembledInstruction,
-    next_offset: usize,
+    continuation: ControlDestination,
     block_ids: &BTreeMap<usize, BlockId>,
 ) -> Terminator {
-    let next_cpu = instruction
-        .address
-        .cpu_address
-        .wrapping_add(u16::from(instruction.decoded.opcode.len()));
-    let direct = || {
-        let cpu_address = match instruction.decoded.opcode.flow() {
-            FlowControl::Branch => {
-                next_cpu.wrapping_add_signed(i16::from(instruction.decoded.bytes()[1] as i8))
-            }
-            _ => instruction.decoded.operand(),
-        };
-        target_from_cpu(disassembly, block_ids, cpu_address)
-    };
+    let direct =
+        || target_from_destination(block_ids, direct_destination(disassembly, instruction));
     match instruction.decoded.opcode.flow() {
         FlowControl::Branch => Terminator::Branch {
             condition: branch_condition(instruction.decoded.opcode.mnemonic),
             taken: direct(),
-            not_taken: target_from_offset(block_ids, next_offset, next_cpu),
+            not_taken: target_from_destination(block_ids, continuation),
         },
         FlowControl::Call => Terminator::Call {
             callee: direct(),
-            continuation: target_from_offset(block_ids, next_offset, next_cpu),
+            continuation: target_from_destination(block_ids, continuation),
         },
         FlowControl::Jump => Terminator::Jump(direct()),
         FlowControl::IndirectJump => Terminator::Stop(StopReason::IndirectJump {
@@ -853,33 +998,25 @@ fn terminator_for(
         FlowControl::Return => Terminator::Return,
         FlowControl::Interrupt => Terminator::Interrupt,
         FlowControl::Fallthrough => {
-            Terminator::Fallthrough(target_from_offset(block_ids, next_offset, next_cpu))
+            Terminator::Fallthrough(target_from_destination(block_ids, continuation))
         }
     }
 }
 
-fn target_from_cpu(
-    disassembly: &Disassembly,
+fn target_from_destination(
     block_ids: &BTreeMap<usize, BlockId>,
-    cpu_address: u16,
+    destination: ControlDestination,
 ) -> BlockTarget {
-    offset_for_cpu(disassembly, cpu_address)
+    destination
+        .prg_offset
         .and_then(|offset| block_ids.get(&offset).copied())
         .map_or(
-            BlockTarget::Unresolved { cpu_address },
+            BlockTarget::Unresolved {
+                bank: destination.bank,
+                cpu_address: destination.cpu_address,
+            },
             BlockTarget::Resolved,
         )
-}
-
-fn target_from_offset(
-    block_ids: &BTreeMap<usize, BlockId>,
-    offset: usize,
-    cpu_address: u16,
-) -> BlockTarget {
-    block_ids.get(&offset).copied().map_or(
-        BlockTarget::Unresolved { cpu_address },
-        BlockTarget::Resolved,
-    )
 }
 
 fn branch_condition(mnemonic: Mnemonic) -> BranchCondition {
@@ -933,12 +1070,14 @@ fn edge(source: BlockId, kind: EdgeKind, target: &BlockTarget) -> Edge {
             kind,
             target: Some(*target),
             unresolved_cpu_address: None,
+            unresolved_bank: None,
         },
-        BlockTarget::Unresolved { cpu_address } => Edge {
+        BlockTarget::Unresolved { bank, cpu_address } => Edge {
             source,
             kind,
             target: None,
             unresolved_cpu_address: Some(*cpu_address),
+            unresolved_bank: *bank,
         },
     }
 }
@@ -1296,6 +1435,23 @@ pub fn lift_instruction(instruction: &DisassembledInstruction) -> SemanticInstru
     }
 }
 
+fn lift_instruction_with_mapper_writes(
+    instruction: &DisassembledInstruction,
+    mapper_writes: &[&MapperWrite],
+) -> SemanticInstruction {
+    let mut lifted = lift_instruction(instruction);
+    lifted.operations.extend(
+        mapper_writes
+            .iter()
+            .map(|write| SemanticOperation::MapperWrite {
+                register_address: write.register_address,
+                value: write.value,
+                resulting_prg_bank: write.resulting_bank,
+            }),
+    );
+    lifted
+}
+
 fn value_source(instruction: &DisassembledInstruction, write: bool) -> ValueSource {
     match instruction.decoded.opcode.mode {
         AddressingMode::Immediate => ValueSource::Immediate(instruction.decoded.operand() as u8),
@@ -1544,7 +1700,7 @@ mod tests {
     use nesc_rom::{Format, Metadata, Mirroring, Region, Rom, build};
 
     use super::{
-        AddressSpace, AnalysisLimits, DecimalBehavior, EdgeKind, Flag, HardwareEffect,
+        AddressSpace, AnalysisLimits, BlockTarget, DecimalBehavior, EdgeKind, Flag, HardwareEffect,
         SemanticOperation, StopReason, Terminator, ValueSource, analyze, lift_instruction,
     };
 
@@ -1571,6 +1727,67 @@ mod tests {
             chr_rom: Vec::new(),
         })
         .expect("ROM")
+    }
+
+    fn uxrom(program: &[u8]) -> Vec<u8> {
+        let mut prg = vec![0xff; 4 * 16 * 1024];
+        prg[16 * 1024..16 * 1024 + 3].copy_from_slice(&[0xa9, 0x2a, 0x60]);
+        let fixed = 3 * 16 * 1024;
+        prg[fixed..fixed + program.len()].copy_from_slice(program);
+        let vectors = prg.len() - 6;
+        for offset in [0, 2, 4] {
+            prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+        }
+        build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 2,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 0,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: Vec::new(),
+        })
+        .expect("UxROM")
+    }
+
+    fn uxrom_with_switch_window_fallthrough() -> Vec<u8> {
+        let mut prg = vec![0xff; 4 * 16 * 1024];
+        prg[..5].copy_from_slice(&[
+            0xa9, 0x01, // lda #1
+            0x8d, 0x00, 0x80, // sta $8000
+        ]);
+        prg[16 * 1024 + 5] = 0x60; // bank 1: $8005 rts
+        let fixed = 3 * 16 * 1024;
+        prg[fixed..fixed + 4].copy_from_slice(&[
+            0x20, 0x00, 0x80, // jsr $8000
+            0x60, // rts
+        ]);
+        let vectors = prg.len() - 6;
+        for offset in [0, 2, 4] {
+            prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+        }
+        build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 2,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 0,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: Vec::new(),
+        })
+        .expect("UxROM")
     }
 
     #[test]
@@ -1632,6 +1849,109 @@ mod tests {
         assert_eq!(destination.address_space, AddressSpace::IoRegister);
         assert_eq!(destination.hardware_effect, Some(HardwareEffect::Dma));
         assert!(destination.volatile);
+    }
+
+    #[test]
+    fn resolves_uxrom_calls_by_physical_bank_and_lifts_mapper_writes() {
+        let bytes = uxrom(&[
+            0xa9, 0x01, // lda #1
+            0x8d, 0x00, 0x80, // sta $8000
+            0x20, 0x00, 0x80, // jsr $8000
+            0x60, // rts
+        ]);
+        let disassembly = disassemble(&bytes, DisassemblyLimits::default()).expect("disassembly");
+        let program = analyze(&disassembly, AnalysisLimits::default()).expect("analysis");
+
+        assert_eq!(program.mapper, 2);
+        let call = program
+            .blocks
+            .values()
+            .find_map(|block| match &block.terminator {
+                Terminator::Call { callee, .. } => Some(callee),
+                _ => None,
+            })
+            .expect("banked call");
+        assert!(matches!(
+            call,
+            BlockTarget::Resolved(target)
+                if target.bank == 1 && target.cpu_address == 0x8000
+        ));
+        assert!(
+            program
+                .blocks
+                .values()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| instruction.operations.contains(
+                    &SemanticOperation::MapperWrite {
+                        register_address: Some(0x8000),
+                        value: Some(1),
+                        resulting_prg_bank: Some(1),
+                    }
+                ))
+        );
+        program.verify().expect("verified Mapper 2 program");
+    }
+
+    #[test]
+    fn preserves_unknown_uxrom_call_bank_without_guessing() {
+        let bytes = uxrom(&[
+            0xad, 0x00, 0x00, // lda $0000
+            0x8d, 0x00, 0x80, // sta $8000
+            0x20, 0x00, 0x80, // jsr $8000
+            0x60, // rts
+        ]);
+        let disassembly = disassemble(&bytes, DisassemblyLimits::default()).expect("disassembly");
+        let program = analyze(&disassembly, AnalysisLimits::default()).expect("analysis");
+        let call = program
+            .blocks
+            .values()
+            .find_map(|block| match &block.terminator {
+                Terminator::Call { callee, .. } => Some(callee),
+                _ => None,
+            })
+            .expect("unresolved call");
+        assert_eq!(
+            call,
+            &BlockTarget::Unresolved {
+                bank: None,
+                cpu_address: 0x8000,
+            }
+        );
+        assert!(program.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CallTarget
+                && edge.target.is_none()
+                && edge.unresolved_bank.is_none()
+                && edge.unresolved_cpu_address == Some(0x8000)
+        }));
+    }
+
+    #[test]
+    fn follows_uxrom_bank_change_across_noncontiguous_fallthrough() {
+        let bytes = uxrom_with_switch_window_fallthrough();
+        let disassembly = disassemble(&bytes, DisassemblyLimits::default()).expect("disassembly");
+        let program = analyze(&disassembly, AnalysisLimits::default()).expect("analysis");
+        let source = program
+            .blocks
+            .values()
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    instruction.operations.iter().any(|operation| {
+                        matches!(
+                            operation,
+                            SemanticOperation::MapperWrite {
+                                resulting_prg_bank: Some(1),
+                                ..
+                            }
+                        )
+                    })
+                })
+            })
+            .expect("switching block");
+        assert!(matches!(
+            source.terminator,
+            Terminator::Fallthrough(BlockTarget::Resolved(target))
+                if target.bank == 1 && target.cpu_address == 0x8005
+        ));
     }
 
     #[test]

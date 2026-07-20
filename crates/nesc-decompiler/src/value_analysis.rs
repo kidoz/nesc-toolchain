@@ -893,6 +893,7 @@ impl Builder<'_> {
                         self.kill_stack_aliases(block, instruction, state, &mut slot);
                     }
                 }
+                SemanticOperation::MapperWrite { .. } => {}
                 SemanticOperation::NoOperation => {}
             }
         }
@@ -1619,6 +1620,7 @@ fn operation_memory(operation: &SemanticOperation) -> Vec<&MemoryOperand> {
         SemanticOperation::Transfer { .. }
         | SemanticOperation::SetFlag { .. }
         | SemanticOperation::StackControl(_)
+        | SemanticOperation::MapperWrite { .. }
         | SemanticOperation::NoOperation => {}
     }
     memory

@@ -916,6 +916,7 @@ impl Emitter<'_> {
             | SemanticOperation::StackControl(StackControl::PopReturnAddress)
             | SemanticOperation::StackControl(StackControl::PushInterruptFrame)
             | SemanticOperation::StackControl(StackControl::PopInterruptFrame)
+            | SemanticOperation::MapperWrite { .. }
             | SemanticOperation::NoOperation => {}
         }
         Ok(())
