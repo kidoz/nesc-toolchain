@@ -18,7 +18,7 @@ ROM. The toolkit is written in stable Rust 2024.
 > accept both mappers; hybrid NesC emission accepts both mappers.
 > SSA/value, call-graph, calling-convention, conservative type, and reducible
 > control-flow recovery support hybrid NesC and stable Rust 2024 translation
-> with bounded fallback. Differential verification is available for Rust output.
+> with bounded fallback. Differential verification is available for both outputs.
 
 ## Highlights
 
@@ -53,6 +53,8 @@ ROM. The toolkit is written in stable Rust 2024.
   target-side dispatcher for unresolved or irreducible functions
 - Original-6502-versus-Rust differential checks across deterministic CPU and
   memory states, with the generated tests and pass report retained as artifacts
+- Original-6502-versus-NesC emulator checks across recovered functions,
+  deterministic inputs, and Mapper 2 bank contexts
 - Rustc-style diagnostics with source spans and suggested corrections
 
 ## Current status
@@ -75,6 +77,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | Mapper 0/2 stable Rust translation with bounded fallback | Available |
 | Mapper 0/2 hybrid NesC translation with bounded dispatcher fallback | Available |
 | Mapper 0/2 original-versus-Rust differential verification | Available |
+| Mapper 0/2 original-versus-NesC differential verification | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
 | Complete PPU/APU timing and debugger integration | Planned |
 
@@ -93,7 +96,7 @@ cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
   decompile target/demo.nes --emit=rust --verify --output target/demo-rust
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
-  decompile target/demo.nes --emit=nesc --output target/demo-nesc
+  decompile target/demo.nes --emit=nesc --verify --output target/demo-nesc
 ```
 
 Expected output:
@@ -104,7 +107,7 @@ Checked `demo` v0.1.0 (src/main.c)
 Built `demo` at target
 Disassembled `target/demo.nes` into target/demo-disassembly (..., exact ROM round trip verified)
 Decompiled `target/demo.nes` into target/demo-rust as host-side stable Rust (..., verified)
-Decompiled `target/demo.nes` into target/demo-nesc as hybrid NesC (...)
+Decompiled `target/demo.nes` into target/demo-nesc as hybrid NesC (..., verified with ... executions)
 ```
 
 The generated project contains:
@@ -229,13 +232,19 @@ Recovered assembly uses `.nesc_prg_bank number, origin` to preserve repeated
 header, trainer, PRG-ROM, CHR-ROM, and trailing bytes exactly.
 
 `nesc decompile --emit=rust` translates proven UxROM regions and retains
-unknown bank selections in bounded interpreter fallback. `--verify` compares
-CPU state, RAM, mapper state, ordered bus events, termination, and instruction
-budgets across every switchable-bank context. Hybrid NesC output preserves the
-Mapper 2 cartridge layout, places proven switchable functions with `NES_BANK`,
-tracks mapper writes, and qualifies fallback dispatch by physical PRG bank.
-Unknown bank selections remain unresolved and reach the bounded trap instead
-of selecting a guessed target.
+unknown bank selections in bounded interpreter fallback. Hybrid NesC output
+preserves the Mapper 2 cartridge layout, places proven switchable functions
+with `NES_BANK`, tracks mapper writes, and qualifies fallback dispatch by
+physical PRG bank. For either output, `--verify` compares bounded executions
+across recovered functions, deterministic input profiles, and every applicable
+switchable-bank context. NesC verification compares CPU state, RAM, PRG RAM,
+mapper state, ordered semantic bus events, and termination through the
+deterministic emulator. Unknown bank selections remain unresolved rather than
+selecting a guessed target, and verification reports an actionable failure
+when the conservative fallback cannot reproduce an exercised execution.
+Target-side NesC verification reserves `$7000-$7FFF` for its isolated RAM
+shadow, event log, and result record; an exercised source access to that
+workspace is rejected instead of being compared unsafely.
 
 ```toml
 [cartridge]
@@ -326,8 +335,8 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete PPU/APU timing and debugger integration
 2. Add Mapper 3 compilation and recovery
-3. Add original-versus-hybrid-NesC emulator differential verification across
-   Mapper 2 bank contexts
+3. Extend decompilation verification with scheduled interrupt and frame-boundary
+   cases
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
