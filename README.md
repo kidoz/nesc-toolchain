@@ -12,8 +12,9 @@ ROM. The toolkit is written in stable Rust 2024.
 
 > [!IMPORTANT]
 > The compiler currently generates Mapper 0 (NROM) and Mapper 2 (UxROM) ROMs.
-> Mapper-aware ROM models for UxROM and CNROM exist. Recursive disassembly
-> currently accepts Mapper 0 ROMs;
+> Mapper-aware ROM models for UxROM and CNROM exist. Recursive disassembly and
+> exact assembly round trips accept Mapper 0 and Mapper 2 ROMs; high-level
+> lifting currently accepts Mapper 0 ROMs;
 > SSA/value, call-graph, calling-convention, conservative type, and reducible
 > control-flow recovery support hybrid NesC and stable Rust 2024 translation
 > with bounded fallback. Differential verification is available for Rust output.
@@ -36,8 +37,8 @@ ROM. The toolkit is written in stable Rust 2024.
 - Public bounded emulator execution for all 151 official CPU opcodes, reset,
   interrupts, controller I/O, DMA, mapper writes, region timing, checkpoints,
   and first-divergence event traces
-- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0
-  `nesc disassemble`, `nesc decompile --emit=nesc`, and
+- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2
+  `nesc disassemble`, Mapper 0 `nesc decompile --emit=nesc`, and
   `nesc decompile --emit=rust` workflows
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
@@ -66,7 +67,8 @@ ROM. The toolkit is written in stable Rust 2024.
 | Standalone relocatable 6502 assembly modules | Available |
 | 6502 code generation and Mapper 0/2 linking | Available |
 | ROM construction and inspection | Available |
-| Official 6502 decoding and recursive Mapper 0 disassembly | Available |
+| Official 6502 decoding and recursive Mapper 0/2 disassembly | Available |
+| Lossless Mapper 0/2 assembly recovery and exact ROM round trips | Available |
 | Bank-qualified NROM CFG and semantic 6502 IR | Available as a library |
 | SSA/value, ABI/type, and reducible control-flow recovery | Available as a library |
 | Stable Rust host-side translation with bounded fallback | Available |
@@ -218,6 +220,13 @@ trampolines that preserve A, X, Y, the prior bank selection, and `nescall`
 return values. The stack report includes the trampoline's additional three
 bytes. Entry and interrupt functions cannot use `NES_BANK`.
 
+`nesc disassemble` follows statically known UxROM mapper writes into
+switchable code, keeps every instruction and label qualified by its physical
+PRG bank, and records unknown mapper state instead of inventing an edge.
+Recovered assembly uses `.nesc_prg_bank number, origin` to preserve repeated
+`$8000` switchable windows. `--round-trip-check` reconstructs the complete
+header, trainer, PRG-ROM, CHR-ROM, and trailing bytes exactly.
+
 ```toml
 [cartridge]
 mapper = 2
@@ -306,9 +315,9 @@ CI runs the same commands on pushes and pull requests.
 ## Next work
 
 1. Complete PPU/APU timing and debugger integration
-2. Add mapper-aware compilation for UxROM and CNROM
-3. Extend recovery and verification to bank-switched cartridges and compiled
-   NesC output
+2. Add Mapper 3 compilation and recovery
+3. Extend Mapper 2 recovery into high-level NesC/Rust lifting and differential
+   verification
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
