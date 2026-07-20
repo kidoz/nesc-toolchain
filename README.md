@@ -15,7 +15,7 @@ ROM. The toolkit is written in stable Rust 2024.
 > Mapper-aware ROM models for UxROM and CNROM exist. Recursive disassembly and
 > exact assembly round trips and bank-qualified semantic CFG lifting accept
 > Mapper 0 and Mapper 2 ROMs. Stable Rust emission and differential verification
-> accept both mappers; hybrid NesC emission remains Mapper 0.
+> accept both mappers; hybrid NesC emission accepts both mappers.
 > SSA/value, call-graph, calling-convention, conservative type, and reducible
 > control-flow recovery support hybrid NesC and stable Rust 2024 translation
 > with bounded fallback. Differential verification is available for Rust output.
@@ -39,7 +39,7 @@ ROM. The toolkit is written in stable Rust 2024.
   interrupts, controller I/O, DMA, mapper writes, region timing, checkpoints,
   and first-divergence event traces
 - `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2
-  `nesc disassemble`, Mapper 0 `nesc decompile --emit=nesc`, and
+  `nesc disassemble`, Mapper 0/2 `nesc decompile --emit=nesc`, and
   Mapper 0/2 `nesc decompile --emit=rust` workflows
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
@@ -73,7 +73,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | Bank-qualified Mapper 0/2 CFG and semantic 6502 IR | Available as a library |
 | SSA/value, ABI/type, and reducible control-flow recovery | Available as a library |
 | Mapper 0/2 stable Rust translation with bounded fallback | Available |
-| Mapper 0 hybrid NesC translation with bounded dispatcher fallback | Available |
+| Mapper 0/2 hybrid NesC translation with bounded dispatcher fallback | Available |
 | Mapper 0/2 original-versus-Rust differential verification | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
 | Complete PPU/APU timing and debugger integration | Planned |
@@ -231,8 +231,11 @@ header, trainer, PRG-ROM, CHR-ROM, and trailing bytes exactly.
 `nesc decompile --emit=rust` translates proven UxROM regions and retains
 unknown bank selections in bounded interpreter fallback. `--verify` compares
 CPU state, RAM, mapper state, ordered bus events, termination, and instruction
-budgets across every switchable-bank context. Mapper 2 hybrid NesC output is
-not yet available.
+budgets across every switchable-bank context. Hybrid NesC output preserves the
+Mapper 2 cartridge layout, places proven switchable functions with `NES_BANK`,
+tracks mapper writes, and qualifies fallback dispatch by physical PRG bank.
+Unknown bank selections remain unresolved and reach the bounded trap instead
+of selecting a guessed target.
 
 ```toml
 [cartridge]
@@ -323,8 +326,8 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete PPU/APU timing and debugger integration
 2. Add Mapper 3 compilation and recovery
-3. Extend Mapper 2 semantic recovery into hybrid NesC emission and
-   emulator-wide differential verification
+3. Add original-versus-hybrid-NesC emulator differential verification across
+   Mapper 2 bank contexts
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
