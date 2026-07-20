@@ -946,16 +946,22 @@ impl DebugSession {
     }
 
     fn render_ppu(&self) -> Result<String, DebugSessionError> {
-        let position = self.machine.ppu_position();
+        let state = self.machine.ppu_state();
         Ok(format!(
-            "Timing: {:?}\nFrame {}, scanline {}, dot {}\nCTRL=${:02X} MASK=${:02X} STATUS=${:02X}\nCHR RAM: {} nonzero bytes\nPalette: {} nonzero bytes\nOAM: {} nonzero bytes\nNametable RAM: {} nonzero bytes\n",
+            "Timing: {:?}\nFrame {}, scanline {}, dot {}\nCTRL=${:02X} MASK=${:02X} STATUS=${:02X}\nVRAM=${:04X} TEMP=${:04X} fine X={} write toggle={}\nFramebuffer: 256x240 palette indices, {} nonzero pixels, checksum ${:016X}\nCHR RAM: {} nonzero bytes\nPalette: {} nonzero bytes\nOAM: {} nonzero bytes\nNametable RAM: {} nonzero bytes\n",
             self.machine.timing_profile(),
-            position.frame,
-            position.scanline,
-            position.dot,
-            self.machine.peek(0x2000)?,
-            self.machine.peek(0x2001)?,
-            self.machine.peek(0x2002)?,
+            state.position.frame,
+            state.position.scanline,
+            state.position.dot,
+            state.ctrl,
+            state.mask,
+            state.status,
+            state.vram_address,
+            state.temporary_address,
+            state.fine_x,
+            state.write_toggle,
+            nonzero(self.machine.framebuffer()),
+            self.machine.framebuffer_checksum(),
             nonzero(self.machine.chr_ram()),
             nonzero(self.machine.palette()),
             nonzero(self.machine.oam()),
@@ -1460,6 +1466,11 @@ mod tests {
         let ppu = session.execute_command("ppu").expect("PPU state").text;
         assert!(ppu.contains("Timing: Ntsc"), "{ppu}");
         assert!(ppu.contains("scanline 0, dot 27"), "{ppu}");
+        assert!(ppu.contains("VRAM=$0000 TEMP=$0000 fine X=0"), "{ppu}");
+        assert!(
+            ppu.contains("Framebuffer: 256x240 palette indices"),
+            "{ppu}"
+        );
 
         let mut session = nrom_session();
         let source = session
