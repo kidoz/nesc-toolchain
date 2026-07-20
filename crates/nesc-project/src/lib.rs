@@ -65,6 +65,25 @@ impl Project {
             );
         }
 
+        for assembly in &document.manifest().build.assembly {
+            let assembly_path = root.join(assembly);
+            if !assembly_path.is_file() {
+                diagnostics.push(
+                    document
+                        .field_error(
+                            "E0112",
+                            format!(
+                                "assembly source `{}` does not exist",
+                                assembly_path.display()
+                            ),
+                            "assembly",
+                            "missing assembly source",
+                        )
+                        .with_help("create the source file or remove it from `build.assembly`"),
+                );
+            }
+        }
+
         if diagnostics.is_empty() {
             Ok(Self { root, document })
         } else {
@@ -88,5 +107,16 @@ impl Project {
     #[must_use]
     pub fn entry_path(&self) -> PathBuf {
         self.root.join(&self.manifest().build.entry)
+    }
+
+    /// Returns standalone assembly-source paths in manifest order.
+    #[must_use]
+    pub fn assembly_paths(&self) -> Vec<PathBuf> {
+        self.manifest()
+            .build
+            .assembly
+            .iter()
+            .map(|path| self.root.join(path))
+            .collect()
     }
 }

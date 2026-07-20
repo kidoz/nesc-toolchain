@@ -17,18 +17,34 @@ pub struct StackReport {
     pub functions: BTreeMap<String, u16>,
 }
 
-pub(crate) fn analyze(module: &Module, limit: u16) -> Result<StackReport, Vec<CodegenError>> {
+pub(crate) fn analyze(
+    module: &Module,
+    limit: u16,
+    external_stack_bytes: &BTreeMap<String, u16>,
+) -> Result<StackReport, Vec<CodegenError>> {
     let mut calls = HashMap::<FunctionId, BTreeSet<FunctionId>>::new();
     let mut helper_callers = HashSet::new();
+    let mut inline_stack = HashMap::<FunctionId, u16>::new();
+    let external_stack = module
+        .functions
+        .iter()
+        .filter(|function| function.blocks.is_empty())
+        .filter_map(|function| {
+            external_stack_bytes
+                .get(&function.name)
+                .copied()
+                .map(|bytes| (function.id, bytes))
+        })
+        .collect::<HashMap<_, _>>();
     for function in &module.functions {
         if function.blocks.is_empty() {
             continue;
         }
         let mut callees = BTreeSet::new();
         for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
-            match instruction.kind {
+            match &instruction.kind {
                 InstructionKind::Call { function, .. } => {
-                    callees.insert(function);
+                    callees.insert(*function);
                 }
                 InstructionKind::Binary {
                     operator:
@@ -41,6 +57,13 @@ pub(crate) fn analyze(module: &Module, limit: u16) -> Result<StackReport, Vec<Co
                 } => {
                     helper_callers.insert(function.id);
                 }
+                InstructionKind::InlineAssembly(assembly) => {
+                    callees.extend(assembly.calls.iter().copied());
+                    inline_stack
+                        .entry(function.id)
+                        .and_modify(|bytes| *bytes = (*bytes).max(assembly.stack_bytes))
+                        .or_insert(assembly.stack_bytes);
+                }
                 _ => {}
             }
         }
@@ -51,12 +74,19 @@ pub(crate) fn analyze(module: &Module, limit: u16) -> Result<StackReport, Vec<Co
     let mut maximum_call_path = 0;
     for function in &module.functions {
         if function.blocks.is_empty() {
+            if let Some(bytes) = external_stack_bytes.get(&function.name) {
+                let usage = 3_u16.saturating_add(*bytes);
+                maximum_call_path = maximum_call_path.max(usage);
+                functions.insert(function.name.clone(), usage);
+            }
             continue;
         }
         let usage = call_usage(
             function.id,
             &calls,
             &helper_callers,
+            &inline_stack,
+            &external_stack,
             &mut memo,
             &mut HashSet::new(),
         )?;
@@ -85,6 +115,8 @@ fn call_usage(
     function: FunctionId,
     calls: &HashMap<FunctionId, BTreeSet<FunctionId>>,
     helper_callers: &HashSet<FunctionId>,
+    inline_stack: &HashMap<FunctionId, u16>,
+    external_stack: &HashMap<FunctionId, u16>,
     memo: &mut HashMap<FunctionId, u16>,
     visiting: &mut HashSet<FunctionId>,
 ) -> Result<u16, Vec<CodegenError>> {
@@ -102,13 +134,22 @@ fn call_usage(
     if let Some(callees) = calls.get(&function) {
         for callee in callees {
             let usage = if calls.contains_key(callee) {
-                call_usage(*callee, calls, helper_callers, memo, visiting)?
+                call_usage(
+                    *callee,
+                    calls,
+                    helper_callers,
+                    inline_stack,
+                    external_stack,
+                    memo,
+                    visiting,
+                )?
             } else {
-                3
+                3_u16.saturating_add(external_stack.get(callee).copied().unwrap_or(0))
             };
             nested = nested.max(usage);
         }
     }
+    nested = nested.saturating_add(inline_stack.get(&function).copied().unwrap_or(0));
     visiting.remove(&function);
     let usage = nested.saturating_add(2);
     memo.insert(function, usage);
@@ -142,11 +183,29 @@ mod tests {
             FunctionId(0),
             &calls,
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &mut HashMap::new(),
             &mut HashSet::new(),
         )
         .expect("acyclic graph");
         assert_eq!(usage, 5);
+    }
+
+    #[test]
+    fn includes_declared_external_stack_use() {
+        let calls = HashMap::from([(FunctionId(0), BTreeSet::from([FunctionId(1)]))]);
+        let usage = call_usage(
+            FunctionId(0),
+            &calls,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::from([(FunctionId(1), 4)]),
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("acyclic graph");
+        assert_eq!(usage, 9);
     }
 
     #[test]
@@ -156,6 +215,8 @@ mod tests {
             FunctionId(0),
             &calls,
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &mut HashMap::new(),
             &mut HashSet::new(),
         )
@@ -170,6 +231,8 @@ mod tests {
             FunctionId(0),
             &calls,
             &HashSet::from([FunctionId(0)]),
+            &HashMap::new(),
+            &HashMap::new(),
             &mut HashMap::new(),
             &mut HashSet::new(),
         )

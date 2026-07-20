@@ -268,6 +268,75 @@ pub struct Block {
     pub span: SourceSpan,
 }
 
+/// Ricoh 2A03 register used by an inline-assembly operand.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AssemblyRegister {
+    /// Accumulator.
+    A,
+    /// X index register.
+    X,
+    /// Y index register.
+    Y,
+}
+
+/// Value loaded into a register before an inline-assembly block.
+#[derive(Clone, Debug)]
+pub struct AssemblyInput {
+    /// Destination CPU register.
+    pub register: AssemblyRegister,
+    /// Source value expression.
+    pub value: Expression,
+}
+
+/// Variable receiving a register after an inline-assembly block.
+#[derive(Clone, Debug)]
+pub struct AssemblyOutput {
+    /// Source CPU register.
+    pub register: AssemblyRegister,
+    /// Writable local or global object name.
+    pub target: String,
+    /// Target name source range.
+    pub span: SourceSpan,
+}
+
+/// Declared CPU and memory state changed by inline assembly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AssemblyClobbers {
+    /// Accumulator may change.
+    pub a: bool,
+    /// X register may change.
+    pub x: bool,
+    /// Y register may change.
+    pub y: bool,
+    /// Processor flags may change.
+    pub flags: bool,
+    /// Arbitrary memory may change.
+    pub memory: bool,
+}
+
+/// Target-specific inline 6502 assembly statement.
+#[derive(Clone, Debug)]
+pub struct InlineAssembly {
+    /// Stable syntax identifier.
+    pub id: NodeId,
+    /// Assembly source using the official 6502 instruction set.
+    pub template: String,
+    /// Register inputs evaluated before the block.
+    pub inputs: Vec<AssemblyInput>,
+    /// Register outputs stored after the block.
+    pub outputs: Vec<AssemblyOutput>,
+    /// Declared state changes.
+    pub clobbers: AssemblyClobbers,
+    /// Whether mapper bank state may change.
+    pub bank_effect: bool,
+    /// Direct callees entered by the assembly source.
+    pub calls: Vec<(String, SourceSpan)>,
+    /// Maximum additional hardware-stack bytes used by the block.
+    pub stack_bytes: u16,
+    /// Complete statement range.
+    pub span: SourceSpan,
+}
+
 /// Statement node.
 #[derive(Clone, Debug)]
 pub enum Statement {
@@ -284,6 +353,8 @@ pub enum Statement {
         /// Statement range.
         span: SourceSpan,
     },
+    /// Volatile target-specific inline assembly.
+    InlineAssembly(InlineAssembly),
     /// Conditional branch.
     If {
         /// Stable syntax identifier.
@@ -355,6 +426,7 @@ impl Statement {
         match self {
             Self::Block(block) => block.span,
             Self::Variable(variable) => variable.span,
+            Self::InlineAssembly(assembly) => assembly.span,
             Self::Expression { span, .. }
             | Self::If { span, .. }
             | Self::While { span, .. }

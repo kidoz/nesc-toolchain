@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use nesc_mir::{FunctionId, GlobalId, InstructionKind, LocalId, Module, Terminator, Type, ValueId};
 
@@ -39,6 +39,8 @@ pub struct BackendConfig {
     pub zero_page_strategy: ZeroPageStrategy,
     /// Maximum hardware-stack use in bytes.
     pub stack_limit: u16,
+    /// Additional stack use declared by standalone assembly functions.
+    pub external_stack_bytes: BTreeMap<String, u16>,
 }
 
 impl Default for BackendConfig {
@@ -54,6 +56,7 @@ impl Default for BackendConfig {
             }],
             zero_page_strategy: ZeroPageStrategy::Frequency,
             stack_limit: 192,
+            external_stack_bytes: BTreeMap::new(),
         }
     }
 }
@@ -318,6 +321,21 @@ fn access_counts(module: &Module) -> AccessCounts {
                     InstructionKind::Call { arguments, .. } => {
                         for argument in arguments {
                             bump(&mut values, (function.id, *argument));
+                        }
+                    }
+                    InstructionKind::InlineAssembly(assembly) => {
+                        for input in &assembly.inputs {
+                            bump(&mut values, (function.id, input.value));
+                        }
+                        for output in &assembly.outputs {
+                            match output.target {
+                                nesc_mir::AssemblyOutputTarget::Local(local) => {
+                                    bump(&mut locals, (function.id, local));
+                                }
+                                nesc_mir::AssemblyOutputTarget::Global(global) => {
+                                    bump(&mut globals, global);
+                                }
+                            }
                         }
                     }
                 }

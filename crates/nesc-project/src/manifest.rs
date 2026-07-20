@@ -39,6 +39,9 @@ pub struct Package {
 pub struct Build {
     /// Entry NesC source, relative to the project root.
     pub entry: PathBuf,
+    /// Standalone relocatable 6502 assembly modules.
+    #[serde(default)]
+    pub assembly: Vec<PathBuf>,
     /// Console timing profile.
     pub region: Region,
     /// ROM container format.
@@ -316,6 +319,41 @@ fn validate_manifest(document: &ManifestDocument) -> Vec<Diagnostic> {
             "entry",
             "absolute paths and parent-directory traversal are not allowed",
         ));
+    }
+
+    let mut assembly_paths = std::collections::BTreeSet::new();
+    for path in &manifest.build.assembly {
+        if !safe_relative_path(path) {
+            diagnostics.push(document.field_error(
+                "E0107",
+                format!(
+                    "assembly source `{}` must be a safe relative path",
+                    path.display()
+                ),
+                "assembly",
+                "absolute paths and parent-directory traversal are not allowed",
+            ));
+        } else if path.extension().and_then(|value| value.to_str()) != Some("s") {
+            diagnostics.push(document.field_error(
+                "E0107",
+                format!(
+                    "assembly source `{}` must use the `.s` extension",
+                    path.display()
+                ),
+                "assembly",
+                "expected a 6502 assembly source file",
+            ));
+        } else if !assembly_paths.insert(path) {
+            diagnostics.push(document.field_error(
+                "E0107",
+                format!(
+                    "assembly source `{}` is listed more than once",
+                    path.display()
+                ),
+                "assembly",
+                "duplicate assembly source",
+            ));
+        }
     }
 
     validate_cartridge(document, &mut diagnostics);

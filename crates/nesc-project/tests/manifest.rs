@@ -68,3 +68,30 @@ fn project_load_reports_missing_entry_file() {
             .any(|diagnostic| diagnostic.code() == "E0111")
     );
 }
+
+#[test]
+fn rejects_unsafe_and_missing_assembly_sources() {
+    let (_temporary, project) = generated_project();
+    let manifest_path = project.join("NesC.toml");
+    let manifest = fs::read_to_string(&manifest_path)
+        .expect("read manifest")
+        .replace("assembly = []", "assembly = [\"../outside.s\"]");
+    fs::write(&manifest_path, manifest).expect("write manifest");
+    let diagnostics = Project::load(&manifest_path).expect_err("unsafe assembly path rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "E0107")
+    );
+
+    let manifest = fs::read_to_string(&manifest_path)
+        .expect("read manifest")
+        .replace("../outside.s", "src/missing.s");
+    fs::write(&manifest_path, manifest).expect("write manifest");
+    let diagnostics = Project::load(&manifest_path).expect_err("missing assembly source rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "E0112")
+    );
+}

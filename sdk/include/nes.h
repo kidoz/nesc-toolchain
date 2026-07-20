@@ -26,6 +26,13 @@
 #define NES_EXPORT __nesc_attribute__(export)
 #define NES_IMPORT __nesc_attribute__(import)
 
+/*
+ * NES_ASM is reserved compiler syntax. Its contract items are
+ * NES_ASM_INPUT_A/X/Y(value), NES_ASM_OUTPUT_A/X/Y(variable),
+ * NES_CLOBBER_A/X/Y, NES_CLOBBER_FLAGS, NES_CLOBBER_MEMORY,
+ * NES_ASM_BANK_EFFECT, NES_ASM_CALL(function), and NES_ASM_STACK(bytes).
+ */
+
 void nes_init(void);
 void nes_wait_vblank(void);
 void nes_wait_frame(void);

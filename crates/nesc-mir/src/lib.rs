@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub use nesc_hir::{
-    AddressSpace, BinaryOperator, FunctionId, GlobalId, IntegerType, SourceId, SourceSpan, Type,
-    TypeKind, UnaryOperator,
+    AddressSpace, AssemblyClobbers, AssemblyRegister, BinaryOperator, FunctionId, GlobalId,
+    IntegerType, SourceId, SourceSpan, Type, TypeKind, UnaryOperator,
 };
 use nesc_hir::{Expression, ExpressionKind, Module as HirModule, Statement};
 
@@ -105,6 +105,52 @@ pub struct Instruction {
     pub span: SourceSpan,
 }
 
+/// Register value supplied to inline assembly.
+#[derive(Clone, Debug)]
+pub struct AssemblyInput {
+    /// CPU register loaded before the assembly source executes.
+    pub register: AssemblyRegister,
+    /// MIR value copied into the register.
+    pub value: ValueId,
+}
+
+/// Writable storage receiving an inline-assembly register output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssemblyOutputTarget {
+    /// Function-local slot.
+    Local(LocalId),
+    /// Global object.
+    Global(GlobalId),
+}
+
+/// Register value produced by inline assembly.
+#[derive(Clone, Debug)]
+pub struct AssemblyOutput {
+    /// CPU register stored after the assembly source executes.
+    pub register: AssemblyRegister,
+    /// Destination storage.
+    pub target: AssemblyOutputTarget,
+}
+
+/// Fully declared target-specific inline assembly.
+#[derive(Clone, Debug)]
+pub struct InlineAssembly {
+    /// Official 6502 assembly source.
+    pub template: String,
+    /// Register inputs.
+    pub inputs: Vec<AssemblyInput>,
+    /// Register outputs.
+    pub outputs: Vec<AssemblyOutput>,
+    /// CPU and memory clobbers.
+    pub clobbers: AssemblyClobbers,
+    /// Whether mapper bank state may change.
+    pub bank_effect: bool,
+    /// Direct function calls made by the assembly source.
+    pub calls: Vec<FunctionId>,
+    /// Maximum additional hardware-stack bytes used by the block.
+    pub stack_bytes: u16,
+}
+
 /// MIR instruction operation.
 #[derive(Clone, Debug)]
 pub enum InstructionKind {
@@ -200,6 +246,8 @@ pub enum InstructionKind {
         /// Arguments in evaluation order.
         arguments: Vec<ValueId>,
     },
+    /// Volatile target-specific 6502 assembly.
+    InlineAssembly(InlineAssembly),
 }
 
 /// Required control transfer at the end of a block.
@@ -460,6 +508,60 @@ impl<'a> Builder<'a> {
                 if let Some(expression) = expression {
                     self.lower_expression(expression);
                 }
+            }
+            Statement::InlineAssembly(assembly) => {
+                let inputs = assembly
+                    .inputs
+                    .iter()
+                    .filter_map(|input| {
+                        self.lower_expression(&input.value)
+                            .map(|value| AssemblyInput {
+                                register: input.register,
+                                value,
+                            })
+                    })
+                    .collect();
+                let outputs = assembly
+                    .outputs
+                    .iter()
+                    .filter_map(|output| {
+                        self.scopes
+                            .iter()
+                            .rev()
+                            .find_map(|scope| scope.get(&output.target).copied())
+                            .map(AssemblyOutputTarget::Local)
+                            .or_else(|| {
+                                self.hir
+                                    .global_names
+                                    .get(&output.target)
+                                    .copied()
+                                    .map(AssemblyOutputTarget::Global)
+                            })
+                            .map(|target| AssemblyOutput {
+                                register: output.register,
+                                target,
+                            })
+                    })
+                    .collect();
+                let calls = assembly
+                    .calls
+                    .iter()
+                    .filter_map(|(name, _)| self.hir.function_names.get(name).copied())
+                    .collect();
+                self.emit(
+                    None,
+                    InstructionKind::InlineAssembly(InlineAssembly {
+                        template: assembly.template.clone(),
+                        inputs,
+                        outputs,
+                        clobbers: assembly.clobbers,
+                        bank_effect: assembly.bank_effect,
+                        calls,
+                        stack_bytes: assembly.stack_bytes,
+                    }),
+                    Effect::Volatile,
+                    assembly.span,
+                );
             }
             Statement::If {
                 condition,
@@ -1534,6 +1636,130 @@ fn verify_instruction(
                 );
             }
         }
+        InstructionKind::InlineAssembly(assembly) => {
+            if assembly.template.is_empty() {
+                verification_error(
+                    errors,
+                    function.id,
+                    Some(block),
+                    "inline assembly source is empty",
+                );
+            }
+            if instruction.result.is_some() {
+                verification_error(
+                    errors,
+                    function.id,
+                    Some(block),
+                    "inline assembly cannot produce a MIR result",
+                );
+            }
+            let mut input_registers = HashSet::new();
+            for input in &assembly.inputs {
+                operands.push(input.value);
+                if !input_registers.insert(input.register) {
+                    verification_error(
+                        errors,
+                        function.id,
+                        Some(block),
+                        "inline assembly register has more than one input",
+                    );
+                }
+                if function
+                    .value_types
+                    .get(input.value.0 as usize)
+                    .and_then(Type::integer_width)
+                    .is_none_or(|width| width > 8)
+                {
+                    verification_error(
+                        errors,
+                        function.id,
+                        Some(block),
+                        "inline assembly input does not fit in one CPU register",
+                    );
+                }
+            }
+            let mut output_registers = HashSet::new();
+            for output in &assembly.outputs {
+                if !output_registers.insert(output.register) {
+                    verification_error(
+                        errors,
+                        function.id,
+                        Some(block),
+                        "inline assembly register has more than one output",
+                    );
+                }
+                if assembly_register_clobbered(assembly, output.register) {
+                    verification_error(
+                        errors,
+                        function.id,
+                        Some(block),
+                        "inline assembly output register is also declared clobbered",
+                    );
+                }
+                match output.target {
+                    AssemblyOutputTarget::Local(local)
+                        if local.0 as usize >= function.locals.len() =>
+                    {
+                        verification_error(
+                            errors,
+                            function.id,
+                            Some(block),
+                            "inline assembly output local is out of range",
+                        );
+                    }
+                    AssemblyOutputTarget::Global(global)
+                        if global.0 as usize >= module.globals.len() =>
+                    {
+                        verification_error(
+                            errors,
+                            function.id,
+                            Some(block),
+                            "inline assembly output global is out of range",
+                        );
+                    }
+                    AssemblyOutputTarget::Local(local) => {
+                        let ty = &function.locals[local.0 as usize].ty;
+                        if ty.is_const || ty.integer_width().is_none_or(|width| width > 8) {
+                            verification_error(
+                                errors,
+                                function.id,
+                                Some(block),
+                                "inline assembly output is not a writable 8-bit integer",
+                            );
+                        }
+                    }
+                    AssemblyOutputTarget::Global(global) => {
+                        let ty = &module.globals[global.0 as usize];
+                        if ty.is_const || ty.integer_width().is_none_or(|width| width > 8) {
+                            verification_error(
+                                errors,
+                                function.id,
+                                Some(block),
+                                "inline assembly output is not a writable 8-bit integer",
+                            );
+                        }
+                    }
+                }
+            }
+            for callee in &assembly.calls {
+                if callee.0 as usize >= module.functions.len() {
+                    verification_error(
+                        errors,
+                        function.id,
+                        Some(block),
+                        "inline assembly callee is out of range",
+                    );
+                }
+            }
+            if instruction.effect != Effect::Volatile {
+                verification_error(
+                    errors,
+                    function.id,
+                    Some(block),
+                    "inline assembly must have a volatile effect",
+                );
+            }
+        }
     }
     for operand in operands {
         verify_value(function, block, operand, defined, errors);
@@ -1544,6 +1770,7 @@ fn verify_instruction(
             | InstructionKind::StoreGlobal { .. }
             | InstructionKind::StoreIndirect { .. }
             | InstructionKind::BoundsCheck { .. }
+            | InstructionKind::InlineAssembly(_)
     );
     if produces_value
         && instruction.result.is_none()
@@ -1555,6 +1782,14 @@ fn verify_instruction(
             Some(block),
             "value-producing instruction has no result",
         );
+    }
+}
+
+fn assembly_register_clobbered(assembly: &InlineAssembly, register: AssemblyRegister) -> bool {
+    match register {
+        AssemblyRegister::A => assembly.clobbers.a,
+        AssemblyRegister::X => assembly.clobbers.x,
+        AssemblyRegister::Y => assembly.clobbers.y,
     }
 }
 
@@ -1619,7 +1854,64 @@ mod tests {
 
     use nesc_frontend::{FrontendConfig, check};
 
-    use super::{InstructionKind, Terminator, lower, verify};
+    use super::{
+        AssemblyOutputTarget, AssemblyRegister, InstructionKind, Terminator, lower, verify,
+    };
+
+    #[test]
+    fn lowers_complete_inline_assembly_contract() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("main.c");
+        fs::write(
+            &source,
+            r#"
+                extern void helper(void);
+                u8 result;
+                NES_MAIN int main(void) {
+                    u8 input = 7;
+                    NES_ASM(
+                        "pha\njsr helper\npla",
+                        NES_ASM_INPUT_A(input),
+                        NES_ASM_OUTPUT_X(result),
+                        NES_CLOBBER_A,
+                        NES_CLOBBER_FLAGS,
+                        NES_CLOBBER_MEMORY,
+                        NES_ASM_BANK_EFFECT,
+                        NES_ASM_CALL(helper),
+                        NES_ASM_STACK(1)
+                    );
+                    return result;
+                }
+            "#,
+        )
+        .expect("source");
+        let checked = check(&FrontendConfig::new(source)).expect("frontend");
+        let hir = nesc_hir::lower(checked);
+        let mir = lower(&hir).expect("MIR lowering");
+        verify(&mir).expect("valid MIR");
+        let assembly = mir.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| match &instruction.kind {
+                InstructionKind::InlineAssembly(assembly) => Some(assembly),
+                _ => None,
+            })
+            .expect("inline assembly instruction");
+        assert_eq!(assembly.template, "pha\njsr helper\npla");
+        assert_eq!(assembly.inputs[0].register, AssemblyRegister::A);
+        assert_eq!(assembly.outputs[0].register, AssemblyRegister::X);
+        assert_eq!(
+            assembly.outputs[0].target,
+            AssemblyOutputTarget::Global(super::GlobalId(0))
+        );
+        assert!(assembly.clobbers.a);
+        assert!(assembly.clobbers.flags);
+        assert!(assembly.clobbers.memory);
+        assert!(assembly.bank_effect);
+        assert_eq!(assembly.calls, [super::FunctionId(0)]);
+        assert_eq!(assembly.stack_bytes, 1);
+    }
 
     #[test]
     fn lowers_control_flow_and_passes_verifier() {

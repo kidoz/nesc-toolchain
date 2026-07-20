@@ -1,8 +1,9 @@
 use nesc_diagnostics::Diagnostic;
 
 use crate::{
-    AddressSpace, Attribute, BinaryOperator, Block, Declaration, Expression, ExpressionKind,
-    Function, IntegerType, Linkage, NodeId, Parameter, Program, SourceMap, SourceSpan, Statement,
+    AddressSpace, AssemblyClobbers, AssemblyInput, AssemblyOutput, AssemblyRegister, Attribute,
+    BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function, InlineAssembly,
+    IntegerType, Linkage, NodeId, Parameter, Program, SourceMap, SourceSpan, Statement,
     StorageClass, Token, TokenKind, Type, TypeKind, UnaryOperator, Variable,
 };
 
@@ -432,6 +433,12 @@ impl Parser<'_> {
         if self.at(&TokenKind::LeftBrace) {
             return self.block().map(Statement::Block);
         }
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "NES_ASM") {
+            return self.inline_assembly_statement();
+        }
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "asm") {
+            return self.standard_inline_assembly_statement();
+        }
         if self.consume(&TokenKind::If).is_some() {
             return self.if_statement();
         }
@@ -495,6 +502,340 @@ impl Parser<'_> {
             expression,
             span: start.through(end.span),
         })
+    }
+
+    fn inline_assembly_statement(&mut self) -> Option<Statement> {
+        let start = self.advance().span;
+        self.expect(
+            &TokenKind::LeftParen,
+            "E1202",
+            "expected `(` after `NES_ASM`",
+        )?;
+        let mut template = String::new();
+        while let TokenKind::String(value) = &self.current().kind {
+            template.push_str(value);
+            self.advance();
+        }
+        if template.is_empty() {
+            self.error_current(
+                "E1203",
+                "`NES_ASM` requires a non-empty string literal",
+                "assembly source required here",
+            );
+            return None;
+        }
+
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut clobbers = AssemblyClobbers::default();
+        let mut bank_effect = false;
+        let mut calls = Vec::new();
+        let mut stack_bytes = 0;
+        let mut stack_declared = false;
+        while self.consume(&TokenKind::Comma).is_some() {
+            let (metadata, metadata_span) = self.identifier("expected `NES_ASM` metadata")?;
+            match metadata.as_str() {
+                "NES_CLOBBER_A" => clobbers.a = true,
+                "NES_CLOBBER_X" => clobbers.x = true,
+                "NES_CLOBBER_Y" => clobbers.y = true,
+                "NES_CLOBBER_FLAGS" => clobbers.flags = true,
+                "NES_CLOBBER_MEMORY" => clobbers.memory = true,
+                "NES_ASM_BANK_EFFECT" => bank_effect = true,
+                "NES_ASM_INPUT_A" | "NES_ASM_INPUT_X" | "NES_ASM_INPUT_Y" => {
+                    let register = assembly_register(&metadata).expect("matched input register");
+                    self.expect(
+                        &TokenKind::LeftParen,
+                        "E1202",
+                        "expected `(` after assembly input",
+                    )?;
+                    let value = self.expression()?;
+                    self.expect(
+                        &TokenKind::RightParen,
+                        "E1202",
+                        "expected `)` after assembly input",
+                    )?;
+                    inputs.push(AssemblyInput { register, value });
+                }
+                "NES_ASM_OUTPUT_A" | "NES_ASM_OUTPUT_X" | "NES_ASM_OUTPUT_Y" => {
+                    let register = assembly_register(&metadata).expect("matched output register");
+                    self.expect(
+                        &TokenKind::LeftParen,
+                        "E1202",
+                        "expected `(` after assembly output",
+                    )?;
+                    let (target, span) = self.identifier("expected an assembly output variable")?;
+                    self.expect(
+                        &TokenKind::RightParen,
+                        "E1202",
+                        "expected `)` after assembly output",
+                    )?;
+                    outputs.push(AssemblyOutput {
+                        register,
+                        target,
+                        span,
+                    });
+                }
+                "NES_ASM_CALL" => {
+                    self.expect(
+                        &TokenKind::LeftParen,
+                        "E1202",
+                        "expected `(` after `NES_ASM_CALL`",
+                    )?;
+                    let (callee, span) = self.identifier("expected a directly called function")?;
+                    self.expect(
+                        &TokenKind::RightParen,
+                        "E1202",
+                        "expected `)` after directly called function",
+                    )?;
+                    calls.push((callee, span));
+                }
+                "NES_ASM_STACK" => {
+                    self.expect(
+                        &TokenKind::LeftParen,
+                        "E1202",
+                        "expected `(` after `NES_ASM_STACK`",
+                    )?;
+                    let token = self.advance().clone();
+                    let TokenKind::Integer(literal) = token.kind else {
+                        self.error_at(
+                            "E1203",
+                            "assembly stack use must be an integer literal",
+                            token.span,
+                            "integer literal required here",
+                        );
+                        return None;
+                    };
+                    let Ok(bytes) = u16::try_from(literal.value) else {
+                        self.error_at(
+                            "E1204",
+                            "assembly stack use exceeds 65535 bytes",
+                            token.span,
+                            "value is too large",
+                        );
+                        return None;
+                    };
+                    if stack_declared {
+                        self.error_at(
+                            "E1203",
+                            "`NES_ASM_STACK` may only appear once",
+                            metadata_span,
+                            "duplicate stack declaration",
+                        );
+                        return None;
+                    }
+                    stack_declared = true;
+                    stack_bytes = bytes;
+                    self.expect(
+                        &TokenKind::RightParen,
+                        "E1202",
+                        "expected `)` after assembly stack use",
+                    )?;
+                }
+                _ => {
+                    self.error_at(
+                        "E1203",
+                        format!("unknown `NES_ASM` metadata `{metadata}`"),
+                        metadata_span,
+                        "unsupported assembly contract item",
+                    );
+                    return None;
+                }
+            }
+        }
+        self.expect(
+            &TokenKind::RightParen,
+            "E1202",
+            "expected `)` after `NES_ASM` metadata",
+        )?;
+        let end = self.expect(
+            &TokenKind::Semicolon,
+            "E1202",
+            "expected `;` after `NES_ASM`",
+        )?;
+        Some(Statement::InlineAssembly(InlineAssembly {
+            id: self.node_id(),
+            template,
+            inputs,
+            outputs,
+            clobbers,
+            bank_effect,
+            calls,
+            stack_bytes,
+            span: start.through(end.span),
+        }))
+    }
+
+    fn standard_inline_assembly_statement(&mut self) -> Option<Statement> {
+        let start = self.advance().span;
+        self.expect(
+            &TokenKind::Volatile,
+            "E1202",
+            "inline `asm` must be declared `volatile`",
+        )?;
+        self.expect(
+            &TokenKind::LeftParen,
+            "E1202",
+            "expected `(` after `asm volatile`",
+        )?;
+        let mut template = String::new();
+        while let TokenKind::String(value) = &self.current().kind {
+            template.push_str(value);
+            self.advance();
+        }
+        if template.is_empty() {
+            self.error_current(
+                "E1203",
+                "inline `asm` requires a non-empty string literal",
+                "assembly source required here",
+            );
+            return None;
+        }
+        self.expect(
+            &TokenKind::Colon,
+            "E1202",
+            "expected `:` before assembly outputs",
+        )?;
+        let mut outputs = Vec::new();
+        while !self.at(&TokenKind::Colon) {
+            let token = self.advance().clone();
+            let TokenKind::String(constraint) = token.kind else {
+                self.error_at(
+                    "E1203",
+                    "assembly output requires a string constraint",
+                    token.span,
+                    "constraint required here",
+                );
+                return None;
+            };
+            let Some(register) = assembly_constraint(&constraint, true) else {
+                self.error_at(
+                    "E1203",
+                    format!("unsupported assembly output constraint `{constraint}`"),
+                    token.span,
+                    "use `=a`, `=x`, or `=y`",
+                );
+                return None;
+            };
+            self.expect(
+                &TokenKind::LeftParen,
+                "E1202",
+                "expected `(` after assembly output constraint",
+            )?;
+            let (target, span) = self.identifier("expected an assembly output variable")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "E1202",
+                "expected `)` after assembly output",
+            )?;
+            outputs.push(AssemblyOutput {
+                register,
+                target,
+                span,
+            });
+            if self.consume(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(
+            &TokenKind::Colon,
+            "E1202",
+            "expected `:` before assembly inputs",
+        )?;
+        let mut inputs = Vec::new();
+        while !self.at(&TokenKind::Colon) {
+            let token = self.advance().clone();
+            let TokenKind::String(constraint) = token.kind else {
+                self.error_at(
+                    "E1203",
+                    "assembly input requires a string constraint",
+                    token.span,
+                    "constraint required here",
+                );
+                return None;
+            };
+            let Some(register) = assembly_constraint(&constraint, false) else {
+                self.error_at(
+                    "E1203",
+                    format!("unsupported assembly input constraint `{constraint}`"),
+                    token.span,
+                    "use `a`, `x`, or `y`",
+                );
+                return None;
+            };
+            self.expect(
+                &TokenKind::LeftParen,
+                "E1202",
+                "expected `(` after assembly input constraint",
+            )?;
+            let value = self.expression()?;
+            self.expect(
+                &TokenKind::RightParen,
+                "E1202",
+                "expected `)` after assembly input",
+            )?;
+            inputs.push(AssemblyInput { register, value });
+            if self.consume(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(
+            &TokenKind::Colon,
+            "E1202",
+            "expected `:` before assembly clobbers",
+        )?;
+        let mut clobbers = AssemblyClobbers::default();
+        while !self.at(&TokenKind::RightParen) {
+            let token = self.advance().clone();
+            let TokenKind::String(clobber) = token.kind else {
+                self.error_at(
+                    "E1203",
+                    "assembly clobber requires a string literal",
+                    token.span,
+                    "clobber name required here",
+                );
+                return None;
+            };
+            match clobber.as_str() {
+                "a" => clobbers.a = true,
+                "x" => clobbers.x = true,
+                "y" => clobbers.y = true,
+                "flags" => clobbers.flags = true,
+                "memory" => clobbers.memory = true,
+                _ => {
+                    self.error_at(
+                        "E1203",
+                        format!("unsupported assembly clobber `{clobber}`"),
+                        token.span,
+                        "unknown clobber name",
+                    );
+                    return None;
+                }
+            }
+            if self.consume(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(
+            &TokenKind::RightParen,
+            "E1202",
+            "expected `)` after inline assembly",
+        )?;
+        let end = self.expect(
+            &TokenKind::Semicolon,
+            "E1202",
+            "expected `;` after inline assembly",
+        )?;
+        Some(Statement::InlineAssembly(InlineAssembly {
+            id: self.node_id(),
+            template,
+            inputs,
+            outputs,
+            clobbers,
+            bank_effect: false,
+            calls: Vec::new(),
+            stack_bytes: 0,
+            span: start.through(end.span),
+        }))
     }
 
     fn local_variable(&mut self) -> Option<Variable> {
@@ -995,6 +1336,27 @@ fn integer_type_name(name: &str) -> Option<IntegerType> {
     }
 }
 
+fn assembly_register(name: &str) -> Option<AssemblyRegister> {
+    if name.ends_with("_A") {
+        Some(AssemblyRegister::A)
+    } else if name.ends_with("_X") {
+        Some(AssemblyRegister::X)
+    } else if name.ends_with("_Y") {
+        Some(AssemblyRegister::Y)
+    } else {
+        None
+    }
+}
+
+fn assembly_constraint(constraint: &str, output: bool) -> Option<AssemblyRegister> {
+    match (constraint, output) {
+        ("a", false) | ("=a", true) => Some(AssemblyRegister::A),
+        ("x", false) | ("=x", true) => Some(AssemblyRegister::X),
+        ("y", false) | ("=y", true) => Some(AssemblyRegister::Y),
+        _ => None,
+    }
+}
+
 fn sdk_attribute_name(name: &str) -> Option<&'static str> {
     match name {
         "NES_MAIN" => Some("main"),
@@ -1084,7 +1446,7 @@ fn binary_operator(kind: &TokenKind) -> Option<(BinaryOperator, u8)> {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::{Declaration, PreprocessedFile, SourceMap};
+    use crate::{AssemblyRegister, Declaration, PreprocessedFile, SourceMap, Statement};
 
     use super::parse;
 
@@ -1103,5 +1465,36 @@ mod tests {
         };
         assert_eq!(function.attributes[0].name, "main");
         assert!(function.body.is_some());
+    }
+
+    #[test]
+    fn parses_standard_volatile_inline_assembly() {
+        let source = r#"
+            NES_MAIN int main(void) {
+                u8 input;
+                u8 output;
+                asm volatile ("tax" : "=x"(output) : "a"(input) : "flags");
+                return output;
+            }
+        "#;
+        let mut sources = SourceMap::new();
+        let id = sources.add(PathBuf::from("test.c"), source.to_owned());
+        let file = PreprocessedFile::new(id, source.to_owned());
+        let mut diagnostics = Vec::new();
+        let tokens = crate::lexer::lex(&file, &sources, &mut diagnostics);
+        let program = parse(tokens, &sources, &mut diagnostics).expect("program");
+        assert!(diagnostics.is_empty());
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("function expected");
+        };
+        let Statement::InlineAssembly(assembly) =
+            &function.body.as_ref().expect("body").statements[2]
+        else {
+            panic!("inline assembly expected");
+        };
+        assert_eq!(assembly.template, "tax");
+        assert_eq!(assembly.inputs[0].register, AssemblyRegister::A);
+        assert_eq!(assembly.outputs[0].register, AssemblyRegister::X);
+        assert!(assembly.clobbers.flags);
     }
 }

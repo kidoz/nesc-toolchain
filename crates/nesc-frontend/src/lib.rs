@@ -10,9 +10,10 @@ mod source;
 mod token;
 
 pub use ast::{
-    AddressSpace, Attribute, BinaryOperator, Block, Declaration, Expression, ExpressionKind,
-    Function, IntegerType, Linkage, NodeId, Parameter, Program, Statement, StorageClass, Type,
-    TypeKind, UnaryOperator, Variable,
+    AddressSpace, AssemblyClobbers, AssemblyInput, AssemblyOutput, AssemblyRegister, Attribute,
+    BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function, InlineAssembly,
+    IntegerType, Linkage, NodeId, Parameter, Program, Statement, StorageClass, Type, TypeKind,
+    UnaryOperator, Variable,
 };
 pub use preprocessor::{MacroDefinition, PreprocessedFile, TranslationUnit};
 pub use sema::{CheckedProgram, Symbol, SymbolKind};

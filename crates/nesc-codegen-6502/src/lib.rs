@@ -9,8 +9,8 @@ use std::error::Error;
 use std::fmt;
 
 use nesc_mir::{
-    BinaryOperator, BlockId, Function, Instruction, InstructionKind, Module, SourceSpan,
-    Terminator, TypeKind, UnaryOperator, ValueId,
+    AssemblyOutputTarget, AssemblyRegister, BinaryOperator, BlockId, Function, InlineAssembly,
+    Instruction, InstructionKind, Module, SourceSpan, Terminator, TypeKind, UnaryOperator, ValueId,
 };
 use nesc_object::{
     Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SymbolId, SymbolKind,
@@ -83,7 +83,7 @@ pub fn generate_with_config(
     config: &BackendConfig,
 ) -> Result<GeneratedCode, Vec<CodegenError>> {
     let allocation = allocation::allocate(module, config)?;
-    let stack = stack::analyze(module, config.stack_limit)?;
+    let stack = stack::analyze(module, config.stack_limit, &config.external_stack_bytes)?;
     let zero_page_report = allocation::render_report(&allocation);
     let stack_report = stack::render_report(&stack);
     let mut emitter = Emitter::new(module, allocation)?;
@@ -303,6 +303,94 @@ impl Emitter {
                 arguments,
             } => {
                 self.call(function, instruction, *callee, arguments);
+            }
+            InstructionKind::InlineAssembly(assembly) => {
+                self.inline_assembly(function, instruction, assembly);
+            }
+        }
+    }
+
+    fn inline_assembly(
+        &mut self,
+        function: &Function,
+        instruction: &Instruction,
+        assembly: &InlineAssembly,
+    ) {
+        for input in &assembly.inputs {
+            let location = self.value_location(function, input.value);
+            match input.register {
+                AssemblyRegister::A => self.lda_location(location, 0),
+                AssemblyRegister::X => self.ldx_location(location, 0),
+                AssemblyRegister::Y => self.ldy_location(location, 0),
+            }
+        }
+        let allowed_calls = assembly
+            .calls
+            .iter()
+            .map(|callee| {
+                self.object.symbols[self.function_symbols[callee.0 as usize].0 as usize]
+                    .name
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let assembled = match nesc_asm::assemble_inline_with_calls(
+            &assembly.template,
+            &allowed_calls,
+            nesc_asm::AssemblyLimits::default(),
+        ) {
+            Ok(assembled) => assembled,
+            Err(error) => {
+                self.error(
+                    format!("invalid inline assembly: {error}"),
+                    instruction.span,
+                );
+                return;
+            }
+        };
+        let base = self.code_len();
+        self.object
+            .section_bytes_mut(self.code)
+            .expect("code section exists")
+            .extend_from_slice(&assembled.bytes);
+        for call in assembled.calls {
+            let callee = assembly
+                .calls
+                .iter()
+                .copied()
+                .find(|callee| {
+                    self.object.symbols[self.function_symbols[callee.0 as usize].0 as usize].name
+                        == call.symbol
+                })
+                .expect("assembler only returns allowed call symbols");
+            self.object.add_relocation(Relocation {
+                section: self.code,
+                offset: u32::try_from(base)
+                    .expect("code section length fits u32")
+                    .saturating_add(call.offset),
+                kind: RelocationKind::Absolute16,
+                symbol: self.function_symbols[callee.0 as usize],
+                addend: 0,
+            });
+        }
+        self.assembly.push_str("    ; begin NES_ASM\n");
+        for line in assembly.template.lines() {
+            if !line.trim().is_empty() {
+                self.assembly.push_str("    ");
+                self.assembly.push_str(line.trim());
+                self.assembly.push('\n');
+            }
+        }
+        self.assembly.push_str("    ; end NES_ASM\n");
+
+        for output in &assembly.outputs {
+            let location = match output.target {
+                AssemblyOutputTarget::Local(local) => self.local_location(function, local),
+                AssemblyOutputTarget::Global(global) => self.global_location(global),
+            };
+            match output.register {
+                AssemblyRegister::A => self.sta_location(location, 0),
+                AssemblyRegister::X => self.stx_location(location, 0),
+                AssemblyRegister::Y => self.sty_location(location, 0),
             }
         }
     }
@@ -1308,8 +1396,10 @@ impl Emitter {
 #[cfg(test)]
 mod tests {
     use nesc_mir::{
-        BasicBlock, BinaryOperator, BlockId, Function, FunctionId, Instruction, InstructionKind,
-        Module, SourceId, SourceSpan, Terminator, Type, TypeKind, ValueId,
+        AssemblyClobbers, AssemblyInput, AssemblyOutput, AssemblyOutputTarget, AssemblyRegister,
+        BasicBlock, BinaryOperator, BlockId, Effect, Function, FunctionId, InlineAssembly,
+        Instruction, InstructionKind, Local, LocalId, Module, SourceId, SourceSpan, Terminator,
+        Type, TypeKind, ValueId,
     };
 
     use super::generate;
@@ -1350,6 +1440,93 @@ mod tests {
                 .iter()
                 .any(|symbol| symbol.name == "main")
         );
+    }
+
+    #[test]
+    fn emits_inline_assembly_operands_calls_and_stack_contract() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let void = Type::scalar(TypeKind::Void);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![
+                Function {
+                    id: FunctionId(0),
+                    name: "main".to_owned(),
+                    return_type: void.clone(),
+                    parameters: Vec::new(),
+                    locals: vec![Local {
+                        id: LocalId(0),
+                        name: "result".to_owned(),
+                        ty: byte.clone(),
+                        parameter: false,
+                    }],
+                    entry: Some(BlockId(0)),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction {
+                                result: Some(ValueId(0)),
+                                kind: InstructionKind::Constant(7),
+                                effect: Effect::Pure,
+                                span,
+                            },
+                            Instruction {
+                                result: None,
+                                kind: InstructionKind::InlineAssembly(InlineAssembly {
+                                    template: "pha\njsr helper\npla".to_owned(),
+                                    inputs: vec![AssemblyInput {
+                                        register: AssemblyRegister::A,
+                                        value: ValueId(0),
+                                    }],
+                                    outputs: vec![AssemblyOutput {
+                                        register: AssemblyRegister::X,
+                                        target: AssemblyOutputTarget::Local(LocalId(0)),
+                                    }],
+                                    clobbers: AssemblyClobbers {
+                                        a: true,
+                                        flags: true,
+                                        memory: true,
+                                        ..AssemblyClobbers::default()
+                                    },
+                                    bank_effect: false,
+                                    calls: vec![FunctionId(1)],
+                                    stack_bytes: 1,
+                                }),
+                                effect: Effect::Volatile,
+                                span,
+                            },
+                        ],
+                        terminator: Some(Terminator::Return(None)),
+                    }],
+                    value_types: vec![byte],
+                },
+                Function {
+                    id: FunctionId(1),
+                    name: "helper".to_owned(),
+                    return_type: void,
+                    parameters: Vec::new(),
+                    locals: Vec::new(),
+                    entry: None,
+                    blocks: Vec::new(),
+                    value_types: Vec::new(),
+                },
+            ],
+        };
+        let generated = generate(&module).expect("code generation");
+        assert!(generated.assembly.contains("; begin NES_ASM"));
+        assert!(generated.assembly.contains("jsr helper"));
+        assert_eq!(generated.stack.functions["main"], 6);
+        let helper = generated
+            .object
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "helper")
+            .expect("helper symbol");
+        assert!(generated.object.relocations.iter().any(|relocation| {
+            relocation.symbol.0 as usize == helper
+                && relocation.kind == nesc_object::RelocationKind::Absolute16
+        }));
     }
 
     #[test]

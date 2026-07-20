@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use nesc_diagnostics::Diagnostic;
+use nesc_diagnostics::{Diagnostic, SourceFile, Span};
 use nesc_frontend::{CheckedProgram, FrontendConfig};
 use nesc_project::{BoundsChecks, Mirroring, Optimization, Project, Region, RomFormat};
 
@@ -55,6 +55,19 @@ pub struct CheckedProject {
     pub mir: nesc_mir::Module,
     /// Counts from the selected optimization pipeline.
     pub optimization: nesc_opt::OptimizationReport,
+    /// Validated standalone assembly modules.
+    pub assembly: Vec<CheckedAssembly>,
+}
+
+/// One validated standalone assembly input.
+#[derive(Clone, Debug)]
+pub struct CheckedAssembly {
+    /// Source path used by diagnostics and source maps.
+    pub path: PathBuf,
+    /// Original source retained for symbolic assembly artifacts.
+    pub source: String,
+    /// Relocatable object and stack contracts.
+    pub module: nesc_asm::AssemblyModule,
 }
 
 /// Complete in-memory build artifacts.
@@ -126,12 +139,191 @@ pub fn check_project(
             .map(|error| Diagnostic::error("E2001", format!("invalid MIR: {error}")))
             .collect::<Vec<_>>()
     })?;
+    let assembly = check_assembly_modules(project, &hir)?;
     Ok(CheckedProject {
         frontend,
         hir,
         mir,
         optimization,
+        assembly,
     })
+}
+
+fn check_assembly_modules(
+    project: &Project,
+    hir: &nesc_hir::Module,
+) -> Result<Vec<CheckedAssembly>, Vec<Diagnostic>> {
+    let mut checked = Vec::new();
+    let mut diagnostics = Vec::new();
+    for path in project.assembly_paths() {
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "E2100",
+                    format!(
+                        "could not read assembly source `{}`: {error}",
+                        path.display()
+                    ),
+                ));
+                continue;
+            }
+        };
+        let module_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("assembly");
+        let module = match nesc_asm::assemble_module(
+            &source,
+            module_name,
+            nesc_asm::AssemblyLimits::default(),
+        ) {
+            Ok(module) => module,
+            Err(error) => {
+                diagnostics.push(assembly_diagnostic(&path, &source, &error));
+                continue;
+            }
+        };
+        validate_assembly_abi(&path, &source, &module, hir, &mut diagnostics);
+        checked.push(CheckedAssembly {
+            path,
+            source,
+            module,
+        });
+    }
+    if diagnostics.is_empty() {
+        Ok(checked)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+fn validate_assembly_abi(
+    path: &Path,
+    source: &str,
+    module: &nesc_asm::AssemblyModule,
+    hir: &nesc_hir::Module,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for exported in &module.exports {
+        match hir
+            .function_names
+            .get(&exported.name)
+            .and_then(|id| hir.function(*id))
+        {
+            Some(function)
+                if function.body.is_none() && function.linkage == nesc_hir::Linkage::External => {}
+            Some(_) => diagnostics.push(assembly_source_diagnostic(
+                path,
+                source,
+                exported.line,
+                "E2101",
+                format!(
+                    "assembly export `{}` requires a matching `extern` NesC declaration",
+                    exported.name
+                ),
+                "conflicting NesC definition or linkage",
+            )),
+            None => diagnostics.push(assembly_source_diagnostic(
+                path,
+                source,
+                exported.line,
+                "E2101",
+                format!(
+                    "assembly export `{}` has no matching NesC declaration",
+                    exported.name
+                ),
+                "declare this function with `extern` in NesC",
+            )),
+        }
+    }
+    for imported in &module.imports {
+        match hir
+            .function_names
+            .get(&imported.name)
+            .and_then(|id| hir.function(*id))
+        {
+            Some(function)
+                if function.body.is_none()
+                    || function
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.name == "export") => {}
+            Some(_) => diagnostics.push(assembly_source_diagnostic(
+                path,
+                source,
+                imported.line,
+                "E2102",
+                format!(
+                    "assembly import `{}` refers to a NesC definition without `NES_EXPORT`",
+                    imported.name
+                ),
+                "add `NES_EXPORT` to the NesC definition",
+            )),
+            None => diagnostics.push(assembly_source_diagnostic(
+                path,
+                source,
+                imported.line,
+                "E2102",
+                format!(
+                    "assembly import `{}` has no matching NesC function declaration",
+                    imported.name
+                ),
+                "declare the imported function in NesC",
+            )),
+        }
+    }
+}
+
+fn assembly_diagnostic(path: &Path, source: &str, error: &nesc_asm::AssemblyError) -> Diagnostic {
+    error.line().map_or_else(
+        || {
+            Diagnostic::error(
+                "E2100",
+                format!("invalid assembly module: {}", error.message()),
+            )
+        },
+        |line| {
+            assembly_source_diagnostic(
+                path,
+                source,
+                line,
+                "E2100",
+                format!("invalid assembly module: {}", error.message()),
+                "assembly error",
+            )
+        },
+    )
+}
+
+fn assembly_source_diagnostic(
+    path: &Path,
+    source: &str,
+    line: usize,
+    code: &str,
+    message: impl Into<String>,
+    label: &str,
+) -> Diagnostic {
+    let (start, len) = line_span(source, line);
+    Diagnostic::error(code, message).with_source(
+        SourceFile::new(path, source),
+        Span::new(start, len),
+        label,
+    )
+}
+
+fn line_span(source: &str, line: usize) -> (usize, usize) {
+    let mut start = 0;
+    for (index, text) in source.split_inclusive('\n').enumerate() {
+        if index + 1 == line {
+            return (start, text.trim_end_matches('\n').len().max(1));
+        }
+        start += text.len();
+    }
+    (
+        source.len().saturating_sub(1),
+        usize::from(!source.is_empty()),
+    )
 }
 
 /// Compiles and links a project into Mapper 0 artifacts.
@@ -145,7 +337,8 @@ pub fn build_project(
     config: &CompilerConfig,
 ) -> Result<BuildArtifacts, Vec<Diagnostic>> {
     let checked = check_project(project, config)?;
-    let backend_config = backend_config(project);
+    let external_stack_bytes = assembly_stack_contracts(&checked.assembly)?;
+    let backend_config = backend_config(project, external_stack_bytes);
     let generated = nesc_codegen_6502::generate_with_config(&checked.mir, &backend_config)
         .map_err(|errors| {
             errors
@@ -170,11 +363,16 @@ pub fn build_project(
         .collect::<BTreeSet<_>>();
     let runtime = nesc_runtime::build_for(&required_helpers);
     let link_config = linker_config(project)?;
-    let linked = nesc_linker::link(
-        &[runtime.object.clone(), generated.object.clone()],
-        link_config,
-    )
-    .map_err(|errors| {
+    let mut objects = Vec::with_capacity(checked.assembly.len() + 2);
+    objects.push(runtime.object.clone());
+    objects.extend(
+        checked
+            .assembly
+            .iter()
+            .map(|assembly| assembly.module.object.clone()),
+    );
+    objects.push(generated.object.clone());
+    let linked = nesc_linker::link(&objects, link_config).map_err(|errors| {
         errors
             .into_iter()
             .map(|error| Diagnostic::error("E3001", error.to_string()))
@@ -200,9 +398,36 @@ pub fn build_project(
             ));
         }
     }
+    for assembly in &checked.assembly {
+        for exported in &assembly.module.exports {
+            let Some(address) = linked.symbols.get(&exported.name) else {
+                continue;
+            };
+            source_map.push_str(&format!(
+                "{address:04X} {}:{}:1 {}\n",
+                assembly.path.display(),
+                exported.line,
+                exported.name
+            ));
+        }
+    }
+    let assembly_sources = checked
+        .assembly
+        .iter()
+        .map(|assembly| {
+            format!(
+                "\n; standalone module {}\n{}",
+                assembly.path.display(),
+                assembly.source
+            )
+        })
+        .collect::<String>();
     Ok(BuildArtifacts {
         rom: linked.rom,
-        assembly: format!("{}\n{}", runtime.assembly, generated.assembly),
+        assembly: format!(
+            "{}{}\n{}",
+            runtime.assembly, assembly_sources, generated.assembly
+        ),
         map: linked.map,
         symbols,
         source_map,
@@ -212,7 +437,32 @@ pub fn build_project(
     })
 }
 
-fn backend_config(project: &Project) -> nesc_codegen_6502::BackendConfig {
+fn assembly_stack_contracts(
+    assembly: &[CheckedAssembly],
+) -> Result<BTreeMap<String, u16>, Vec<Diagnostic>> {
+    let mut contracts = BTreeMap::new();
+    let mut diagnostics = Vec::new();
+    for input in assembly {
+        for (name, bytes) in &input.module.stack_bytes {
+            if contracts.insert(name.clone(), *bytes).is_some() {
+                diagnostics.push(Diagnostic::error(
+                    "E2103",
+                    format!("assembly function `{name}` is exported by more than one module"),
+                ));
+            }
+        }
+    }
+    if diagnostics.is_empty() {
+        Ok(contracts)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+fn backend_config(
+    project: &Project,
+    external_stack_bytes: BTreeMap<String, u16>,
+) -> nesc_codegen_6502::BackendConfig {
     let zero_page = &project.manifest().memory.zero_page;
     let ranges = |values: &[String]| {
         values
@@ -231,6 +481,7 @@ fn backend_config(project: &Project) -> nesc_codegen_6502::BackendConfig {
             nesc_project::ZeroPageStrategy::Cycles => nesc_codegen_6502::ZeroPageStrategy::Cycles,
         },
         stack_limit: project.manifest().compiler.stack_limit,
+        external_stack_bytes,
     }
 }
 
@@ -327,6 +578,132 @@ NES_MAIN int main(void) {
         .expect("boot oracle");
         assert_eq!(boot.background_color, 0x21);
         assert!(boot.frames >= 2);
+    }
+
+    #[test]
+    fn executes_inline_assembly_in_a_generated_rom() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("inline-assembly");
+        create_project("inline-assembly", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+NES_MAIN int main(void) {
+    u8 color;
+    NES_ASM(
+        "lda #$2A",
+        NES_ASM_OUTPUT_A(color),
+        NES_CLOBBER_FLAGS
+    );
+    nes_wait_vblank();
+    nes_set_background_color(color);
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("inline assembly source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        assert!(artifacts.assembly.contains("; begin NES_ASM"));
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x2a,
+            200_000,
+        )
+        .expect("inline assembly boot oracle");
+        assert_eq!(boot.background_color, 0x2a);
+    }
+
+    #[test]
+    fn links_nesc_and_standalone_assembly_functions() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("assembly-module");
+        create_project("assembly-module", &project_path).expect("project");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+        fs::write(
+            &manifest_path,
+            manifest.replace("assembly = []", "assembly = [\"src/double.s\"]"),
+        )
+        .expect("assembly manifest");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+extern u8 assembly_double(u8 value);
+
+NES_EXPORT u8 double_value(u8 value) {
+    return value + value;
+}
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    nes_set_background_color(assembly_double(0x15u8));
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("NesC source");
+        fs::write(
+            project_path.join("src/double.s"),
+            r#".setcpu "6502"
+.segment "CODE"
+.import double_value
+.export assembly_double
+.nesc_stack assembly_double, 2
+
+assembly_double:
+    jsr double_value
+    rts
+"#,
+        )
+        .expect("assembly source");
+        let project = Project::load(&manifest_path).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        assert!(artifacts.assembly.contains("standalone module"));
+        assert!(artifacts.map.contains(".text.double"));
+        assert!(artifacts.stack.contains("assembly_double"));
+        assert!(artifacts.source_map.contains("src/double.s"));
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x2a,
+            200_000,
+        )
+        .expect("standalone assembly boot oracle");
+        assert_eq!(boot.background_color, 0x2a);
+    }
+
+    #[test]
+    fn rejects_untyped_assembly_exports() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("untyped-assembly");
+        create_project("untyped-assembly", &project_path).expect("project");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path)
+            .expect("manifest source")
+            .replace("assembly = []", "assembly = [\"src/orphan.s\"]");
+        fs::write(&manifest_path, manifest).expect("assembly manifest");
+        fs::write(
+            project_path.join("src/orphan.s"),
+            ".segment \"CODE\"\n.import main\n.export orphan\n.nesc_stack orphan, 0\norphan:\n rts\n",
+        )
+        .expect("assembly source");
+        let project = Project::load(&manifest_path).expect("manifest");
+        let diagnostics = check_project(&project, &CompilerConfig::bundled_sdk())
+            .expect_err("untyped export rejected");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "E2101")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "E2102")
+        );
     }
 
     #[test]

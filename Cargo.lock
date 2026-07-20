@@ -188,6 +188,7 @@ name = "nesc-asm"
 version = "0.1.0"
 dependencies = [
  "nesc-disasm",
+ "nesc-object",
 ]
 
 [[package]]
@@ -210,6 +211,7 @@ dependencies = [
 name = "nesc-codegen-6502"
 version = "0.1.0"
 dependencies = [
+ "nesc-asm",
  "nesc-mir",
  "nesc-object",
 ]
@@ -218,6 +220,7 @@ dependencies = [
 name = "nesc-compiler"
 version = "0.1.0"
 dependencies = [
+ "nesc-asm",
  "nesc-codegen-6502",
  "nesc-diagnostics",
  "nesc-emulator",

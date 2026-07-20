@@ -180,6 +180,9 @@ fn instruction_operands(kind: &InstructionKind, used: &mut HashSet<ValueId>) {
             used.insert(*right);
         }
         InstructionKind::Call { arguments, .. } => used.extend(arguments.iter().copied()),
+        InstructionKind::InlineAssembly(assembly) => {
+            used.extend(assembly.inputs.iter().map(|input| input.value));
+        }
         InstructionKind::Constant(_)
         | InstructionKind::LoadLocal(_)
         | InstructionKind::LoadGlobal(_)

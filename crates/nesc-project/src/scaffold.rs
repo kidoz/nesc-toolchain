@@ -81,6 +81,7 @@ version = "0.1.0"
 
 [build]
 entry = "src/main.c"
+assembly = []
 region = "ntsc"
 format = "nes2"
 

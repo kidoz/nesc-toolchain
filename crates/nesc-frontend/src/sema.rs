@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use nesc_diagnostics::Diagnostic;
 
 use crate::{
-    AddressSpace, BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function,
-    IntegerLiteral, IntegerSuffix, IntegerType, MacroDefinition, Program, SourceMap, SourceSpan,
-    Statement, StorageClass, Type, TypeKind, UnaryOperator, Variable,
+    AddressSpace, AssemblyRegister, BinaryOperator, Block, Declaration, Expression, ExpressionKind,
+    Function, InlineAssembly, IntegerLiteral, IntegerSuffix, IntegerType, MacroDefinition, Program,
+    SourceMap, SourceSpan, Statement, StorageClass, Type, TypeKind, UnaryOperator, Variable,
 };
 
 /// Kind of a resolved global symbol.
@@ -435,6 +435,7 @@ impl FunctionChecker<'_, '_> {
                     self.expression(expression);
                 }
             }
+            Statement::InlineAssembly(assembly) => self.inline_assembly(assembly),
             Statement::If {
                 condition,
                 then_branch,
@@ -508,6 +509,106 @@ impl FunctionChecker<'_, '_> {
                     self.require_conversion(value, actual.as_ref(), &expected);
                 }
             },
+        }
+    }
+
+    fn inline_assembly(&mut self, assembly: &mut InlineAssembly) {
+        let mut inputs = HashSet::new();
+        for input in &mut assembly.inputs {
+            if !inputs.insert(input.register) {
+                self.error(
+                    "E1346",
+                    format!(
+                        "inline assembly register {} has more than one input",
+                        assembly_register_name(input.register)
+                    ),
+                    input.value.span,
+                    "duplicate register input",
+                );
+            }
+            let ty = self.expression(&mut input.value);
+            if ty
+                .as_ref()
+                .and_then(Type::integer_width)
+                .is_none_or(|width| width > 8)
+            {
+                self.error(
+                    "E1347",
+                    "inline assembly register inputs must be 8-bit integer values",
+                    input.value.span,
+                    "value does not fit in one CPU register",
+                );
+            }
+        }
+
+        let mut outputs = HashSet::new();
+        for output in &assembly.outputs {
+            if !outputs.insert(output.register) {
+                self.error(
+                    "E1348",
+                    format!(
+                        "inline assembly register {} has more than one output",
+                        assembly_register_name(output.register)
+                    ),
+                    output.span,
+                    "duplicate register output",
+                );
+            }
+            if assembly_register_clobbered(assembly, output.register) {
+                self.error(
+                    "E1349",
+                    format!(
+                        "inline assembly register {} cannot be both an output and a clobber",
+                        assembly_register_name(output.register)
+                    ),
+                    output.span,
+                    "conflicting assembly contract",
+                );
+            }
+            let ty = self
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(&output.target))
+                .or_else(|| {
+                    self.symbols.get(&output.target).and_then(|symbol| {
+                        matches!(symbol.kind, SymbolKind::Variable).then_some(&symbol.ty)
+                    })
+                });
+            match ty {
+                None => self.error(
+                    "E1350",
+                    format!("unknown inline assembly output `{}`", output.target),
+                    output.span,
+                    "writable variable required here",
+                ),
+                Some(ty) if ty.is_const || ty.integer_width().is_none_or(|width| width > 8) => {
+                    self.error(
+                        "E1351",
+                        "inline assembly outputs require a writable 8-bit integer variable",
+                        output.span,
+                        "invalid output variable",
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+
+        for (callee, span) in &assembly.calls {
+            match self.symbols.get(callee) {
+                Some(Symbol {
+                    kind: SymbolKind::Function { .. },
+                    ..
+                }) => {
+                    self.calls.insert(callee.clone());
+                }
+                _ => self.error(
+                    "E1352",
+                    format!("unknown inline assembly callee `{callee}`"),
+                    *span,
+                    "declared function required here",
+                ),
+            }
         }
     }
 
@@ -1105,6 +1206,22 @@ fn is_assignable(expression: &Expression) -> bool {
                 ..
             }
     )
+}
+
+fn assembly_register_name(register: AssemblyRegister) -> &'static str {
+    match register {
+        AssemblyRegister::A => "A",
+        AssemblyRegister::X => "X",
+        AssemblyRegister::Y => "Y",
+    }
+}
+
+fn assembly_register_clobbered(assembly: &InlineAssembly, register: AssemblyRegister) -> bool {
+    match register {
+        AssemblyRegister::A => assembly.clobbers.a,
+        AssemblyRegister::X => assembly.clobbers.x,
+        AssemblyRegister::Y => assembly.clobbers.y,
+    }
 }
 
 fn type_name(ty: &Type) -> String {

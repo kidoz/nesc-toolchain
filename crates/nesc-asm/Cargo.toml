@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 nesc-disasm = { path = "../nesc-disasm" }
+nesc-object = { path = "../nesc-object" }
 
 [lints]
 workspace = true
