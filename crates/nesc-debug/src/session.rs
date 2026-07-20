@@ -2,10 +2,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nesc_disasm::{AddressingMode, opcode};
 use nesc_emulator::{
-    BusAccess, BusAccessKind, EmulatorConfig, Machine, StepReport, Termination, TimingProfile,
+    BusAccess, BusAccessKind, CycleReport, EmulatorConfig, Machine, StepReport, Termination,
+    TimingProfile,
 };
 
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -81,6 +84,27 @@ impl Default for DebugSessionConfig {
 pub struct DebugCommandOutput {
     pub text: String,
     pub quit: bool,
+}
+
+/// Thread-safe cooperative pause signal for a running debugger session.
+#[derive(Clone, Debug, Default)]
+pub struct DebugPauseHandle {
+    requested: Arc<AtomicBool>,
+}
+
+impl DebugPauseHandle {
+    /// Requests that the session stop at its next cooperative check.
+    pub fn request_pause(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn take_request(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
+    }
+
+    fn clear(&self) {
+        self.requested.store(false, Ordering::Release);
+    }
 }
 
 /// ROM debugger construction, parsing, or execution failure.
@@ -200,6 +224,8 @@ pub struct DebugSession {
     trace: VecDeque<TraceEntry>,
     instruction_limit: u64,
     cycle_limit: u64,
+    pause: DebugPauseHandle,
+    pending_trace_address: Option<DebugAddress>,
 }
 
 impl DebugSession {
@@ -287,6 +313,8 @@ impl DebugSession {
             trace: VecDeque::new(),
             instruction_limit: config.instruction_limit,
             cycle_limit: config.cycle_limit,
+            pause: DebugPauseHandle::default(),
+            pending_trace_address: None,
         })
     }
 
@@ -315,6 +343,7 @@ impl DebugSession {
             }
             "pause" => {
                 require_count(name, &arguments, 0)?;
+                self.pause.clear();
                 "Execution is paused.\n".to_owned()
             }
             "step" | "s" => {
@@ -322,13 +351,16 @@ impl DebugSession {
                 self.step_once("instruction step")?
             }
             "step-cycle" => {
-                return Err(DebugSessionError::Command(
-                    "cycle stepping is unavailable because the current CPU core executes one instruction atomically".to_owned(),
-                ));
+                require_count(name, &arguments, 0)?;
+                self.step_cycle()?
             }
             "step-frame" => {
                 require_count(name, &arguments, 0)?;
                 self.step_frame()?
+            }
+            "step-source" => {
+                require_count(name, &arguments, 0)?;
+                self.step_source()?
             }
             "next" => {
                 require_count(name, &arguments, 0)?;
@@ -418,6 +450,12 @@ impl DebugSession {
         )
     }
 
+    /// Returns a signal that another thread may use to pause bounded execution.
+    #[must_use]
+    pub fn pause_handle(&self) -> DebugPauseHandle {
+        self.pause.clone()
+    }
+
     fn step_once(&mut self, reason: &str) -> Result<String, DebugSessionError> {
         let report = self.execute_one()?;
         if let Some(termination) = report.termination {
@@ -429,11 +467,40 @@ impl DebugSession {
         Ok(self.render_stop(reason))
     }
 
+    fn step_cycle(&mut self) -> Result<String, DebugSessionError> {
+        let cycle = self.execute_cycle()?;
+        if let Some(report) = cycle.step {
+            if let Some(termination) = report.termination {
+                return Ok(self.render_termination(termination));
+            }
+            if let Some(stop) = self.watchpoint_stop() {
+                return Ok(stop);
+            }
+        }
+        let position = self.machine.ppu_position();
+        let state = if cycle.instruction_complete {
+            "instruction complete"
+        } else {
+            "instruction pending"
+        };
+        Ok(format!(
+            "Cycle {}: {state}; PPU frame {}, scanline {}, dot {}\n{}",
+            cycle.cycle,
+            position.frame,
+            position.scanline,
+            position.dot,
+            self.render_registers()
+        ))
+    }
+
     fn resume(&mut self, skip_current_breakpoint: bool) -> Result<String, DebugSessionError> {
         let initial_instructions = self.machine.instructions();
         let initial_cycles = self.machine.cycles();
         let mut first = true;
         loop {
+            if self.pause.take_request() {
+                return Ok(self.render_stop("pause requested"));
+            }
             if !first || !skip_current_breakpoint {
                 if let Some((id, _)) = self.breakpoint_at_current() {
                     return Ok(self.render_stop(&format!("breakpoint {id}")));
@@ -451,7 +518,17 @@ impl DebugSession {
             if self.machine.cycles().saturating_sub(initial_cycles) >= self.cycle_limit {
                 return Ok(self.render_stop("cycle limit"));
             }
-            let report = self.execute_one()?;
+            let report = loop {
+                if self.pause.take_request() {
+                    return Ok(self.render_stop("pause requested"));
+                }
+                if self.machine.cycles().saturating_sub(initial_cycles) >= self.cycle_limit {
+                    return Ok(self.render_stop("cycle limit"));
+                }
+                if let Some(report) = self.execute_cycle()?.step {
+                    break report;
+                }
+            };
             if let Some(termination) = report.termination {
                 return Ok(self.render_termination(termination));
             }
@@ -466,8 +543,35 @@ impl DebugSession {
         let initial_instructions = self.machine.instructions();
         let initial_cycles = self.machine.cycles();
         while self.machine.frames() == frame {
+            if self.pause.take_request() {
+                return Ok(self.render_stop("pause requested"));
+            }
             if self.limit_reached(initial_instructions, initial_cycles) {
                 return Ok(self.render_stop("execution limit before next frame"));
+            }
+            let cycle = self.execute_cycle()?;
+            if let Some(report) = cycle.step {
+                if let Some(termination) = report.termination {
+                    return Ok(self.render_termination(termination));
+                }
+                if let Some(stop) = self.watchpoint_stop().or_else(|| self.breakpoint_stop()) {
+                    return Ok(stop);
+                }
+            }
+        }
+        Ok(self.render_stop("frame boundary"))
+    }
+
+    fn step_source(&mut self) -> Result<String, DebugSessionError> {
+        let initial_source = self.source_for(self.current_address()).cloned();
+        let initial_instructions = self.machine.instructions();
+        let initial_cycles = self.machine.cycles();
+        loop {
+            if self.pause.take_request() {
+                return Ok(self.render_stop("pause requested"));
+            }
+            if self.limit_reached(initial_instructions, initial_cycles) {
+                return Ok(self.render_stop("execution limit before source change"));
             }
             let report = self.execute_one()?;
             if let Some(termination) = report.termination {
@@ -476,8 +580,10 @@ impl DebugSession {
             if let Some(stop) = self.watchpoint_stop().or_else(|| self.breakpoint_stop()) {
                 return Ok(stop);
             }
+            if self.source_for(self.current_address()) != initial_source.as_ref() {
+                return Ok(self.render_stop("source location changed"));
+            }
         }
-        Ok(self.render_stop("frame boundary"))
     }
 
     fn next(&mut self) -> Result<String, DebugSessionError> {
@@ -490,6 +596,9 @@ impl DebugSession {
         let initial_instructions = self.machine.instructions();
         let initial_cycles = self.machine.cycles();
         loop {
+            if self.pause.take_request() {
+                return Ok(self.render_stop("pause requested"));
+            }
             if self.limit_reached(initial_instructions, initial_cycles) {
                 return Ok(self.render_stop("execution limit while stepping over call"));
             }
@@ -513,6 +622,9 @@ impl DebugSession {
         let initial_cycles = self.machine.cycles();
         let mut nested_calls = 0_u32;
         loop {
+            if self.pause.take_request() {
+                return Ok(self.render_stop("pause requested"));
+            }
             if self.limit_reached(initial_instructions, initial_cycles) {
                 return Ok(self.render_stop("execution limit while finishing function"));
             }
@@ -535,20 +647,47 @@ impl DebugSession {
     }
 
     fn execute_one(&mut self) -> Result<StepReport, DebugSessionError> {
+        if self.machine.instruction_pending() {
+            loop {
+                if let Some(report) = self.execute_cycle()?.step {
+                    return Ok(report);
+                }
+            }
+        }
         let address = self.current_address();
         let report = self.machine.step()?;
-        if self.trace_enabled {
-            if self.trace.len() == TRACE_CAPACITY {
-                self.trace.pop_front();
-            }
-            self.trace.push_back(TraceEntry {
-                address,
-                opcode: report.opcode,
-                cycles: report.cycles,
-                source: self.source_for(address).cloned(),
-            });
-        }
+        self.record_trace(address, report);
         Ok(report)
+    }
+
+    fn execute_cycle(&mut self) -> Result<CycleReport, DebugSessionError> {
+        if !self.machine.instruction_pending() {
+            self.pending_trace_address = Some(self.current_address());
+        }
+        let cycle = self.machine.step_cycle()?;
+        if let Some(report) = cycle.step {
+            let address = self.pending_trace_address.take().unwrap_or(DebugAddress {
+                bank: self.machine.mapped_prg_bank(report.pc),
+                address: report.pc,
+            });
+            self.record_trace(address, report);
+        }
+        Ok(cycle)
+    }
+
+    fn record_trace(&mut self, address: DebugAddress, report: StepReport) {
+        if !self.trace_enabled {
+            return;
+        }
+        if self.trace.len() == TRACE_CAPACITY {
+            self.trace.pop_front();
+        }
+        self.trace.push_back(TraceEntry {
+            address,
+            opcode: report.opcode,
+            cycles: report.cycles,
+            source: self.source_for(address).cloned(),
+        });
     }
 
     fn limit_reached(&self, instructions: u64, cycles: u64) -> bool {
@@ -777,12 +916,16 @@ impl DebugSession {
     }
 
     fn render_ppu(&self) -> Result<String, DebugSessionError> {
+        let position = self.machine.ppu_position();
         Ok(format!(
-            "CTRL=${:02X} MASK=${:02X} STATUS=${:02X} frames={}\nCHR RAM: {} nonzero bytes\nPalette: {} nonzero bytes\nOAM: {} nonzero bytes\nNametable RAM: {} nonzero bytes\n",
+            "Timing: {:?}\nFrame {}, scanline {}, dot {}\nCTRL=${:02X} MASK=${:02X} STATUS=${:02X}\nCHR RAM: {} nonzero bytes\nPalette: {} nonzero bytes\nOAM: {} nonzero bytes\nNametable RAM: {} nonzero bytes\n",
+            self.machine.timing_profile(),
+            position.frame,
+            position.scanline,
+            position.dot,
             self.machine.peek(0x2000)?,
             self.machine.peek(0x2001)?,
             self.machine.peek(0x2002)?,
-            self.machine.frames(),
             nonzero(self.machine.chr_ram()),
             nonzero(self.machine.palette()),
             nonzero(self.machine.oam()),
@@ -1084,7 +1227,7 @@ fn nonzero(values: &[u8]) -> usize {
 }
 
 fn help_text() -> &'static str {
-    "run | continue | pause\nstep | step-frame | next | finish\nbreak <address-or-symbol> | delete <id>\nwatch <address> | watch-read <address> | watch-write <address>\nregisters | memory <address> <length> | disassemble <address> <count> | stack\nsource | symbols | ppu | apu | cartridge\ntrace on | trace off | trace show\nreset | quit\n"
+    "run | continue | pause\nstep | step-cycle | step-frame | step-source | next | finish\nbreak <address-or-symbol> | delete <id>\nwatch <address> | watch-read <address> | watch-write <address>\nregisters | memory <address> <length> | disassemble <address> <count> | stack\nsource | symbols | ppu | apu | cartridge\ntrace on | trace off | trace show\nreset | quit\n"
 }
 
 #[cfg(test)]
@@ -1221,6 +1364,39 @@ mod tests {
     }
 
     #[test]
+    fn steps_cycles_and_source_locations_and_honors_pause_requests() {
+        let mut session = nrom_session();
+        let first = session
+            .execute_command("step-cycle")
+            .expect("first cycle")
+            .text;
+        assert!(first.contains("instruction pending"), "{first}");
+        let second = session
+            .execute_command("step-cycle")
+            .expect("second cycle")
+            .text;
+        assert!(second.contains("instruction complete"), "{second}");
+        let ppu = session.execute_command("ppu").expect("PPU state").text;
+        assert!(ppu.contains("Timing: Ntsc"), "{ppu}");
+        assert!(ppu.contains("scanline 0, dot 27"), "{ppu}");
+
+        let mut session = nrom_session();
+        let source = session
+            .execute_command("step-source")
+            .expect("source step")
+            .text;
+        assert!(source.contains("source location changed"), "{source}");
+        assert_eq!(session.current_address().address, 0x8010);
+
+        let mut session = nrom_session();
+        let pause = session.pause_handle();
+        pause.request_pause();
+        let stopped = session.execute_command("continue").expect("pause").text;
+        assert!(stopped.contains("pause requested"), "{stopped}");
+        assert_eq!(session.current_address().address, 0x8000);
+    }
+
+    #[test]
     fn honors_mapper_two_bank_qualified_breakpoints() {
         let mut session = DebugSession::from_rom_bytes(
             &uxrom(),
@@ -1254,5 +1430,11 @@ mod tests {
                 .text
                 .contains("Selected PRG bank: 1")
         );
+        let cycle = session
+            .execute_command("step-cycle")
+            .expect("banked instruction cycle")
+            .text;
+        assert!(cycle.contains("instruction pending"), "{cycle}");
+        assert_eq!(session.current_address().bank, Some(1));
     }
 }

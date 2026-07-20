@@ -3,8 +3,8 @@
 mod session;
 
 pub use session::{
-    DebugAddress, DebugCommandOutput, DebugSession, DebugSessionConfig, DebugSessionError,
-    SourceLocation,
+    DebugAddress, DebugCommandOutput, DebugPauseHandle, DebugSession, DebugSessionConfig,
+    DebugSessionError, SourceLocation,
 };
 
 use std::fmt;

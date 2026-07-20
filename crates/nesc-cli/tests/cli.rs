@@ -310,6 +310,10 @@ fn build_and_inspect_generated_project() {
             "disassemble main 2",
             "--command",
             "cartridge",
+            "--command",
+            "step-cycle",
+            "--command",
+            "ppu",
         ])
         .output()
         .expect("debug generated ROM");
@@ -323,6 +327,8 @@ fn build_and_inspect_generated_project() {
     assert!(stdout.contains("Stopped: breakpoint 1"), "{stdout}");
     assert!(stdout.contains("src/main.c"), "{stdout}");
     assert!(stdout.contains("<main>"), "{stdout}");
+    assert!(stdout.contains("instruction pending"), "{stdout}");
+    assert!(stdout.contains("Timing: Ntsc"), "{stdout}");
 
     let mut interactive = nesc()
         .current_dir(&project)
@@ -779,6 +785,10 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
             "continue",
             "--command",
             "cartridge",
+            "--command",
+            "step-cycle",
+            "--command",
+            "ppu",
         ])
         .output()
         .expect("debug UxROM");
@@ -794,6 +804,8 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
         "{stdout}"
     );
     assert!(stdout.contains("Selected PRG bank: 1"), "{stdout}");
+    assert!(stdout.contains("instruction pending"), "{stdout}");
+    assert!(stdout.contains("Timing: Ntsc"), "{stdout}");
 
     let output = nesc()
         .current_dir(temporary.path())
