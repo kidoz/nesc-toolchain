@@ -38,6 +38,9 @@ ROM. The toolkit is written in stable Rust 2024.
 - Public bounded emulator execution for all 151 official CPU opcodes, reset,
   interrupts, controller I/O, DMA, mapper writes, region timing, checkpoints,
   and first-divergence event traces
+- Dot-driven NTSC/PAL/Dendy PPU timing with scrolling-register latches,
+  background and sprite composition, sprite status flags, mapper-aware CHR
+  reads, nametable mirroring, and a checkpointed palette-index framebuffer
 - `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2
   `nesc disassemble`, Mapper 0/2 `nesc decompile --emit=nesc`, and
   Mapper 0/2 `nesc decompile --emit=rust` workflows
@@ -90,8 +93,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | Interactive and scripted Mapper 0/2 ROM debugger | Available |
 | CPU-cycle stepping and NTSC/PAL/Dendy PPU beam position | Available |
 | Per-clock official CPU bus operations, dummy accesses, interrupts, and OAM DMA | Available |
+| PPU background/sprite rendering and palette-index framebuffer | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Complete PPU rendering and APU channel timing | Planned |
+| Remaining PPU hardware edge behavior and APU channel timing | Planned |
 
 ## Quick start
 
@@ -330,8 +334,12 @@ and operand fetches, indexed-address penalties, branch dummy reads,
 read-modify-write double writes, stack and control-flow traffic, interrupt
 entry, and parity-correct 513/514-clock OAM DMA. Bus and MMIO effects occur on
 their scheduled clocks; architectural register state commits on the final
-instruction clock. Complete PPU rendering and APU channel execution remain
-future timing work.
+instruction clock. The PPU beam now runs dot by dot, renders scrolled
+background tiles and evaluated sprites through cartridge CHR mapping, updates
+sprite-zero-hit and overflow status, and retains a 256x240 palette-index
+framebuffer in machine checkpoints. The debugger's `ppu` command reports the
+rendering registers and a stable framebuffer checksum. Remaining low-level PPU
+edge behavior and APU channel execution are future timing work.
 
 ## Verification artifact inspection
 
@@ -442,7 +450,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Add complete PPU rendering and APU channel timing
+1. Complete remaining PPU hardware edge behavior and add APU channel timing
 2. Add Mapper 3 compilation and recovery
 3. Add emulator-backed `NES_TEST` discovery and execution
 4. Expand optimization quality and generated-code cost modeling
