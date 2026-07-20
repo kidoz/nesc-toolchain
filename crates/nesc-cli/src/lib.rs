@@ -17,7 +17,7 @@ use nesc_decompiler::{
 };
 use nesc_diagnostics::Diagnostic;
 use nesc_disasm::{AnalysisLimits, ByteClassification, Disassembly, disassemble};
-use nesc_linker::{RecoveryLinkInput, relink_nrom};
+use nesc_linker::{RecoveryLinkInput, relink_recovery};
 use nesc_project::{Project, create_project};
 
 /// Top-level command-line arguments.
@@ -59,7 +59,7 @@ enum Command {
         #[arg(value_name = "ROM")]
         rom: PathBuf,
     },
-    /// Recover an NROM image as deterministic 6502 assembly and cartridge data.
+    /// Recover a Mapper 0 or Mapper 2 image as deterministic 6502 assembly and cartridge data.
     #[command(alias = "disasm")]
     Disassemble {
         /// ROM file to analyze.
@@ -343,7 +343,7 @@ fn verify_disassembly_round_trip(
             "parsed cartridge regions exceed the original ROM file",
         )]
     })?;
-    let rebuilt = relink_nrom(RecoveryLinkInput {
+    let rebuilt = relink_recovery(RecoveryLinkInput {
         header: &original[..16],
         trainer: disassembly.rom.trainer.as_deref(),
         prg_rom: &rebuilt_prg,
@@ -431,13 +431,30 @@ fn render_analysis_report(disassembly: &Disassembly, trailing_bytes: usize) -> S
         .filter(|classification| **classification == ByteClassification::Data)
         .count();
     let mut report = format!(
-        "mapper: {}\nprg-bytes: {}\ninstructions: {}\ndata-bytes: {data_bytes}\nunresolved-control-flow: {}\nnotices: {}\ntrailing-bytes: {trailing_bytes}\n",
+        "mapper: {}\nprg-bytes: {}\ninstructions: {}\ndata-bytes: {data_bytes}\nmapper-writes: {}\nunresolved-control-flow: {}\nnotices: {}\ntrailing-bytes: {trailing_bytes}\n",
         disassembly.rom.metadata.mapper,
         disassembly.rom.prg_rom.len(),
         disassembly.instructions.len(),
+        disassembly.mapper_writes.len(),
         disassembly.unresolved.len(),
         disassembly.notices.len(),
     );
+    for write in &disassembly.mapper_writes {
+        report.push_str(&format!(
+            "mapper-write: prg:{:02X}:${:04X} address={} value={} resulting-bank={}\n",
+            write.source.bank,
+            write.source.cpu_address,
+            write
+                .register_address
+                .map_or_else(|| "unknown".to_owned(), |value| format!("${value:04X}")),
+            write
+                .value
+                .map_or_else(|| "unknown".to_owned(), |value| format!("${value:02X}")),
+            write
+                .resulting_bank
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:02X}")),
+        ));
+    }
     for unresolved in &disassembly.unresolved {
         report.push_str(&format!(
             "unresolved: prg:{:02X}:${:04X} {:?} ${:04X}\n",
@@ -471,6 +488,15 @@ fn decompile_rom_file(
     })?;
     let disassembly = disassemble(&bytes, limits)
         .map_err(|error| vec![Diagnostic::error("E4201", error.to_string())])?;
+    if disassembly.rom.metadata.mapper != 0 {
+        return Err(vec![Diagnostic::error(
+            "E4201",
+            format!(
+                "high-level decompilation currently supports Mapper 0, not Mapper {}",
+                disassembly.rom.metadata.mapper
+            ),
+        )]);
+    }
     let program = analyze(&disassembly, DecompilerLimits::default())
         .map_err(|errors| decompiler_diagnostics("E4202", "semantic analysis", errors))?;
     let values = analyze_values(&program, ValueAnalysisLimits::default())

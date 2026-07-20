@@ -43,7 +43,7 @@ pub struct LinkedImage {
     pub map: String,
 }
 
-/// Exact NROM recovery input after assembly reconstruction.
+/// Exact cartridge recovery input after assembly reconstruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryLinkInput<'a> {
     /// Original 16-byte container header.
@@ -58,7 +58,7 @@ pub struct RecoveryLinkInput<'a> {
     pub trailing: &'a [u8],
 }
 
-/// Exact relink result for a recovered NROM project.
+/// Exact relink result for a recovered cartridge project.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredImage {
     /// Complete reconstructed container.
@@ -647,17 +647,17 @@ fn uxrom_trampoline(bank: u8, target: u16) -> Vec<u8> {
     ]
 }
 
-/// Relinks an exact Mapper 0 recovery image through the shared ROM builder.
+/// Relinks an exact supported recovery image through the shared ROM builder.
 ///
 /// This path does not perform ordinary section placement or rewrite vectors:
 /// those bytes are already explicit in the recovered assembly. It validates
-/// the reconstructed container and Mapper 0 layout before returning it.
+/// the reconstructed container and supported mapper layout before returning it.
 ///
 /// # Errors
 ///
 /// Returns a deterministic error for inconsistent container parts, malformed
-/// metadata, unsupported mappers, or invalid NROM capacities.
-pub fn relink_nrom(input: RecoveryLinkInput<'_>) -> Result<RecoveredImage, LinkError> {
+/// metadata, unsupported mappers, or invalid cartridge capacities.
+pub fn relink_recovery(input: RecoveryLinkInput<'_>) -> Result<RecoveredImage, LinkError> {
     let rom = nesc_rom::rebuild_exact(nesc_rom::ExactImageParts {
         header: input.header,
         trainer: input.trainer,
@@ -667,23 +667,48 @@ pub fn relink_nrom(input: RecoveryLinkInput<'_>) -> Result<RecoveredImage, LinkE
     })
     .map_err(|error| LinkError(error.to_string()))?;
     let cartridge = nesc_rom::parse(&rom).map_err(|error| LinkError(error.to_string()))?;
-    if cartridge.metadata.mapper != 0 {
+    match cartridge.metadata.mapper {
+        0 if !matches!(cartridge.prg_rom.len(), 0x4000 | 0x8000) => {
+            return Err(LinkError(
+                "Mapper 0 recovery requires 16 or 32 KiB PRG-ROM".to_owned(),
+            ));
+        }
+        2 if cartridge.prg_rom.len() < 0x8000 || cartridge.prg_rom.len() % 0x4000 != 0 => {
+            return Err(LinkError(
+                "Mapper 2 recovery requires at least two complete 16 KiB PRG-ROM banks".to_owned(),
+            ));
+        }
+        0 | 2 => {}
+        mapper => {
+            return Err(LinkError(format!(
+                "recovery relinking supports Mapper 0 and Mapper 2, not Mapper {mapper}"
+            )));
+        }
+    }
+    if !matches!(cartridge.chr_rom.len(), 0 | 0x2000) {
         return Err(LinkError(format!(
-            "recovery relinking supports Mapper 0, not Mapper {}",
+            "Mapper {} recovery requires 0 or 8 KiB CHR-ROM",
             cartridge.metadata.mapper
         )));
     }
-    if !matches!(cartridge.prg_rom.len(), 0x4000 | 0x8000) {
-        return Err(LinkError(
-            "Mapper 0 recovery requires 16 or 32 KiB PRG-ROM".to_owned(),
-        ));
-    }
-    if !matches!(cartridge.chr_rom.len(), 0 | 0x2000) {
-        return Err(LinkError(
-            "Mapper 0 recovery requires 0 or 8 KiB CHR-ROM".to_owned(),
-        ));
-    }
     Ok(RecoveredImage { rom, cartridge })
+}
+
+/// Relinks an exact Mapper 0 recovery image.
+///
+/// # Errors
+///
+/// Returns a deterministic error for non-NROM input or invalid reconstruction
+/// data.
+pub fn relink_nrom(input: RecoveryLinkInput<'_>) -> Result<RecoveredImage, LinkError> {
+    let recovered = relink_recovery(input)?;
+    if recovered.cartridge.metadata.mapper != 0 {
+        return Err(LinkError(format!(
+            "NROM recovery relinking does not accept Mapper {}",
+            recovered.cartridge.metadata.mapper
+        )));
+    }
+    Ok(recovered)
 }
 
 fn align(value: usize, alignment: usize) -> usize {
@@ -697,7 +722,7 @@ mod tests {
     };
     use nesc_rom::{Format, Mirroring, Region};
 
-    use super::{LinkConfig, RecoveryLinkInput, link, relink_nrom};
+    use super::{LinkConfig, RecoveryLinkInput, link, relink_nrom, relink_recovery};
 
     #[test]
     fn resolves_vectors_in_nrom() {
@@ -829,6 +854,37 @@ mod tests {
             trainer: cartridge.trainer.as_deref(),
             prg_rom: &cartridge.prg_rom,
             chr_rom: &cartridge.chr_rom,
+            trailing: &original[original.len() - 2..],
+        })
+        .expect("relink");
+        assert_eq!(rebuilt.rom, original);
+        assert_eq!(rebuilt.cartridge, cartridge);
+    }
+
+    #[test]
+    fn relinks_exact_uxrom_recovery_container() {
+        let cartridge = nesc_rom::Rom {
+            metadata: nesc_rom::Metadata {
+                format: Format::Nes2,
+                mapper: 2,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: 0x10000,
+                chr_rom_len: 0,
+            },
+            trainer: None,
+            prg_rom: vec![0xea; 0x10000],
+            chr_rom: Vec::new(),
+        };
+        let mut original = nesc_rom::build(&cartridge).expect("ROM");
+        original.extend_from_slice(&[0xde, 0xad]);
+        let rebuilt = relink_recovery(RecoveryLinkInput {
+            header: &original[..16],
+            trainer: None,
+            prg_rom: &cartridge.prg_rom,
+            chr_rom: &[],
             trailing: &original[original.len() - 2..],
         })
         .expect("relink");

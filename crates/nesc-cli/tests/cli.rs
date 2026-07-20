@@ -264,6 +264,141 @@ fn round_trips_exact_nrom_container_with_mirrored_code() {
 }
 
 #[test]
+fn round_trips_exact_uxrom_container_with_banked_code() {
+    let temporary = tempdir().expect("temporary directory");
+    let mut prg = vec![0xff; 4 * 16 * 1024];
+    prg[16 * 1024..16 * 1024 + 3].copy_from_slice(&[0xa9, 0x2a, 0x60]);
+    let fixed = 3 * 16 * 1024;
+    prg[fixed..fixed + 9].copy_from_slice(&[
+        0xa9, 0x01, // lda #1
+        0x8d, 0x00, 0x80, // sta $8000
+        0x20, 0x00, 0x80, // jsr $8000
+        0x60, // rts
+    ]);
+    let vectors = prg.len() - 6;
+    for offset in [0, 2, 4] {
+        prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+    }
+    let cartridge = Rom {
+        metadata: Metadata {
+            format: Format::Nes2,
+            mapper: 2,
+            submapper: 0,
+            mirroring: Mirroring::Horizontal,
+            battery: false,
+            region: Region::Ntsc,
+            prg_rom_len: prg.len(),
+            chr_rom_len: 0,
+        },
+        trainer: None,
+        prg_rom: prg,
+        chr_rom: Vec::new(),
+    };
+    let mut original = nesc_rom::build(&cartridge).expect("ROM");
+    original.extend_from_slice(&[0xde, 0xad]);
+    fs::write(temporary.path().join("banked.nes"), &original).expect("write ROM");
+
+    let disassembled = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "disassemble",
+            "banked.nes",
+            "--output",
+            "recovered",
+            "--round-trip-check",
+        ])
+        .output()
+        .expect("run nesc disassemble");
+    assert!(
+        disassembled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disassembled.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&disassembled.stdout).contains("exact ROM round trip verified")
+    );
+    let assembly =
+        fs::read_to_string(temporary.path().join("recovered/prg.asm")).expect("assembly");
+    assert!(assembly.contains(".nesc_prg_bank 1, $8000"));
+    assert!(assembly.contains(".nesc_prg_bank 3, $C000"));
+    assert!(assembly.contains("jsr L_prg01_8000"));
+    let analysis =
+        fs::read_to_string(temporary.path().join("recovered/analysis.txt")).expect("analysis");
+    assert!(analysis.contains("mapper-writes: 1"));
+    assert!(analysis.contains("resulting-bank=01"));
+    assert_eq!(
+        fs::read(temporary.path().join("recovered/trailing.bin")).expect("trailing"),
+        [0xde, 0xad]
+    );
+}
+
+#[test]
+fn round_trips_compiler_generated_uxrom() {
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "compiled-uxrom"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("compiled-uxrom");
+    let manifest_path = project.join("NesC.toml");
+    let manifest = fs::read_to_string(&manifest_path)
+        .expect("manifest")
+        .replace("\nmapper = 0\n", "\nmapper = 2\n")
+        .replace("prg-rom-kib = 32", "prg-rom-kib = 64");
+    fs::write(&manifest_path, manifest).expect("Mapper 2 manifest");
+    fs::write(
+        project.join("src/main.c"),
+        r#"#include <nes.h>
+
+NES_BANK(1) NES_NOINLINE u8 banked_color(void) { return 0x2Au8; }
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    nes_set_background_color(banked_color());
+    while (true) { nes_wait_frame(); }
+}
+"#,
+    )
+    .expect("source");
+    let built = nesc()
+        .current_dir(&project)
+        .arg("build")
+        .output()
+        .expect("run nesc build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let disassembled = nesc()
+        .current_dir(&project)
+        .args([
+            "disassemble",
+            "target/compiled-uxrom.nes",
+            "--output",
+            "target/recovered-uxrom",
+            "--round-trip-check",
+        ])
+        .output()
+        .expect("run nesc disassemble");
+    assert!(
+        disassembled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disassembled.stderr)
+    );
+    let assembly = fs::read_to_string(project.join("target/recovered-uxrom/prg.asm"))
+        .expect("recovered assembly");
+    assert!(assembly.contains(".nesc_prg_bank 1, $8000"));
+    assert!(assembly.contains("jsr L_prg01_8000"));
+    let analysis =
+        fs::read_to_string(project.join("target/recovered-uxrom/analysis.txt")).expect("analysis");
+    assert!(analysis.contains("mapper-write:"));
+    assert!(analysis.contains("resulting-bank=01"));
+}
+
+#[test]
 fn decompiles_mapper_zero_to_a_stable_rust_project() {
     let temporary = tempdir().expect("temporary directory");
     let mut prg = vec![0xff; 16 * 1024];

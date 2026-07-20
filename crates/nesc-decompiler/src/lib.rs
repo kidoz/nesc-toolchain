@@ -445,6 +445,12 @@ pub fn analyze(
     disassembly: &Disassembly,
     limits: AnalysisLimits,
 ) -> Result<Program, Vec<AnalysisError>> {
+    if disassembly.rom.metadata.mapper != 0 {
+        return Err(vec![AnalysisError::new(format!(
+            "semantic lifting currently supports Mapper 0, not Mapper {}",
+            disassembly.rom.metadata.mapper
+        ))]);
+    }
     if limits.max_blocks == 0
         || limits.max_functions == 0
         || limits.max_edges == 0
@@ -1642,6 +1648,7 @@ mod tests {
                     cpu_address: 0xc000,
                 },
                 prg_offset: 0x4000,
+                selected_prg_banks: vec![None],
                 rom_file_offset: 0x4010,
                 decoded,
             };

@@ -10,6 +10,8 @@ use nesc_object::{
     SymbolKind,
 };
 
+const PRG_BANK_LEN: usize = 16 * 1024;
+
 /// Resource bounds applied while parsing generated recovery assembly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssemblyLimits {
@@ -132,6 +134,10 @@ enum Statement {
         symbol: String,
         bytes: u16,
     },
+    PrgBank {
+        bank: u16,
+        origin: u16,
+    },
     Origin(u16),
     Equate(String, u16),
     Label(String),
@@ -151,9 +157,10 @@ struct LocatedStatement {
 
 /// Assembles the deterministic source subset emitted by `nesc-disasm`.
 ///
-/// The accepted subset includes `.setcpu`, `.segment`, `.org`, `.byte`,
-/// absolute symbol assignments, labels, and every official 6502 instruction.
-/// It deliberately rejects undocumented opcodes and unrelated directives.
+/// The accepted subset includes `.setcpu`, `.segment`, `.org`,
+/// `.nesc_prg_bank`, `.byte`, absolute symbol assignments, labels, and every
+/// official 6502 instruction. It deliberately rejects undocumented opcodes
+/// and unrelated directives.
 ///
 /// # Errors
 ///
@@ -186,6 +193,7 @@ pub fn assemble_recovery(
                     format!("recovery assembly does not support segment `{name}`"),
                 ));
             }
+            Statement::PrgBank { .. } => {}
             Statement::Export(_)
             | Statement::Import(_)
             | Statement::Bank(_)
@@ -282,7 +290,10 @@ pub fn assemble_inline_with_calls(
                 }
                 expected_len = expected_len.saturating_add(usize::from(opcode.len()));
             }
-            Statement::SetCpu | Statement::Segment(_) | Statement::Origin(_) => {
+            Statement::SetCpu
+            | Statement::Segment(_)
+            | Statement::Origin(_)
+            | Statement::PrgBank { .. } => {
                 return Err(AssemblyError::at(
                     located.line,
                     "inline assembly cannot change the CPU, segment, or origin",
@@ -365,6 +376,12 @@ pub fn assemble_module(
                 return Err(AssemblyError::at(
                     located.line,
                     "relocatable assembly modules cannot set an origin",
+                ));
+            }
+            Statement::PrgBank { .. } => {
+                return Err(AssemblyError::at(
+                    located.line,
+                    "relocatable assembly modules cannot select a physical PRG bank",
                 ));
             }
             Statement::Equate(name, value) => {
@@ -596,6 +613,7 @@ pub fn assemble_module(
             | Statement::Export(_)
             | Statement::Import(_)
             | Statement::Bank(_)
+            | Statement::PrgBank { .. }
             | Statement::Stack { .. } => {}
         }
     }
@@ -792,6 +810,18 @@ fn parse_statement(text: &str, line: usize) -> Result<Statement, AssemblyError> 
             parse_u16(bank, line).map(|bank| Statement::Bank(SectionPlacement::Bank(bank)))
         };
     }
+    if let Some(value) = text.strip_prefix(".nesc_prg_bank ") {
+        let Some((bank, origin)) = value.split_once(',') else {
+            return Err(AssemblyError::at(
+                line,
+                "`.nesc_prg_bank` requires `bank, origin`",
+            ));
+        };
+        return Ok(Statement::PrgBank {
+            bank: parse_u16(bank.trim(), line)?,
+            origin: parse_u16(origin.trim(), line)?,
+        });
+    }
     if let Some(value) = text.strip_prefix(".org ") {
         return parse_u16(value.trim(), line).map(Statement::Origin);
     }
@@ -862,6 +892,7 @@ fn collect_symbols(
     for located in statements {
         match &located.statement {
             Statement::Origin(origin) => pc = Some(u32::from(*origin)),
+            Statement::PrgBank { origin, .. } => pc = Some(u32::from(*origin)),
             Statement::Equate(name, value) => {
                 insert_symbol(&mut symbols, name, *value, located.line, limits)?;
             }
@@ -927,6 +958,24 @@ fn emit(
                         format!(
                             "`.org` changes the location from ${:04X} to ${origin:04X}",
                             current as u16
+                        ),
+                    ));
+                }
+                pc = Some(u32::from(*origin));
+            }
+            Statement::PrgBank { bank, origin } => {
+                let expected_offset =
+                    usize::from(*bank)
+                        .checked_mul(PRG_BANK_LEN)
+                        .ok_or_else(|| {
+                            AssemblyError::at(located.line, "physical PRG bank offset overflows")
+                        })?;
+                if output.len() != expected_offset {
+                    return Err(AssemblyError::at(
+                        located.line,
+                        format!(
+                            "physical PRG bank {bank} begins at output offset ${:05X}, expected ${expected_offset:05X}",
+                            output.len()
                         ),
                     ));
                 }

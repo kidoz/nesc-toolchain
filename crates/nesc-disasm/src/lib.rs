@@ -108,6 +108,8 @@ pub struct Instruction {
     pub address: BankAddress,
     /// Physical byte offset within PRG-ROM.
     pub prg_offset: usize,
+    /// Mapper 2 switchable-bank states observed while this instruction executes.
+    pub selected_prg_banks: Vec<Option<u16>>,
     /// Byte offset within the original ROM container.
     pub rom_file_offset: usize,
     /// Exact official instruction decoding.
@@ -134,7 +136,22 @@ pub struct AnalysisNotice {
     pub message: String,
 }
 
-/// Complete NROM recursive-analysis result.
+/// Statically observed write to a mapper register.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MapperWrite {
+    /// Instruction performing the write.
+    pub source: BankAddress,
+    /// Physical source offset.
+    pub prg_offset: usize,
+    /// CPU mapper-register address, when statically exact.
+    pub register_address: Option<u16>,
+    /// Written value, when statically known.
+    pub value: Option<u8>,
+    /// Physical switchable PRG bank selected by the write, when known.
+    pub resulting_bank: Option<u16>,
+}
+
+/// Complete mapper-aware recursive-analysis result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Disassembly {
     /// Parsed cartridge, including original PRG and CHR bytes.
@@ -149,6 +166,8 @@ pub struct Disassembly {
     pub entry_points: Vec<EntryPoint>,
     /// Explicit unresolved control-flow records.
     pub unresolved: Vec<UnresolvedFlow>,
+    /// Mapper-register writes discovered during traversal.
+    pub mapper_writes: Vec<MapperWrite>,
     /// Non-fatal analysis notices.
     pub notices: Vec<AnalysisNotice>,
 }
@@ -272,12 +291,7 @@ impl Disassembly {
             let prg_offset = file_offset - prg_start;
             let bank = physical_bank(prg_offset);
             let bank_offset = prg_offset % PRG_BANK_LEN;
-            let cpu_base = if self.rom.prg_rom.len() == PRG_BANK_LEN {
-                0xc000
-            } else {
-                0x8000
-            };
-            let cpu_address = cpu_base + u16::try_from(prg_offset).unwrap_or(0);
+            let cpu_address = cpu_address_for_offset(&self.rom, prg_offset);
             return format!(
                 "PRG-ROM physical bank {bank:02X}, bank offset ${bank_offset:04X}, CPU ${cpu_address:04X}"
             );
@@ -328,27 +342,27 @@ impl fmt::Display for DisassemblyError {
 
 impl Error for DisassemblyError {}
 
-/// Parses and recursively analyzes an NROM image.
+/// Parses and recursively analyzes a supported Mapper 0 or Mapper 2 image.
 ///
 /// # Errors
 ///
 /// Returns a diagnostic for malformed input, an unsupported mapper, an
-/// impossible NROM layout, or exhausted analysis limits.
+/// impossible cartridge layout, or exhausted analysis limits.
 pub fn disassemble(bytes: &[u8], limits: AnalysisLimits) -> Result<Disassembly, DisassemblyError> {
     let rom = nesc_rom::parse(bytes).map_err(|error| DisassemblyError::new(error.to_string()))?;
     disassemble_rom(rom, limits)
 }
 
-/// Recursively analyzes a parsed NROM image.
+/// Recursively analyzes a parsed Mapper 0 or Mapper 2 image.
 ///
 /// # Errors
 ///
 /// Returns a diagnostic for an unsupported mapper, an impossible layout, or
 /// exhausted analysis limits.
 pub fn disassemble_rom(rom: Rom, limits: AnalysisLimits) -> Result<Disassembly, DisassemblyError> {
-    if rom.metadata.mapper != 0 {
+    if !matches!(rom.metadata.mapper, 0 | 2) {
         return Err(DisassemblyError::new(format!(
-            "recursive disassembly currently supports Mapper 0, not Mapper {}",
+            "recursive disassembly supports Mapper 0 and Mapper 2, not Mapper {}",
             rom.metadata.mapper
         )));
     }
@@ -357,7 +371,7 @@ pub fn disassemble_rom(rom: Rom, limits: AnalysisLimits) -> Result<Disassembly, 
             "analysis limits must permit at least one instruction and work item",
         ));
     }
-    let mapper = Mapper::new(0, rom.prg_rom.len(), rom.chr_rom.len())
+    let mapper = Mapper::new(rom.metadata.mapper, rom.prg_rom.len(), rom.chr_rom.len())
         .map_err(|error| DisassemblyError::new(error.to_string()))?;
     Analyzer::new(rom, mapper, limits).run()
 }
@@ -371,10 +385,44 @@ struct Analyzer {
     labels: BTreeMap<(usize, u16), String>,
     entry_points: Vec<EntryPoint>,
     unresolved: Vec<UnresolvedFlow>,
+    mapper_writes: Vec<MapperWrite>,
     notices: Vec<AnalysisNotice>,
-    work: VecDeque<u16>,
-    queued: HashSet<(usize, u16)>,
+    work: VecDeque<WorkItem>,
+    queued: HashSet<WorkItem>,
+    visited: HashSet<WorkItem>,
     work_items: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct WorkItem {
+    cpu_address: u16,
+    state: AbstractState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct AbstractState {
+    selected_prg_bank: Option<u8>,
+    a: Option<u8>,
+    x: Option<u8>,
+    y: Option<u8>,
+}
+
+impl AbstractState {
+    const fn reset() -> Self {
+        Self {
+            selected_prg_bank: Some(0),
+            a: None,
+            x: None,
+            y: None,
+        }
+    }
+
+    const fn forget_call_clobbers(mut self) -> Self {
+        self.a = None;
+        self.x = None;
+        self.y = None;
+        self
+    }
 }
 
 impl Analyzer {
@@ -389,9 +437,11 @@ impl Analyzer {
             labels: BTreeMap::new(),
             entry_points: Vec::new(),
             unresolved: Vec::new(),
+            mapper_writes: Vec::new(),
             notices: Vec::new(),
             work: VecDeque::new(),
             queued: HashSet::new(),
+            visited: HashSet::new(),
             work_items: 0,
         }
     }
@@ -400,8 +450,8 @@ impl Analyzer {
         self.seed_vector(VectorKind::Nmi, NMI_VECTOR)?;
         self.seed_vector(VectorKind::Reset, RESET_VECTOR)?;
         self.seed_vector(VectorKind::Irq, IRQ_VECTOR)?;
-        while let Some(address) = self.work.pop_front() {
-            self.walk(address)?;
+        while let Some(item) = self.work.pop_front() {
+            self.walk(item)?;
         }
         self.classification.iter_mut().for_each(|classification| {
             if *classification == ByteClassification::Unknown {
@@ -427,6 +477,7 @@ impl Analyzer {
             labels,
             entry_points: self.entry_points,
             unresolved: self.unresolved,
+            mapper_writes: self.mapper_writes,
             notices: self.notices,
         })
     }
@@ -436,14 +487,15 @@ impl Analyzer {
         kind: VectorKind,
         vector_address: u16,
     ) -> Result<(), DisassemblyError> {
-        let Some(destination) = self.read_mapped_word(vector_address) else {
+        let state = AbstractState::reset();
+        let Some(destination) = self.read_mapped_word(vector_address, state) else {
             self.notice(format!(
                 "{} vector at ${vector_address:04X} is not readable from PRG-ROM",
                 kind.name()
             ));
             return Ok(());
         };
-        let Some(prg_offset) = self.map_cpu(destination) else {
+        let Some(prg_offset) = self.map_cpu(destination, state) else {
             self.notice(format!(
                 "{} vector targets unmapped CPU address ${destination:04X}",
                 kind.name()
@@ -465,83 +517,125 @@ impl Analyzer {
             prg_offset,
             label,
         });
-        self.enqueue(destination)
+        self.enqueue(destination, state)
     }
 
-    fn walk(&mut self, mut cpu_address: u16) -> Result<(), DisassemblyError> {
+    fn walk(&mut self, item: WorkItem) -> Result<(), DisassemblyError> {
+        let mut cpu_address = item.cpu_address;
+        let mut state = item.state;
         loop {
-            let Some(prg_offset) = self.map_cpu(cpu_address) else {
+            let current = WorkItem { cpu_address, state };
+            if !self.visited.insert(current) {
+                return Ok(());
+            }
+            let Some(prg_offset) = self.map_cpu(cpu_address, state) else {
+                self.notice(format!(
+                    "cannot map CPU address ${cpu_address:04X} with an unknown Mapper 2 bank"
+                ));
                 return Ok(());
             };
-            if let Some(existing) = self.instructions.get(&prg_offset) {
-                if existing.address.cpu_address != cpu_address {
+            let existing = self
+                .instructions
+                .get(&prg_offset)
+                .map(|instruction| (instruction.address.cpu_address, instruction.decoded));
+            let decoded = if let Some((existing_address, decoded)) = existing {
+                if existing_address != cpu_address {
                     self.notice(format!(
                         "physical PRG offset ${prg_offset:05X} is reached through aliases ${:04X} and ${cpu_address:04X}",
-                        existing.address.cpu_address
+                        existing_address
                     ));
                 }
-                return Ok(());
-            }
-            if self.classification[prg_offset] == ByteClassification::CodeOperand {
-                self.notice(format!(
-                    "control flow enters an instruction operand at PRG offset ${prg_offset:05X}"
-                ));
-                return Ok(());
-            }
-            if self.instructions.len() >= self.limits.max_instructions {
-                return Err(DisassemblyError::new(format!(
-                    "instruction analysis limit {} exceeded",
-                    self.limits.max_instructions
-                )));
-            }
-            let decoded = match decode(&self.rom.prg_rom[prg_offset..]) {
-                Ok(decoded) => decoded,
-                Err(DecodeError::UnsupportedOpcode(_)) | Err(DecodeError::Truncated { .. }) => {
-                    self.classification[prg_offset] = ByteClassification::Data;
+                decoded
+            } else {
+                if self.classification[prg_offset] == ByteClassification::CodeOperand {
+                    self.notice(format!(
+                        "control flow enters an instruction operand at PRG offset ${prg_offset:05X}"
+                    ));
                     return Ok(());
                 }
-                Err(DecodeError::EmptyInput) => return Ok(()),
+                if self.instructions.len() >= self.limits.max_instructions {
+                    return Err(DisassemblyError::new(format!(
+                        "instruction analysis limit {} exceeded",
+                        self.limits.max_instructions
+                    )));
+                }
+                let decoded = match self.decode_mapped(cpu_address, prg_offset, state) {
+                    Ok(decoded) => decoded,
+                    Err(DecodeError::UnsupportedOpcode(_)) | Err(DecodeError::Truncated { .. }) => {
+                        self.classification[prg_offset] = ByteClassification::Data;
+                        return Ok(());
+                    }
+                    Err(DecodeError::EmptyInput) => return Ok(()),
+                };
+                let instruction_len = decoded.bytes().len();
+                let end = prg_offset + instruction_len;
+                if self.classification[prg_offset + 1..end].contains(&ByteClassification::Code) {
+                    self.classification[prg_offset] = ByteClassification::Data;
+                    self.notice(format!(
+                        "instruction at ${cpu_address:04X} overlaps an existing code start"
+                    ));
+                    return Ok(());
+                }
+                self.classification[prg_offset] = ByteClassification::Code;
+                self.classification[prg_offset + 1..end].fill(ByteClassification::CodeOperand);
+                decoded
             };
-            let instruction_len = decoded.bytes().len();
-            let end = prg_offset + instruction_len;
-            if self.classification[prg_offset + 1..end].contains(&ByteClassification::Code) {
-                self.classification[prg_offset] = ByteClassification::Data;
-                self.notice(format!(
-                    "instruction at ${cpu_address:04X} overlaps an existing code start"
-                ));
-                return Ok(());
-            }
-            self.classification[prg_offset] = ByteClassification::Code;
-            self.classification[prg_offset + 1..end].fill(ByteClassification::CodeOperand);
             let address = BankAddress {
                 bank: physical_bank(prg_offset),
                 cpu_address,
             };
             let flow = decoded.opcode.flow();
             let operand = decoded.operand();
-            self.instructions.insert(
-                prg_offset,
-                Instruction {
+            let selected_prg_bank = (self.rom.metadata.mapper == 2)
+                .then(|| {
+                    state.selected_prg_bank.and_then(|bank| {
+                        self.mapper
+                            .map_cpu(
+                                CpuAddress(0x8000),
+                                MapperState {
+                                    prg_bank: bank,
+                                    chr_bank: 0,
+                                },
+                            )
+                            .map(|offset| physical_bank(offset.0))
+                    })
+                })
+                .flatten();
+            let rom_file_offset = self.prg_file_start() + prg_offset;
+            self.instructions
+                .entry(prg_offset)
+                .and_modify(|instruction| {
+                    if !instruction.selected_prg_banks.contains(&selected_prg_bank) {
+                        instruction.selected_prg_banks.push(selected_prg_bank);
+                        instruction.selected_prg_banks.sort_unstable();
+                    }
+                })
+                .or_insert(Instruction {
                     address,
                     prg_offset,
-                    rom_file_offset: self.prg_file_start() + prg_offset,
+                    selected_prg_banks: vec![selected_prg_bank],
+                    rom_file_offset,
                     decoded,
-                },
-            );
+                });
             let next = cpu_address.wrapping_add(u16::from(decoded.opcode.len()));
+            self.apply_instruction_state(address, prg_offset, decoded, &mut state);
             match flow {
                 FlowControl::Fallthrough => cpu_address = next,
                 FlowControl::Branch => {
                     let target = next.wrapping_add_signed(i16::from(decoded.bytes()[1] as i8));
-                    self.follow_direct(address, prg_offset, flow, target)?;
+                    self.follow_direct(address, prg_offset, flow, target, state)?;
                     cpu_address = next;
                 }
                 FlowControl::Call => {
-                    self.follow_direct(address, prg_offset, flow, operand)?;
+                    self.follow_direct(address, prg_offset, flow, operand, state)?;
+                    state = state.forget_call_clobbers();
+                    if self.rom.metadata.mapper == 2 {
+                        state.selected_prg_bank = None;
+                    }
                     cpu_address = next;
                 }
                 FlowControl::Jump => {
-                    self.follow_direct(address, prg_offset, flow, operand)?;
+                    self.follow_direct(address, prg_offset, flow, operand, state)?;
                     return Ok(());
                 }
                 FlowControl::IndirectJump => {
@@ -564,8 +658,9 @@ impl Analyzer {
         prg_offset: usize,
         flow: FlowControl,
         target: u16,
+        state: AbstractState,
     ) -> Result<(), DisassemblyError> {
-        let Some(target_offset) = self.map_cpu(target) else {
+        let Some(target_offset) = self.map_cpu(target, state) else {
             self.unresolved.push(UnresolvedFlow {
                 source,
                 prg_offset,
@@ -577,14 +672,15 @@ impl Analyzer {
         self.labels
             .entry((target_offset, target))
             .or_insert_with(|| synthetic_label(target_offset, target));
-        self.enqueue(target)
+        self.enqueue(target, state)
     }
 
-    fn enqueue(&mut self, cpu_address: u16) -> Result<(), DisassemblyError> {
-        let Some(prg_offset) = self.map_cpu(cpu_address) else {
+    fn enqueue(&mut self, cpu_address: u16, state: AbstractState) -> Result<(), DisassemblyError> {
+        if self.map_cpu(cpu_address, state).is_none() {
             return Ok(());
-        };
-        if !self.queued.insert((prg_offset, cpu_address)) {
+        }
+        let item = WorkItem { cpu_address, state };
+        if !self.queued.insert(item) {
             return Ok(());
         }
         if self.work_items >= self.limits.max_work_items {
@@ -594,25 +690,209 @@ impl Analyzer {
             )));
         }
         self.work_items += 1;
-        self.work.push_back(cpu_address);
+        self.work.push_back(item);
         Ok(())
     }
 
-    fn read_mapped_word(&self, address: u16) -> Option<u16> {
+    fn read_mapped_word(&self, address: u16, state: AbstractState) -> Option<u16> {
         let low = self
-            .map_cpu(address)
+            .map_cpu(address, state)
             .and_then(|offset| self.rom.prg_rom.get(offset))?;
         let high = self
-            .map_cpu(address.wrapping_add(1))
+            .map_cpu(address.wrapping_add(1), state)
             .and_then(|offset| self.rom.prg_rom.get(offset))?;
         Some(u16::from_le_bytes([*low, *high]))
     }
 
-    fn map_cpu(&self, address: u16) -> Option<usize> {
+    fn map_cpu(&self, address: u16, state: AbstractState) -> Option<usize> {
+        if self.rom.metadata.mapper == 2 && address < 0xc000 && state.selected_prg_bank.is_none() {
+            return None;
+        }
         self.mapper
-            .map_cpu(CpuAddress(address), MapperState::default())
+            .map_cpu(
+                CpuAddress(address),
+                MapperState {
+                    prg_bank: state.selected_prg_bank.unwrap_or(0),
+                    chr_bank: 0,
+                },
+            )
             .map(|offset| offset.0)
             .filter(|offset| *offset < self.rom.prg_rom.len())
+    }
+
+    fn decode_mapped(
+        &mut self,
+        cpu_address: u16,
+        prg_offset: usize,
+        state: AbstractState,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let first = *self
+            .rom
+            .prg_rom
+            .get(prg_offset)
+            .ok_or(DecodeError::EmptyInput)?;
+        let metadata = opcode(first).ok_or(DecodeError::UnsupportedOpcode(first))?;
+        let required = usize::from(metadata.len());
+        let mut bytes = Vec::with_capacity(required);
+        for index in 0..required {
+            let address = cpu_address.wrapping_add(u16::try_from(index).unwrap_or(0));
+            let Some(mapped) = self.map_cpu(address, state) else {
+                return Err(DecodeError::Truncated {
+                    opcode: first,
+                    required,
+                    available: index,
+                });
+            };
+            if mapped != prg_offset + index {
+                self.notice(format!(
+                    "instruction at prg:{:02X}:${cpu_address:04X} crosses a noncontiguous mapper window and remains data",
+                    physical_bank(prg_offset)
+                ));
+                return Err(DecodeError::Truncated {
+                    opcode: first,
+                    required,
+                    available: index,
+                });
+            }
+            bytes.push(self.rom.prg_rom[mapped]);
+        }
+        decode(&bytes)
+    }
+
+    fn apply_instruction_state(
+        &mut self,
+        source: BankAddress,
+        prg_offset: usize,
+        decoded: DecodedInstruction,
+        state: &mut AbstractState,
+    ) {
+        if self.rom.metadata.mapper == 2 {
+            let stored_value = match decoded.opcode.mnemonic {
+                Mnemonic::Sta => state.a,
+                Mnemonic::Stx => state.x,
+                Mnemonic::Sty => state.y,
+                _ => None,
+            };
+            let writes_memory = matches!(
+                decoded.opcode.mnemonic,
+                Mnemonic::Sta
+                    | Mnemonic::Stx
+                    | Mnemonic::Sty
+                    | Mnemonic::Asl
+                    | Mnemonic::Lsr
+                    | Mnemonic::Rol
+                    | Mnemonic::Ror
+                    | Mnemonic::Inc
+                    | Mnemonic::Dec
+            ) && decoded.opcode.mode != AddressingMode::Accumulator;
+            let register_address =
+                if writes_memory && decoded.opcode.mode == AddressingMode::Absolute {
+                    (decoded.operand() >= 0x8000).then_some(decoded.operand())
+                } else {
+                    None
+                };
+            let uncertain_mapper_store = writes_memory
+                && match decoded.opcode.mode {
+                    AddressingMode::AbsoluteX | AddressingMode::AbsoluteY => {
+                        decoded.operand() >= 0x7f01
+                    }
+                    AddressingMode::IndexedIndirect | AddressingMode::IndirectIndexed => true,
+                    _ => false,
+                };
+            if register_address.is_some() || uncertain_mapper_store {
+                state.selected_prg_bank = if register_address.is_some() {
+                    stored_value
+                } else {
+                    None
+                };
+                let resulting_bank = state.selected_prg_bank.and_then(|bank| {
+                    self.mapper
+                        .map_cpu(
+                            CpuAddress(0x8000),
+                            MapperState {
+                                prg_bank: bank,
+                                chr_bank: 0,
+                            },
+                        )
+                        .map(|offset| physical_bank(offset.0))
+                });
+                let write = MapperWrite {
+                    source,
+                    prg_offset,
+                    register_address,
+                    value: stored_value,
+                    resulting_bank,
+                };
+                if !self.mapper_writes.contains(&write) {
+                    self.mapper_writes.push(write);
+                }
+            }
+        }
+
+        let immediate =
+            (decoded.opcode.mode == AddressingMode::Immediate).then_some(decoded.operand() as u8);
+        match decoded.opcode.mnemonic {
+            Mnemonic::Lda => state.a = immediate,
+            Mnemonic::Ldx => state.x = immediate,
+            Mnemonic::Ldy => state.y = immediate,
+            Mnemonic::Tax => state.x = state.a,
+            Mnemonic::Tay => state.y = state.a,
+            Mnemonic::Txa => state.a = state.x,
+            Mnemonic::Tya => state.a = state.y,
+            Mnemonic::Tsx => state.x = None,
+            Mnemonic::Pla => state.a = None,
+            Mnemonic::Inx => state.x = state.x.map(|value| value.wrapping_add(1)),
+            Mnemonic::Dex => state.x = state.x.map(|value| value.wrapping_sub(1)),
+            Mnemonic::Iny => state.y = state.y.map(|value| value.wrapping_add(1)),
+            Mnemonic::Dey => state.y = state.y.map(|value| value.wrapping_sub(1)),
+            Mnemonic::And => state.a = state.a.zip(immediate).map(|(left, right)| left & right),
+            Mnemonic::Eor => state.a = state.a.zip(immediate).map(|(left, right)| left ^ right),
+            Mnemonic::Ora => state.a = state.a.zip(immediate).map(|(left, right)| left | right),
+            Mnemonic::Adc | Mnemonic::Sbc => state.a = None,
+            Mnemonic::Asl | Mnemonic::Lsr | Mnemonic::Rol | Mnemonic::Ror
+                if decoded.opcode.mode == AddressingMode::Accumulator =>
+            {
+                state.a = None;
+            }
+            Mnemonic::Bcc
+            | Mnemonic::Bcs
+            | Mnemonic::Beq
+            | Mnemonic::Bit
+            | Mnemonic::Bmi
+            | Mnemonic::Bne
+            | Mnemonic::Bpl
+            | Mnemonic::Brk
+            | Mnemonic::Bvc
+            | Mnemonic::Bvs
+            | Mnemonic::Clc
+            | Mnemonic::Cld
+            | Mnemonic::Cli
+            | Mnemonic::Clv
+            | Mnemonic::Cmp
+            | Mnemonic::Cpx
+            | Mnemonic::Cpy
+            | Mnemonic::Dec
+            | Mnemonic::Inc
+            | Mnemonic::Jmp
+            | Mnemonic::Jsr
+            | Mnemonic::Nop
+            | Mnemonic::Pha
+            | Mnemonic::Php
+            | Mnemonic::Plp
+            | Mnemonic::Rti
+            | Mnemonic::Rts
+            | Mnemonic::Sec
+            | Mnemonic::Sed
+            | Mnemonic::Sei
+            | Mnemonic::Sta
+            | Mnemonic::Stx
+            | Mnemonic::Sty
+            | Mnemonic::Txs
+            | Mnemonic::Asl
+            | Mnemonic::Lsr
+            | Mnemonic::Rol
+            | Mnemonic::Ror => {}
+        }
     }
 
     fn prg_file_start(&self) -> usize {
@@ -630,16 +910,29 @@ fn physical_bank(prg_offset: usize) -> u16 {
     u16::try_from(prg_offset / PRG_BANK_LEN).unwrap_or(u16::MAX)
 }
 
+fn cpu_address_for_offset(rom: &Rom, prg_offset: usize) -> u16 {
+    let bank_offset = u16::try_from(prg_offset % PRG_BANK_LEN).unwrap_or(0);
+    match rom.metadata.mapper {
+        2 if prg_offset / PRG_BANK_LEN == rom.prg_rom.len() / PRG_BANK_LEN - 1 => {
+            0xc000 + bank_offset
+        }
+        2 => 0x8000 + bank_offset,
+        _ if rom.prg_rom.len() == PRG_BANK_LEN => 0xc000 + bank_offset,
+        _ => 0x8000 + u16::try_from(prg_offset).unwrap_or(0),
+    }
+}
+
 fn synthetic_label(prg_offset: usize, cpu_address: u16) -> String {
     format!("L_prg{:02X}_{cpu_address:04X}", physical_bank(prg_offset))
 }
 
 fn render_assembly(disassembly: &Disassembly) -> String {
-    let mut assembly = String::from(
-        "; Deterministic Mapper 0 recovery generated by nesc-toolchain\n\
+    let mapper = disassembly.rom.metadata.mapper;
+    let mut assembly = format!(
+        "; Deterministic Mapper {mapper} recovery generated by nesc-toolchain\n\
          ; Unproven and undocumented bytes remain explicit data.\n\
          .setcpu \"6502\"\n\
-         .segment \"PRG\"\n",
+         .segment \"PRG\"\n"
     );
     if !disassembly.labels.is_empty() {
         assembly.push_str("\n; Stable bank-qualified CPU symbols\n");
@@ -653,15 +946,17 @@ fn render_assembly(disassembly: &Disassembly) -> String {
     let mut offset = 0;
     while offset < disassembly.rom.prg_rom.len() {
         if offset % PRG_BANK_LEN == 0 {
-            let origin = if disassembly.rom.prg_rom.len() == PRG_BANK_LEN {
-                0xc000
+            let bank = physical_bank(offset);
+            let origin = cpu_address_for_offset(&disassembly.rom, offset);
+            if mapper == 2 {
+                assembly.push_str(&format!(
+                    "\n; Physical PRG bank {bank:02X}\n.nesc_prg_bank {bank}, ${origin:04X}\n"
+                ));
             } else {
-                0x8000 + u16::try_from(offset).unwrap_or(0)
-            };
-            assembly.push_str(&format!(
-                "\n; Physical PRG bank {:02X}\n.org ${origin:04X}\n",
-                physical_bank(offset)
-            ));
+                assembly.push_str(&format!(
+                    "\n; Physical PRG bank {bank:02X}\n.org ${origin:04X}\n"
+                ));
+            }
         }
         if let Some(instruction) = disassembly.instructions.get(&offset) {
             assembly.push_str("    ");
@@ -670,8 +965,22 @@ fn render_assembly(disassembly: &Disassembly) -> String {
                 assembly.push(' ');
                 assembly.push_str(&operand);
             }
+            let mapper_state = if mapper == 2 {
+                format!(
+                    " selected:{}",
+                    instruction
+                        .selected_prg_banks
+                        .iter()
+                        .map(|bank| bank
+                            .map_or_else(|| "?".to_owned(), |bank| format!("{bank:02X}")))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                )
+            } else {
+                String::new()
+            };
             assembly.push_str(&format!(
-                " ; prg:{:02X}:${:04X} file:${:05X}\n",
+                " ; prg:{:02X}:${:04X}{mapper_state} file:${:05X}\n",
                 instruction.address.bank,
                 instruction.address.cpu_address,
                 instruction.rom_file_offset
@@ -698,6 +1007,25 @@ fn render_assembly(disassembly: &Disassembly) -> String {
         }
         assembly.push_str(&format!(" ; PRG offset ${start:05X}\n"));
     }
+    if !disassembly.mapper_writes.is_empty() {
+        assembly.push_str("\n; Mapper writes\n");
+        for write in &disassembly.mapper_writes {
+            assembly.push_str(&format!(
+                "; prg:{:02X}:${:04X} address {} value {} resulting-bank {}\n",
+                write.source.bank,
+                write.source.cpu_address,
+                write
+                    .register_address
+                    .map_or_else(|| "unknown".to_owned(), |value| format!("${value:04X}")),
+                write
+                    .value
+                    .map_or_else(|| "unknown".to_owned(), |value| format!("${value:02X}")),
+                write
+                    .resulting_bank
+                    .map_or_else(|| "unknown".to_owned(), |value| format!("{value:02X}")),
+            ));
+        }
+    }
     if !disassembly.unresolved.is_empty() {
         assembly.push_str("\n; Unresolved control flow\n");
         for unresolved in &disassembly.unresolved {
@@ -717,8 +1045,9 @@ fn render_operand(disassembly: &Disassembly, instruction: &Instruction) -> Optio
     let decoded = instruction.decoded;
     let operand = decoded.operand();
     let byte = operand as u8;
-    let absolute_target =
-        || target_label(disassembly, operand).unwrap_or_else(|| format!("${operand:04X}"));
+    let absolute_target = || {
+        target_label(disassembly, instruction, operand).unwrap_or_else(|| format!("${operand:04X}"))
+    };
     match decoded.opcode.mode {
         AddressingMode::Implied => None,
         AddressingMode::Accumulator => Some("a".to_owned()),
@@ -749,20 +1078,30 @@ fn render_operand(disassembly: &Disassembly, instruction: &Instruction) -> Optio
     }
 }
 
-fn target_label(disassembly: &Disassembly, cpu_address: u16) -> Option<String> {
-    let mapper = Mapper::new(
-        disassembly.rom.metadata.mapper,
-        disassembly.rom.prg_rom.len(),
-        disassembly.rom.chr_rom.len(),
-    )
-    .ok()?;
-    let offset = mapper
-        .map_cpu(CpuAddress(cpu_address), MapperState::default())?
-        .0;
+fn target_label(
+    disassembly: &Disassembly,
+    instruction: &Instruction,
+    cpu_address: u16,
+) -> Option<String> {
+    let target_bank = if disassembly.rom.metadata.mapper == 2 {
+        if cpu_address >= 0xc000 {
+            u16::try_from(disassembly.rom.prg_rom.len() / PRG_BANK_LEN - 1).ok()?
+        } else if instruction.selected_prg_banks.len() == 1 {
+            instruction.selected_prg_banks[0]?
+        } else {
+            return None;
+        }
+    } else {
+        return disassembly
+            .labels
+            .iter()
+            .find(|label| label.address.cpu_address == cpu_address)
+            .map(|label| label.name.clone());
+    };
     disassembly
         .labels
         .iter()
-        .find(|label| label.prg_offset == offset && label.address.cpu_address == cpu_address)
+        .find(|label| label.address.cpu_address == cpu_address && label.address.bank == target_bank)
         .map(|label| label.name.clone())
 }
 
@@ -795,6 +1134,38 @@ mod tests {
             chr_rom: Vec::new(),
         })
         .expect("valid NROM")
+    }
+
+    fn uxrom_with_banked_call() -> Vec<u8> {
+        let mut prg = vec![0xff; 4 * 16 * 1024];
+        prg[16 * 1024..16 * 1024 + 3].copy_from_slice(&[0xa9, 0x2a, 0x60]);
+        let fixed = 3 * 16 * 1024;
+        prg[fixed..fixed + 9].copy_from_slice(&[
+            0xa9, 0x01, // lda #1
+            0x8d, 0x00, 0x80, // sta $8000
+            0x20, 0x00, 0x80, // jsr $8000
+            0x60, // rts
+        ]);
+        let vectors = prg.len() - 6;
+        for offset in [0, 2, 4] {
+            prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+        }
+        build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 2,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 0,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: Vec::new(),
+        })
+        .expect("valid UxROM")
     }
 
     #[test]
@@ -837,6 +1208,51 @@ mod tests {
     }
 
     #[test]
+    fn follows_known_uxrom_bank_writes_into_switchable_code() {
+        let rom = uxrom_with_banked_call();
+        let disassembly = disassemble(&rom, AnalysisLimits::default()).expect("disassembly");
+        disassembly.verify_recovery().expect("lossless recovery");
+        assert!(disassembly.instructions.contains_key(&(3 * 16 * 1024)));
+        assert!(disassembly.instructions.contains_key(&(16 * 1024)));
+        assert_eq!(disassembly.mapper_writes.len(), 1);
+        assert_eq!(disassembly.mapper_writes[0].value, Some(1));
+        assert_eq!(disassembly.mapper_writes[0].resulting_bank, Some(1));
+        assert!(
+            disassembly
+                .labels
+                .iter()
+                .any(|label| { label.address.bank == 1 && label.address.cpu_address == 0x8000 })
+        );
+        let assembly = disassembly.assembly();
+        assert!(assembly.contains("Deterministic Mapper 2 recovery"));
+        assert!(assembly.contains(".nesc_prg_bank 1, $8000"));
+        assert!(assembly.contains(".nesc_prg_bank 3, $C000"));
+        assert!(assembly.contains("jsr L_prg01_8000"));
+    }
+
+    #[test]
+    fn preserves_unknown_uxrom_bank_state_without_guessing_an_edge() {
+        let original = uxrom_with_banked_call();
+        let mut cartridge = nesc_rom::parse(&original).expect("UxROM parse");
+        let fixed = 3 * 16 * 1024;
+        cartridge.prg_rom[fixed..fixed + 10].copy_from_slice(&[
+            0xad, 0x00, 0x00, // lda $0000
+            0x8d, 0x00, 0x80, // sta $8000
+            0x20, 0x00, 0x80, // jsr $8000
+            0x60, // rts
+        ]);
+        let rom = build(&cartridge).expect("valid UxROM");
+        let disassembly = disassemble(&rom, AnalysisLimits::default()).expect("disassembly");
+        assert_eq!(disassembly.mapper_writes.len(), 1);
+        assert_eq!(disassembly.mapper_writes[0].value, None);
+        assert_eq!(disassembly.mapper_writes[0].resulting_bank, None);
+        assert!(!disassembly.instructions.contains_key(&(16 * 1024)));
+        assert!(disassembly.unresolved.iter().any(|flow| {
+            flow.source.bank == 3 && flow.target == 0x8000 && flow.flow == FlowControl::Call
+        }));
+    }
+
+    #[test]
     fn enforces_instruction_resource_limit() {
         let rom = nrom_with_program(&[0xea, 0xea, 0x60], 0xc000);
         let error = disassemble(
@@ -851,11 +1267,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_nrom_recursive_analysis() {
+    fn rejects_unsupported_mapper_recursive_analysis() {
         let mut rom = nrom_with_program(&[0x60], 0xc000);
-        rom[6] = 0x20;
-        let error = disassemble(&rom, AnalysisLimits::default()).expect_err("Mapper 2");
-        assert!(error.message().contains("Mapper 0"));
+        rom[6] = 0x30;
+        let error = disassemble(&rom, AnalysisLimits::default()).expect_err("Mapper 3");
+        assert!(error.message().contains("Mapper 0 and Mapper 2"));
     }
 
     #[test]
