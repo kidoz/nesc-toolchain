@@ -16,6 +16,7 @@ const MAX_ROM_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_METADATA_ENTRIES: usize = 100_000;
 const MAX_MEMORY_LENGTH: usize = 256;
 const TRACE_CAPACITY: usize = 256;
+const CYCLE_TRACE_CAPACITY: usize = 4_096;
 
 /// Bank-qualified debugger address.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -209,6 +210,11 @@ struct TraceEntry {
     source: Option<SourceLocation>,
 }
 
+enum InstructionExecution {
+    Complete(StepReport),
+    Watchpoint(String),
+}
+
 /// Deterministic ROM debugger session.
 pub struct DebugSession {
     machine: Machine,
@@ -222,6 +228,7 @@ pub struct DebugSession {
     next_stop_id: u32,
     trace_enabled: bool,
     trace: VecDeque<TraceEntry>,
+    cycle_trace: VecDeque<BusAccess>,
     instruction_limit: u64,
     cycle_limit: u64,
     pause: DebugPauseHandle,
@@ -311,6 +318,7 @@ impl DebugSession {
             next_stop_id: 1,
             trace_enabled: false,
             trace: VecDeque::new(),
+            cycle_trace: VecDeque::new(),
             instruction_limit: config.instruction_limit,
             cycle_limit: config.cycle_limit,
             pause: DebugPauseHandle::default(),
@@ -335,6 +343,7 @@ impl DebugSession {
                 require_count(name, &arguments, 0)?;
                 self.machine.reset()?;
                 self.trace.clear();
+                self.cycle_trace.clear();
                 self.resume(false)?
             }
             "continue" | "c" => {
@@ -410,6 +419,7 @@ impl DebugSession {
                 require_count(name, &arguments, 0)?;
                 self.machine.reset()?;
                 self.trace.clear();
+                self.cycle_trace.clear();
                 format!("Reset at {}\n", self.current_address())
             }
             "help" => help_text().to_owned(),
@@ -457,24 +467,24 @@ impl DebugSession {
     }
 
     fn step_once(&mut self, reason: &str) -> Result<String, DebugSessionError> {
-        let report = self.execute_one()?;
+        let report = match self.execute_one()? {
+            InstructionExecution::Complete(report) => report,
+            InstructionExecution::Watchpoint(stop) => return Ok(stop),
+        };
         if let Some(termination) = report.termination {
             return Ok(self.render_termination(termination));
-        }
-        if let Some(stop) = self.watchpoint_stop() {
-            return Ok(stop);
         }
         Ok(self.render_stop(reason))
     }
 
     fn step_cycle(&mut self) -> Result<String, DebugSessionError> {
         let cycle = self.execute_cycle()?;
+        if let Some(stop) = self.watchpoint_stop_for(cycle.access) {
+            return Ok(stop);
+        }
         if let Some(report) = cycle.step {
             if let Some(termination) = report.termination {
                 return Ok(self.render_termination(termination));
-            }
-            if let Some(stop) = self.watchpoint_stop() {
-                return Ok(stop);
             }
         }
         let position = self.machine.ppu_position();
@@ -525,15 +535,16 @@ impl DebugSession {
                 if self.machine.cycles().saturating_sub(initial_cycles) >= self.cycle_limit {
                     return Ok(self.render_stop("cycle limit"));
                 }
-                if let Some(report) = self.execute_cycle()?.step {
+                let cycle = self.execute_cycle()?;
+                if let Some(stop) = self.watchpoint_stop_for(cycle.access) {
+                    return Ok(stop);
+                }
+                if let Some(report) = cycle.step {
                     break report;
                 }
             };
             if let Some(termination) = report.termination {
                 return Ok(self.render_termination(termination));
-            }
-            if let Some(stop) = self.watchpoint_stop() {
-                return Ok(stop);
             }
         }
     }
@@ -550,11 +561,14 @@ impl DebugSession {
                 return Ok(self.render_stop("execution limit before next frame"));
             }
             let cycle = self.execute_cycle()?;
+            if let Some(stop) = self.watchpoint_stop_for(cycle.access) {
+                return Ok(stop);
+            }
             if let Some(report) = cycle.step {
                 if let Some(termination) = report.termination {
                     return Ok(self.render_termination(termination));
                 }
-                if let Some(stop) = self.watchpoint_stop().or_else(|| self.breakpoint_stop()) {
+                if let Some(stop) = self.breakpoint_stop() {
                     return Ok(stop);
                 }
             }
@@ -573,11 +587,14 @@ impl DebugSession {
             if self.limit_reached(initial_instructions, initial_cycles) {
                 return Ok(self.render_stop("execution limit before source change"));
             }
-            let report = self.execute_one()?;
+            let report = match self.execute_one()? {
+                InstructionExecution::Complete(report) => report,
+                InstructionExecution::Watchpoint(stop) => return Ok(stop),
+            };
             if let Some(termination) = report.termination {
                 return Ok(self.render_termination(termination));
             }
-            if let Some(stop) = self.watchpoint_stop().or_else(|| self.breakpoint_stop()) {
+            if let Some(stop) = self.breakpoint_stop() {
                 return Ok(stop);
             }
             if self.source_for(self.current_address()) != initial_source.as_ref() {
@@ -602,11 +619,14 @@ impl DebugSession {
             if self.limit_reached(initial_instructions, initial_cycles) {
                 return Ok(self.render_stop("execution limit while stepping over call"));
             }
-            let report = self.execute_one()?;
+            let report = match self.execute_one()? {
+                InstructionExecution::Complete(report) => report,
+                InstructionExecution::Watchpoint(stop) => return Ok(stop),
+            };
             if let Some(termination) = report.termination {
                 return Ok(self.render_termination(termination));
             }
-            if let Some(stop) = self.watchpoint_stop().or_else(|| self.breakpoint_stop()) {
+            if let Some(stop) = self.breakpoint_stop() {
                 return Ok(stop);
             }
             if self.machine.cpu().pc == return_address
@@ -628,11 +648,14 @@ impl DebugSession {
             if self.limit_reached(initial_instructions, initial_cycles) {
                 return Ok(self.render_stop("execution limit while finishing function"));
             }
-            let report = self.execute_one()?;
+            let report = match self.execute_one()? {
+                InstructionExecution::Complete(report) => report,
+                InstructionExecution::Watchpoint(stop) => return Ok(stop),
+            };
             if let Some(termination) = report.termination {
                 return Ok(self.render_termination(termination));
             }
-            if let Some(stop) = self.watchpoint_stop().or_else(|| self.breakpoint_stop()) {
+            if let Some(stop) = self.breakpoint_stop() {
                 return Ok(stop);
             }
             match report.opcode {
@@ -646,18 +669,16 @@ impl DebugSession {
         }
     }
 
-    fn execute_one(&mut self) -> Result<StepReport, DebugSessionError> {
-        if self.machine.instruction_pending() {
-            loop {
-                if let Some(report) = self.execute_cycle()?.step {
-                    return Ok(report);
-                }
+    fn execute_one(&mut self) -> Result<InstructionExecution, DebugSessionError> {
+        loop {
+            let cycle = self.execute_cycle()?;
+            if let Some(stop) = self.watchpoint_stop_for(cycle.access) {
+                return Ok(InstructionExecution::Watchpoint(stop));
+            }
+            if let Some(report) = cycle.step {
+                return Ok(InstructionExecution::Complete(report));
             }
         }
-        let address = self.current_address();
-        let report = self.machine.step()?;
-        self.record_trace(address, report);
-        Ok(report)
     }
 
     fn execute_cycle(&mut self) -> Result<CycleReport, DebugSessionError> {
@@ -665,6 +686,14 @@ impl DebugSession {
             self.pending_trace_address = Some(self.current_address());
         }
         let cycle = self.machine.step_cycle()?;
+        if self.trace_enabled {
+            if let Some(access) = cycle.access {
+                if self.cycle_trace.len() == CYCLE_TRACE_CAPACITY {
+                    self.cycle_trace.pop_front();
+                }
+                self.cycle_trace.push_back(access);
+            }
+        }
         if let Some(report) = cycle.step {
             let address = self.pending_trace_address.take().unwrap_or(DebugAddress {
                 bank: self.machine.mapped_prg_bank(report.pc),
@@ -758,21 +787,22 @@ impl DebugSession {
             .map(|(id, _)| self.render_stop(&format!("breakpoint {id}")))
     }
 
-    fn watchpoint_stop(&self) -> Option<String> {
+    fn watchpoint_stop_for(&self, access: Option<BusAccess>) -> Option<String> {
+        let access = access?;
         self.watchpoints.iter().find_map(|(id, watchpoint)| {
-            self.machine.last_bus_accesses().iter().find_map(|access| {
-                (watchpoint.address == access.address && watchpoint.kind.matches(access.kind))
-                    .then(|| self.render_watchpoint_stop(*id, *access))
-            })
+            (watchpoint.address == access.address && watchpoint.kind.matches(access.kind))
+                .then(|| self.render_watchpoint_stop(*id, access))
         })
     }
 
     fn render_watchpoint_stop(&self, id: u32, access: BusAccess) -> String {
         format!(
-            "Stopped at watchpoint {id}: {:?} ${:04X} = ${:02X}\n{}",
+            "Stopped at watchpoint {id} on cycle {}: {:?} ${:04X} = ${:02X}{}\n{}",
+            access.cycle,
             access.kind,
             access.address,
             access.value,
+            if access.dummy { " (dummy)" } else { "" },
             self.render_registers()
         )
     }
@@ -958,11 +988,11 @@ impl DebugSession {
         match arguments[0] {
             "on" => {
                 self.trace_enabled = true;
-                Ok("Instruction trace enabled.\n".to_owned())
+                Ok("Instruction and bus-clock trace enabled.\n".to_owned())
             }
             "off" => {
                 self.trace_enabled = false;
-                Ok("Instruction trace disabled.\n".to_owned())
+                Ok("Instruction and bus-clock trace disabled.\n".to_owned())
             }
             "show" => Ok(self.render_recent_trace(TRACE_CAPACITY)),
             value => Err(DebugSessionError::Command(format!(
@@ -972,21 +1002,46 @@ impl DebugSession {
     }
 
     fn render_recent_trace(&self, limit: usize) -> String {
-        if self.trace.is_empty() {
+        if self.trace.is_empty() && self.cycle_trace.is_empty() {
             return "Trace is empty.\n".to_owned();
         }
-        let mut text = String::from("Recent trace:\n");
-        let start = self.trace.len().saturating_sub(limit);
-        for entry in self.trace.iter().skip(start) {
-            text.push_str(&format!("  {}", entry.address));
-            if let Some(opcode) = entry.opcode {
-                text.push_str(&format!(" opcode=${opcode:02X}"));
+        let mut text = String::new();
+        if !self.trace.is_empty() {
+            text.push_str("Recent instructions:\n");
+            let start = self.trace.len().saturating_sub(limit);
+            for entry in self.trace.iter().skip(start) {
+                text.push_str(&format!("  {}", entry.address));
+                if let Some(opcode) = entry.opcode {
+                    text.push_str(&format!(" opcode=${opcode:02X}"));
+                }
+                text.push_str(&format!(" +{} cycles", entry.cycles));
+                if let Some(source) = &entry.source {
+                    text.push_str(&format!(" {source}"));
+                }
+                text.push('\n');
             }
-            text.push_str(&format!(" +{} cycles", entry.cycles));
-            if let Some(source) = &entry.source {
-                text.push_str(&format!(" {source}"));
+        }
+        if !self.cycle_trace.is_empty() {
+            text.push_str("Recent bus clocks:\n");
+            let start = self.cycle_trace.len().saturating_sub(limit);
+            for access in self.cycle_trace.iter().skip(start) {
+                let direction = match access.kind {
+                    BusAccessKind::Read => 'R',
+                    BusAccessKind::Write => 'W',
+                };
+                text.push_str(&format!(
+                    "  cycle {} pc=${:04X} {direction} ${:04X}=${:02X}{}",
+                    access.cycle,
+                    access.pc,
+                    access.address,
+                    access.value,
+                    if access.dummy { " dummy" } else { "" }
+                ));
+                if let Some(bank) = access.physical_bank {
+                    text.push_str(&format!(" bank={bank:03}"));
+                }
+                text.push('\n');
             }
-            text.push('\n');
         }
         text
     }
@@ -1361,6 +1416,32 @@ mod tests {
                 .text
                 .contains("2A")
         );
+    }
+
+    #[test]
+    fn stops_watchpoints_on_the_exact_bus_clock_and_traces_dummy_reads() {
+        let mut session = nrom_session();
+        session
+            .execute_command("watch-read $8000")
+            .expect("opcode watchpoint");
+        let stopped = session.execute_command("continue").expect("continue").text;
+        assert!(stopped.contains("watchpoint 1 on cycle 8"), "{stopped}");
+        assert!(session.machine.instruction_pending());
+        assert_eq!(session.machine.cpu().pc, 0x8000);
+
+        let mut session = nrom_session();
+        session.execute_command("step").expect("LDA");
+        session.execute_command("step").expect("STA");
+        session.execute_command("next").expect("JSR");
+        session.execute_command("trace on").expect("trace");
+        session
+            .execute_command("watch-read $8008")
+            .expect("dummy read watchpoint");
+        let stopped = session.execute_command("step").expect("NOP").text;
+        assert!(stopped.contains("Read $8008 = $4C (dummy)"), "{stopped}");
+        let trace = session.execute_command("trace show").expect("trace").text;
+        assert!(trace.contains("Recent bus clocks:"), "{trace}");
+        assert!(trace.contains("R $8008=$4C dummy"), "{trace}");
     }
 
     #[test]

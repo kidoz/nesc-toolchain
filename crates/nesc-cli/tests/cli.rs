@@ -311,7 +311,11 @@ fn build_and_inspect_generated_project() {
             "--command",
             "cartridge",
             "--command",
+            "trace on",
+            "--command",
             "step-cycle",
+            "--command",
+            "trace show",
             "--command",
             "ppu",
         ])
@@ -328,6 +332,7 @@ fn build_and_inspect_generated_project() {
     assert!(stdout.contains("src/main.c"), "{stdout}");
     assert!(stdout.contains("<main>"), "{stdout}");
     assert!(stdout.contains("instruction pending"), "{stdout}");
+    assert!(stdout.contains("Recent bus clocks:"), "{stdout}");
     assert!(stdout.contains("Timing: Ntsc"), "{stdout}");
 
     let mut interactive = nesc()
@@ -786,7 +791,11 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
             "--command",
             "cartridge",
             "--command",
+            "trace on",
+            "--command",
             "step-cycle",
+            "--command",
+            "trace show",
             "--command",
             "ppu",
         ])
@@ -805,6 +814,7 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
     );
     assert!(stdout.contains("Selected PRG bank: 1"), "{stdout}");
     assert!(stdout.contains("instruction pending"), "{stdout}");
+    assert!(stdout.contains("Recent bus clocks:"), "{stdout}");
     assert!(stdout.contains("Timing: Ntsc"), "{stdout}");
 
     let output = nesc()
