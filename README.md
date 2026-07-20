@@ -41,6 +41,9 @@ ROM. The toolkit is written in stable Rust 2024.
 - `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2
   `nesc disassemble`, Mapper 0/2 `nesc decompile --emit=nesc`, and
   Mapper 0/2 `nesc decompile --emit=rust` workflows
+- `nesc debug` inspection of verification summaries, interrupt and frame
+  checkpoints, sparse PPU/APU state, cartridge banks, event traces, and the
+  first structured divergence
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
 - Bank-qualified call graphs, recursive-component detection, evidence-scored
@@ -79,8 +82,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | Mapper 0/2 hybrid NesC translation with bounded dispatcher fallback | Available |
 | Mapper 0/2 original-versus-Rust differential verification | Available |
 | Mapper 0/2 original-versus-NesC differential verification with interrupt and multi-frame hardware checkpoints | Available |
+| Structured verification artifact inspection with `nesc debug` | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Complete PPU/APU timing and debugger integration | Planned |
+| Complete PPU/APU timing and interactive source debugger | Planned |
 
 ## Quick start
 
@@ -98,6 +102,8 @@ cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
   decompile target/demo.nes --emit=rust --verify --output target/demo-rust
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
   decompile target/demo.nes --emit=nesc --verify --output target/demo-nesc
+cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
+  debug target/demo-nesc --view checkpoints
 ```
 
 Expected output:
@@ -109,6 +115,7 @@ Built `demo` at target
 Disassembled `target/demo.nes` into target/demo-disassembly (..., exact ROM round trip verified)
 Decompiled `target/demo.nes` into target/demo-rust as host-side stable Rust (..., verified)
 Decompiled `target/demo.nes` into target/demo-nesc as hybrid NesC (..., verified with ... executions)
+No verification checkpoints recorded.
 ```
 
 The generated project contains:
@@ -255,6 +262,27 @@ Target-side NesC verification reserves `$7000-$7FFF` for its isolated RAM
 shadow, event log, and result record; an exercised source access to that
 workspace is rejected instead of being compared unsafely.
 
+## Verification artifact inspection
+
+Verified hybrid NesC output contains a versioned `verification.json`. Pass the
+file or its project directory to `nesc debug`:
+
+```bash
+nesc debug target/demo-nesc
+nesc debug target/demo-nesc --view checkpoints
+nesc debug target/demo-nesc --view ppu --checkpoint 0
+nesc debug target/demo-nesc --view apu --checkpoint 0
+nesc debug target/demo-nesc --view cartridge --checkpoint 0
+nesc debug target/demo-nesc --view trace --checkpoint 0
+nesc debug target/demo-nesc --view divergence
+```
+
+Checkpoint state is recorded after successful scheduled NMI, IRQ, and frame
+comparisons. Hardware arrays use sparse nonzero address/value entries to keep
+the artifact bounded. A failed verification still writes the artifact before
+returning its diagnostic, so `--view divergence` can show the first mismatch
+and recent original and generated semantic events.
+
 ```toml
 [cartridge]
 mapper = 2
@@ -324,6 +352,7 @@ concerns. Core implementation crates include:
 | `nesc-codegen-6502`, `nesc-runtime` | Machine-code selection and runtime support |
 | `nesc-object`, `nesc-linker`, `nesc-rom` | Relocatable objects, linking, and cartridge containers |
 | `nesc-emulator` | Deterministic generated-ROM verification |
+| `nesc-debug` | Structured verification artifact inspection |
 | `nesc-decompiler`, `nesc-decompile-runtime` | ROM analysis, stable Rust emission, and host execution |
 
 SDK declarations live under `sdk/include/`.
@@ -342,10 +371,9 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Complete PPU/APU timing and debugger integration
+1. Add interactive execution, breakpoints, watchpoints, and source mapping to the debugger
 2. Add Mapper 3 compilation and recovery
-3. Surface decompilation checkpoints and divergent hardware state in debugger traces
-4. Expand optimization quality and generated-code cost modeling
+3. Expand optimization quality and generated-code cost modeling
 
 ## License
 
