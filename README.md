@@ -11,8 +11,9 @@ to Ricoh 2A03/2A07 machine code and packages the result as an iNES or NES 2.0
 ROM. The toolkit is written in stable Rust 2024.
 
 > [!IMPORTANT]
-> The compiler currently generates Mapper 0 ROMs. Mapper-aware ROM models for
-> UxROM and CNROM exist. Recursive disassembly currently accepts Mapper 0 ROMs;
+> The compiler currently generates Mapper 0 (NROM) and Mapper 2 (UxROM) ROMs.
+> Mapper-aware ROM models for UxROM and CNROM exist. Recursive disassembly
+> currently accepts Mapper 0 ROMs;
 > SSA/value, call-graph, calling-convention, conservative type, and reducible
 > control-flow recovery support hybrid NesC and stable Rust 2024 translation
 > with bounded fallback. Differential verification is available for Rust output.
@@ -29,8 +30,9 @@ ROM. The toolkit is written in stable Rust 2024.
   call relocations, mapper-bank effects, and hardware-stack accounting
 - Relocatable standalone `.s` modules with typed NesC imports and exports,
   symbolic cross-module relocations, source maps, and stack contracts
-- Mapper 0 linking, iNES/NES 2.0 ROM construction, symbols, source maps, and
-  deterministic emulator boot verification
+- Mapper 0 and Mapper 2 linking, fixed/switchable bank placement, safe
+  cross-bank call trampolines, bank-qualified symbols, and deterministic
+  emulator boot verification
 - Public bounded emulator execution for all 151 official CPU opcodes, reset,
   interrupts, controller I/O, DMA, mapper writes, region timing, checkpoints,
   and first-divergence event traces
@@ -62,7 +64,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | HIR, MIR, verification, and optimization | Available |
 | Target-specific inline 6502 assembly | Available |
 | Standalone relocatable 6502 assembly modules | Available |
-| 6502 code generation and Mapper 0 linking | Available |
+| 6502 code generation and Mapper 0/2 linking | Available |
 | ROM construction and inspection | Available |
 | Official 6502 decoding and recursive Mapper 0 disassembly | Available |
 | Bank-qualified NROM CFG and semantic 6502 IR | Available as a library |
@@ -177,6 +179,7 @@ extern u8 fast_collision(u8 value);
 .setcpu "6502"
 .segment "CODE"
 .export fast_collision
+.nesc_bank fixed
 .nesc_stack fast_collision, 0
 
 fast_collision:
@@ -190,8 +193,40 @@ compiled NesC. `.import name` references another typed function; a compiled
 NesC definition must use `NES_EXPORT` before assembly may import it.
 `.nesc_stack name, bytes` declares the maximum extra hardware-stack use after
 entry, including nested `jsr` return addresses and explicit pushes but excluding
-the caller's `jsr` into the exported routine. Origins and undocumented opcodes
-are rejected in relocatable modules.
+the caller's `jsr` into the exported routine. `.nesc_bank fixed` keeps the whole
+module in the permanently mapped bank; `.nesc_bank 1` places it in switchable
+bank 1. A banked assembly export must have the matching `NES_BANK(number)` on
+its typed `extern` declaration. Origins and undocumented opcodes are rejected
+in relocatable modules.
+
+## Mapper 2 projects
+
+UxROM projects use at least two complete 16 KiB PRG-ROM banks. The last bank is
+permanently mapped at `$C000-$FFFF`; numbered banks are mapped at
+`$8000-$BFFF`. Unannotated functions, startup, runtime helpers, and interrupt
+handlers stay in the fixed bank. Use `NES_BANK(number)` for code that belongs in
+a switchable bank:
+
+```c
+NES_BANK(1) NES_NOINLINE u8 banked_color(void) {
+    return 0x2Au8;
+}
+```
+
+Calls from fixed code or a different switchable bank use linker-generated
+trampolines that preserve A, X, Y, the prior bank selection, and `nescall`
+return values. The stack report includes the trampoline's additional three
+bytes. Entry and interrupt functions cannot use `NES_BANK`.
+
+```toml
+[cartridge]
+mapper = 2
+submapper = 0
+mirroring = "horizontal"
+prg-rom-kib = 64
+chr-rom-kib = 8
+battery = false
+```
 
 ## Project manifest
 
