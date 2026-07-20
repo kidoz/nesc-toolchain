@@ -50,6 +50,47 @@ fn uxrom_with_banked_call(known_bank: bool) -> Vec<u8> {
     .expect("UxROM")
 }
 
+fn uxrom_with_duplicate_fallback_addresses() -> Vec<u8> {
+    let mut prg = vec![0xff; 4 * 16 * 1024];
+    prg[..3].copy_from_slice(&[
+        0x6c, 0x00, 0x02, // jmp ($0200) in bank 0
+    ]);
+    prg[16 * 1024..16 * 1024 + 3].copy_from_slice(&[
+        0x6c, 0x00, 0x02, // jmp ($0200) in bank 1
+    ]);
+    let fixed = 3 * 16 * 1024;
+    let program = [
+        0xa9, 0x00, // lda #0
+        0x8d, 0x00, 0x80, // sta $8000
+        0x20, 0x00, 0x80, // jsr $8000
+        0xa9, 0x01, // lda #1
+        0x8d, 0x00, 0x80, // sta $8000
+        0x20, 0x00, 0x80, // jsr $8000
+        0x60, // rts
+    ];
+    prg[fixed..fixed + program.len()].copy_from_slice(&program);
+    let vectors = prg.len() - 6;
+    for offset in [0, 2, 4] {
+        prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+    }
+    nesc_rom::build(&Rom {
+        metadata: Metadata {
+            format: Format::Nes2,
+            mapper: 2,
+            submapper: 0,
+            mirroring: Mirroring::Horizontal,
+            battery: false,
+            region: Region::Ntsc,
+            prg_rom_len: prg.len(),
+            chr_rom_len: 0,
+        },
+        trainer: None,
+        prg_rom: prg,
+        chr_rom: Vec::new(),
+    })
+    .expect("UxROM")
+}
+
 #[test]
 fn new_then_check_generated_project() {
     let temporary = tempdir().expect("temporary directory");
@@ -581,7 +622,7 @@ fn decompiles_mapper_zero_to_a_stable_rust_project() {
 }
 
 #[test]
-fn decompiles_mapper_two_to_verified_stable_rust() {
+fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
     let temporary = tempdir().expect("temporary directory");
     fs::write(
         temporary.path().join("banked.nes"),
@@ -634,12 +675,36 @@ fn decompiles_mapper_two_to_verified_stable_rust() {
             "--emit",
             "nesc",
             "--output",
-            "unsupported-nesc",
+            "translated-nesc",
+            "--high-level-only",
         ])
         .output()
-        .expect("reject Mapper 2 NesC");
-    assert!(!nesc_output.status.success());
-    assert!(String::from_utf8_lossy(&nesc_output.stderr).contains("error[E4211]"));
+        .expect("decompile UxROM to NesC");
+    assert!(
+        nesc_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&nesc_output.stderr)
+    );
+    let manifest = fs::read_to_string(temporary.path().join("translated-nesc/NesC.toml"))
+        .expect("NesC manifest");
+    assert!(manifest.contains("mapper = 2"));
+    assert!(manifest.contains("submapper = 0"));
+    assert!(manifest.contains("prg-rom-kib = 64"));
+    let source = fs::read_to_string(temporary.path().join("translated-nesc/src/main.c"))
+        .expect("NesC source");
+    assert!(source.contains("NES_BANK(1) NES_NOINLINE"));
+    assert!(source.contains("fn_prg0001_8000"));
+
+    let built = nesc()
+        .current_dir(temporary.path())
+        .args(["build", "--manifest-path", "translated-nesc/NesC.toml"])
+        .output()
+        .expect("build generated Mapper 2 NesC");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
 }
 
 #[test]
@@ -689,6 +754,100 @@ fn keeps_unknown_mapper_two_bank_state_in_rust_fallback() {
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("error[E4206]"));
     assert!(!temporary.path().join("high-level-only").exists());
+
+    let nesc_output = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "unknown-bank.nes",
+            "--emit",
+            "nesc",
+            "--output",
+            "nesc-fallback",
+        ])
+        .output()
+        .expect("decompile unknown bank state to hybrid NesC");
+    assert!(
+        nesc_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&nesc_output.stderr)
+    );
+    let source = fs::read_to_string(temporary.path().join("nesc-fallback/src/main.c"))
+        .expect("NesC fallback source");
+    assert!(source.contains("static u8 cpu_selected_prg_bank;"));
+    assert!(source.contains("static void decompile_fallback(u16 entry)"));
+    assert!(source.contains("cpu_selected_prg_bank = (u8)(value % 3)"));
+
+    let built = nesc()
+        .current_dir(temporary.path())
+        .args(["build", "--manifest-path", "nesc-fallback/NesC.toml"])
+        .output()
+        .expect("build Mapper 2 fallback NesC");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let nesc_rejected = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "unknown-bank.nes",
+            "--emit",
+            "nesc",
+            "--output",
+            "nesc-high-level-only",
+            "--high-level-only",
+        ])
+        .output()
+        .expect("reject Mapper 2 fallback in high-level-only mode");
+    assert!(!nesc_rejected.status.success());
+    assert!(String::from_utf8_lossy(&nesc_rejected.stderr).contains("error[E4211]"));
+    assert!(!temporary.path().join("nesc-high-level-only").exists());
+}
+
+#[test]
+fn bank_qualifies_mapper_two_nesc_fallback_dispatch() {
+    let temporary = tempdir().expect("temporary directory");
+    fs::write(
+        temporary.path().join("duplicate-window.nes"),
+        uxrom_with_duplicate_fallback_addresses(),
+    )
+    .expect("write UxROM");
+
+    let emitted = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "duplicate-window.nes",
+            "--emit",
+            "nesc",
+            "--output",
+            "translated",
+        ])
+        .output()
+        .expect("decompile duplicate Mapper 2 window addresses");
+    assert!(
+        emitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = fs::read_to_string(temporary.path().join("translated/src/main.c"))
+        .expect("NesC fallback source");
+    assert!(source.contains("(cpu_selected_prg_bank == 0) && (cpu_pc == 0x8000)"));
+    assert!(source.contains("(cpu_selected_prg_bank == 1) && (cpu_pc == 0x8000)"));
+
+    let built = nesc()
+        .current_dir(temporary.path())
+        .args(["build", "--manifest-path", "translated/NesC.toml"])
+        .output()
+        .expect("build bank-qualified fallback NesC");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
 }
 
 #[test]

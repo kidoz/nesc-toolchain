@@ -51,7 +51,7 @@ pub struct NesCProject {
     pub report_json: String,
 }
 
-/// Emits a buildable Mapper 0 NesC project.
+/// Emits a buildable Mapper 0 or Mapper 2 NesC project.
 ///
 /// Reducible functions use ordinary NesC control flow. Uncertain functions
 /// call a bounded target-side dispatcher over the recovered machine state.
@@ -74,10 +74,16 @@ pub fn emit_nesc_project(
     values.verify(program)?;
     recovery.verify(program, values)?;
     control.verify(program, values, recovery)?;
-    if program.mapper != 0 || disassembly.rom.metadata.mapper != 0 {
+    if program.mapper != disassembly.rom.metadata.mapper {
         return Err(vec![AnalysisError::new(
-            "hybrid NesC emission currently supports Mapper 0 only",
+            "semantic program mapper differs from the source cartridge",
         )]);
+    }
+    if !matches!(program.mapper, 0 | 2) {
+        return Err(vec![AnalysisError::new(format!(
+            "hybrid NesC emission supports Mapper 0 and Mapper 2, not Mapper {}",
+            program.mapper
+        ))]);
     }
     if disassembly.rom.metadata.region == Region::MultiRegion {
         return Err(vec![AnalysisError::new(
@@ -123,6 +129,14 @@ pub fn emit_nesc_project(
             "high-level-only NesC emission rejected {fallbacks} dispatcher fallback region(s)"
         ))]);
     }
+    let prg_bank_count = disassembly.rom.prg_rom.len() / (16 * 1024);
+    if prg_bank_count > usize::from(u8::MAX) + 1 {
+        return Err(vec![AnalysisError::new(format!(
+            "hybrid NesC emission cannot represent {prg_bank_count} PRG banks"
+        ))]);
+    }
+    let fixed_prg_bank = u16::try_from(prg_bank_count.saturating_sub(1))
+        .map_err(|_| vec![AnalysisError::new("fixed PRG bank does not fit in u16")])?;
     let names = program
         .functions
         .iter()
@@ -141,6 +155,12 @@ pub fn emit_nesc_project(
         control,
         config,
         limits,
+        fixed_prg_bank,
+        switchable_prg_banks: u16::try_from(prg_bank_count.saturating_sub(1)).map_err(|_| {
+            vec![AnalysisError::new(
+                "switchable PRG bank count does not fit in u16",
+            )]
+        })?,
         names,
         source: String::new(),
     };
@@ -190,6 +210,8 @@ struct Emitter<'a> {
     control: &'a ControlFlowAnalysis,
     config: &'a NesCEmitConfig,
     limits: NesCEmissionLimits,
+    fixed_prg_bank: u16,
+    switchable_prg_banks: u16,
     names: BTreeMap<super::FunctionId, String>,
     source: String,
 }
@@ -202,15 +224,27 @@ impl Emitter<'_> {
         )?;
         self.line(0, "#include <nes.h>")?;
         self.line(0, "")?;
-        self.emit_state_helpers()?;
-        let names = self.names.values().cloned().collect::<Vec<_>>();
-        for name in names {
-            self.line(0, &format!("static void {name}(void);"))?;
+        self.emit_state_helpers(has_fallback)?;
+        let functions = self.control.functions.clone();
+        for function in &functions {
+            let name = self.names[&function.function].clone();
+            let placement = self.function_placement(function);
+            self.line(
+                0,
+                &format!("{}static void {name}(void);", bank_attribute(placement)),
+            )?;
         }
         if has_fallback {
+            let blocks = self.program.blocks.keys().copied().collect::<Vec<_>>();
+            for block in blocks {
+                self.line(
+                    0,
+                    &format!("static void {}(void);", fallback_block_name(block)),
+                )?;
+            }
+            self.line(0, "static void decompile_dispatch_once(void);")?;
             self.line(0, "static void decompile_fallback(u16 entry);")?;
         }
-        let functions = self.control.functions.clone();
         for function in &functions {
             self.emit_function(function)?;
         }
@@ -233,6 +267,9 @@ impl Emitter<'_> {
         self.line(0, "NES_MAIN int main(void) {")?;
         self.line(1, "cpu_sp = 0xfd;")?;
         self.line(1, "cpu_status = 0x24;")?;
+        if self.program.mapper == 2 {
+            self.line(1, "cpu_selected_prg_bank = 0;")?;
+        }
         self.line(1, &format!("cpu_pc = 0x{:04x};", reset.entry.cpu_address))?;
         self.line(
             1,
@@ -243,8 +280,8 @@ impl Emitter<'_> {
         self.line(0, "}")
     }
 
-    fn emit_state_helpers(&mut self) -> Result<(), Vec<AnalysisError>> {
-        for declaration in [
+    fn emit_state_helpers(&mut self, has_fallback: bool) -> Result<(), Vec<AnalysisError>> {
+        let mut declarations = vec![
             "static u8 cpu_a;",
             "static u8 cpu_x;",
             "static u8 cpu_y;",
@@ -253,7 +290,18 @@ impl Emitter<'_> {
             "static u16 cpu_pc;",
             "static u16 cpu_budget;",
             "extern void __nesc_trap(void);",
-        ] {
+        ];
+        if self.program.mapper == 2 {
+            declarations.insert(7, "static u8 cpu_selected_prg_bank;");
+        }
+        if has_fallback {
+            declarations.extend([
+                "static u8 fallback_running;",
+                "static u8 fallback_call_depth;",
+                "static u8 fallback_interrupt_depth;",
+            ]);
+        }
+        for declaration in declarations {
             self.line(0, declaration)?;
         }
         self.line(0, "")?;
@@ -276,6 +324,17 @@ impl Emitter<'_> {
         self.line(0, "}")?;
         self.line(0, "static void cpu_write(u16 address, u8 value) {")?;
         self.line(1, "*((ptr<unknown, volatile u8>)address) = value;")?;
+        if self.program.mapper == 2 {
+            self.line(1, "if (address >= 0x8000) {")?;
+            self.line(
+                2,
+                &format!(
+                    "cpu_selected_prg_bank = (u8)(value % {});",
+                    self.switchable_prg_banks
+                ),
+            )?;
+            self.line(1, "}")?;
+        }
         self.line(0, "}")?;
         self.line(0, "static void cpu_step(void) {")?;
         self.line(1, "if (cpu_budget == 0) { __nesc_trap(); }")?;
@@ -332,6 +391,7 @@ impl Emitter<'_> {
     fn emit_function(&mut self, function: &StructuredFunction) -> Result<(), Vec<AnalysisError>> {
         let recovered = &self.program.functions[function.function.0 as usize];
         let name = self.names[&function.function].clone();
+        let placement = self.function_placement(function);
         self.line(0, "")?;
         self.line(
             0,
@@ -343,9 +403,38 @@ impl Emitter<'_> {
                 function.confidence
             ),
         )?;
-        self.line(0, &format!("static void {name}(void) {{"))?;
+        self.line(
+            0,
+            &format!("{}static void {name}(void) {{", bank_attribute(placement)),
+        )?;
+        if self.program.mapper == 2 && recovered.entry.bank != self.fixed_prg_bank {
+            self.line(
+                1,
+                &format!("cpu_selected_prg_bank = {};", recovered.entry.bank),
+            )?;
+        }
         self.emit_region(function, function.root, 1, 0)?;
         self.line(0, "}")
+    }
+
+    fn function_placement(&self, function: &StructuredFunction) -> Option<u16> {
+        let recovered = &self.program.functions[function.function.0 as usize];
+        let has_fallback = function
+            .regions
+            .iter()
+            .any(|region| matches!(region.kind, StructuredRegionKind::Fallback { .. }));
+        let writes_mapper = recovered.blocks.iter().any(|block| {
+            self.program.blocks[block]
+                .instructions
+                .iter()
+                .flat_map(|instruction| &instruction.operations)
+                .any(|operation| matches!(operation, SemanticOperation::MapperWrite { .. }))
+        });
+        (self.program.mapper == 2
+            && recovered.entry.bank != self.fixed_prg_bank
+            && !has_fallback
+            && !writes_mapper)
+            .then_some(recovered.entry.bank)
     }
 
     fn emit_region(
@@ -418,29 +507,52 @@ impl Emitter<'_> {
             }
             StructuredRegionKind::Call { block, callee, .. } => {
                 self.emit_block(block, indent)?;
+                let callee_placement = self
+                    .control
+                    .functions
+                    .get(callee.0 as usize)
+                    .and_then(|function| self.function_placement(function));
+                let restores_mapper = callee_placement.is_some_and(|bank| bank != block.bank);
+                let call_indent = if restores_mapper {
+                    self.line(indent, "{")?;
+                    self.line(indent + 1, "u8 saved_prg_bank;")?;
+                    self.line(indent + 1, "saved_prg_bank = cpu_selected_prg_bank;")?;
+                    indent + 1
+                } else {
+                    indent
+                };
                 let call = self.program.blocks[&block]
                     .instructions
                     .last()
                     .expect("verified call block has an instruction");
                 let return_address =
                     call.provenance.address.cpu_address + call.provenance.bytes.len() as u16 - 1;
-                self.line(indent, &format!("cpu_push(0x{:02x});", return_address >> 8))?;
                 self.line(
-                    indent,
+                    call_indent,
+                    &format!("cpu_push(0x{:02x});", return_address >> 8),
+                )?;
+                self.line(
+                    call_indent,
                     &format!("cpu_push(0x{:02x});", return_address as u8),
                 )?;
                 let callee = self.names[&callee].clone();
-                self.line(indent, &format!("{callee}();"))?;
-                self.line(indent, "{")?;
-                self.line(indent + 1, "u8 return_low;")?;
-                self.line(indent + 1, "u8 return_high;")?;
-                self.line(indent + 1, "return_low = cpu_pop();")?;
-                self.line(indent + 1, "return_high = cpu_pop();")?;
+                self.line(call_indent, &format!("{callee}();"))?;
+                if restores_mapper {
+                    self.line(call_indent, "cpu_selected_prg_bank = saved_prg_bank;")?;
+                }
+                self.line(call_indent, "{")?;
+                self.line(call_indent + 1, "u8 return_low;")?;
+                self.line(call_indent + 1, "u8 return_high;")?;
+                self.line(call_indent + 1, "return_low = cpu_pop();")?;
+                self.line(call_indent + 1, "return_high = cpu_pop();")?;
                 self.line(
-                    indent + 1,
+                    call_indent + 1,
                     "cpu_pc = (u16)((u16)(return_low | ((u16)return_high << 8)) + 1);",
                 )?;
-                self.line(indent, "}")?;
+                self.line(call_indent, "}")?;
+                if restores_mapper {
+                    self.line(indent, "}")?;
+                }
             }
             StructuredRegionKind::Return { block, interrupt } => {
                 self.emit_block(block, indent)?;
@@ -486,9 +598,10 @@ impl Emitter<'_> {
             self.line(
                 indent,
                 &format!(
-                    "/* ROM +0x{:X}, PRG +0x{:X}, CPU 0x{:04X}: {} */",
+                    "/* ROM +0x{:X}, PRG +0x{:X}, bank {}, CPU 0x{:04X}: {} */",
                     instruction.provenance.rom_file_offset,
                     instruction.provenance.prg_offset,
+                    instruction.provenance.address.bank,
                     instruction.provenance.address.cpu_address,
                     bytes
                 ),
@@ -694,34 +807,49 @@ impl Emitter<'_> {
     }
 
     fn emit_fallback_dispatcher(&mut self) -> Result<(), Vec<AnalysisError>> {
+        let blocks = self.program.blocks.values().cloned().collect::<Vec<_>>();
+        for block in &blocks {
+            self.line(0, "")?;
+            self.line(
+                0,
+                &format!("static void {}(void) {{", fallback_block_name(block.id)),
+            )?;
+            self.emit_block(block.id, 1)?;
+            self.emit_dispatch_terminator(block, 1)?;
+            self.line(0, "}")?;
+        }
+
+        self.line(0, "")?;
+        self.line(0, "static void decompile_dispatch_once(void) {")?;
+        for block in &blocks {
+            let condition = if self.program.mapper == 2
+                && block.id.bank != self.fixed_prg_bank
+                && block.id.cpu_address < 0xc000
+            {
+                format!(
+                    "(cpu_selected_prg_bank == {}) && (cpu_pc == 0x{:04x})",
+                    block.id.bank, block.id.cpu_address
+                )
+            } else {
+                format!("cpu_pc == 0x{:04x}", block.id.cpu_address)
+            };
+            self.line(1, &format!("if ({condition}) {{"))?;
+            self.line(2, &format!("{}();", fallback_block_name(block.id)))?;
+            self.line(2, "return;")?;
+            self.line(1, "}")?;
+        }
+        self.line(1, "__nesc_trap();")?;
+        self.line(1, "fallback_running = 0;")?;
+        self.line(0, "}")?;
+
         self.line(0, "")?;
         self.line(0, "static void decompile_fallback(u16 entry) {")?;
-        self.line(1, "u8 running;")?;
-        self.line(1, "u8 call_depth;")?;
-        self.line(1, "u8 interrupt_depth;")?;
-        self.line(1, "running = 1;")?;
-        self.line(1, "call_depth = 0;")?;
-        self.line(1, "interrupt_depth = 0;")?;
+        self.line(1, "fallback_running = 1;")?;
+        self.line(1, "fallback_call_depth = 0;")?;
+        self.line(1, "fallback_interrupt_depth = 0;")?;
         self.line(1, "cpu_pc = entry;")?;
-        self.line(1, "while (running != 0) {")?;
-        let blocks = self.program.blocks.values().cloned().collect::<Vec<_>>();
-        for (index, block) in blocks.iter().enumerate() {
-            self.line(
-                2,
-                &format!(
-                    "{} (cpu_pc == 0x{:04x}) {{",
-                    if index == 0 { "if" } else { "else if" },
-                    block.id.cpu_address
-                ),
-            )?;
-            self.emit_block(block.id, 3)?;
-            self.emit_dispatch_terminator(block, 3)?;
-            self.line(2, "}")?;
-        }
-        self.line(2, "else {")?;
-        self.line(3, "__nesc_trap();")?;
-        self.line(3, "running = 0;")?;
-        self.line(2, "}")?;
+        self.line(1, "while (fallback_running != 0) {")?;
+        self.line(2, "decompile_dispatch_once();")?;
         self.line(1, "}")?;
         self.line(0, "}")
     }
@@ -765,7 +893,7 @@ impl Emitter<'_> {
                 self.line(
                     indent,
                     &format!(
-                        "if (call_depth >= {}) {{ __nesc_trap(); }}",
+                        "if (fallback_call_depth >= {}) {{ __nesc_trap(); }}",
                         self.config.max_fallback_call_depth
                     ),
                 )?;
@@ -774,15 +902,18 @@ impl Emitter<'_> {
                     indent,
                     &format!("cpu_push(0x{:02x});", return_address as u8),
                 )?;
-                self.line(indent, "call_depth = (u8)(call_depth + 1);")?;
+                self.line(
+                    indent,
+                    "fallback_call_depth = (u8)(fallback_call_depth + 1);",
+                )?;
                 self.line(
                     indent,
                     &format!("cpu_pc = 0x{:04x};", target_address(callee)),
                 )?;
             }
             Terminator::Return => {
-                self.line(indent, "if (call_depth == 0) {")?;
-                self.line(indent + 1, "running = 0;")?;
+                self.line(indent, "if (fallback_call_depth == 0) {")?;
+                self.line(indent + 1, "fallback_running = 0;")?;
                 self.line(indent, "} else {")?;
                 self.line(indent + 1, "{")?;
                 self.line(indent + 2, "u8 return_low;")?;
@@ -794,12 +925,18 @@ impl Emitter<'_> {
                     "cpu_pc = (u16)((u16)(return_low | ((u16)return_high << 8)) + 1);",
                 )?;
                 self.line(indent + 1, "}")?;
-                self.line(indent + 1, "call_depth = (u8)(call_depth - 1);")?;
+                self.line(
+                    indent + 1,
+                    "fallback_call_depth = (u8)(fallback_call_depth - 1);",
+                )?;
                 self.line(indent, "}")?;
             }
             Terminator::ReturnFromInterrupt => {
-                self.line(indent, "if ((interrupt_depth == 0) && (call_depth == 0)) {")?;
-                self.line(indent + 1, "running = 0;")?;
+                self.line(
+                    indent,
+                    "if ((fallback_interrupt_depth == 0) && (fallback_call_depth == 0)) {",
+                )?;
+                self.line(indent + 1, "fallback_running = 0;")?;
                 self.line(indent, "} else {")?;
                 self.line(indent + 1, "cpu_status = cpu_pop();")?;
                 self.line(indent + 1, "{")?;
@@ -814,7 +951,7 @@ impl Emitter<'_> {
                 self.line(indent + 1, "}")?;
                 self.line(
                     indent + 1,
-                    "if (interrupt_depth != 0) { interrupt_depth = (u8)(interrupt_depth - 1); }",
+                    "if (fallback_interrupt_depth != 0) { fallback_interrupt_depth = (u8)(fallback_interrupt_depth - 1); }",
                 )?;
                 self.line(indent, "}")?;
             }
@@ -837,7 +974,10 @@ impl Emitter<'_> {
                     indent,
                     "cpu_pc = (u16)(cpu_read(0xfffe) | ((u16)cpu_read(0xffff) << 8));",
                 )?;
-                self.line(indent, "interrupt_depth = (u8)(interrupt_depth + 1);")?;
+                self.line(
+                    indent,
+                    "fallback_interrupt_depth = (u8)(fallback_interrupt_depth + 1);",
+                )?;
             }
             Terminator::Stop(StopReason::IndirectJump { pointer }) => {
                 let high = (pointer & 0xff00) | (pointer.wrapping_add(1) & 0x00ff);
@@ -873,6 +1013,19 @@ fn source_text(source: &ValueSource) -> Result<String, Vec<AnalysisError>> {
         ValueSource::Memory(memory) => Ok(format!("cpu_read({})", address_text(memory)?)),
         ValueSource::Status => Ok("cpu_status".to_owned()),
     }
+}
+
+fn bank_attribute(bank: Option<u16>) -> String {
+    bank.map_or_else(String::new, |bank| {
+        format!("NES_BANK({bank}) NES_NOINLINE ")
+    })
+}
+
+fn fallback_block_name(block: BlockId) -> String {
+    format!(
+        "decompile_block_prg{:04x}_{:04x}",
+        block.bank, block.cpu_address
+    )
 }
 
 fn target_read(target: &ValueTarget) -> Result<String, Vec<AnalysisError>> {
@@ -998,8 +1151,10 @@ fn manifest(disassembly: &Disassembly, config: &NesCEmitConfig) -> String {
         Mirroring::FourScreen => "four-screen",
     };
     format!(
-        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"src/main.c\"\nregion = \"{region}\"\nformat = \"{format}\"\n\n[cartridge]\nmapper = 0\nsubmapper = 0\nmirroring = \"{mirroring}\"\nprg-rom-kib = {}\nchr-rom-kib = {}\nbattery = {}\n\n[compiler]\noptimization = \"0\"\nsigned-overflow = \"wrap\"\nbounds-checks = \"elide-proven\"\nstack-limit = 192\n\n[memory.zero-page]\navailable = [\"0x00..0xEF\"]\nreserved = [\"0xF0..0xFF\"]\nstrategy = \"frequency\"\n\n[debug]\nsymbols = true\nsource-map = true\n",
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"src/main.c\"\nregion = \"{region}\"\nformat = \"{format}\"\n\n[cartridge]\nmapper = {}\nsubmapper = {}\nmirroring = \"{mirroring}\"\nprg-rom-kib = {}\nchr-rom-kib = {}\nbattery = {}\n\n[compiler]\noptimization = \"0\"\nsigned-overflow = \"wrap\"\nbounds-checks = \"elide-proven\"\nstack-limit = 192\n\n[memory.zero-page]\navailable = [\"0x00..0xEF\"]\nreserved = [\"0xF0..0xFF\"]\nstrategy = \"frequency\"\n\n[debug]\nsymbols = true\nsource-map = true\n",
         config.package_name,
+        metadata.mapper,
+        metadata.submapper,
         metadata.prg_rom_len / 1024,
         metadata.chr_rom_len / 1024,
         metadata.battery
