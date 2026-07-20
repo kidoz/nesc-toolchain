@@ -25,6 +25,10 @@ ROM. The toolkit is written in stable Rust 2024.
   allocation, stack reports, and reference-driven arithmetic helpers
 - Fixed arrays, pointer arithmetic, typed CPU-bus address spaces, volatile
   indirect access, and configurable bounds checks
+- Verified `NES_ASM` blocks with register operands, explicit clobbers, symbolic
+  call relocations, mapper-bank effects, and hardware-stack accounting
+- Relocatable standalone `.s` modules with typed NesC imports and exports,
+  symbolic cross-module relocations, source maps, and stack contracts
 - Mapper 0 linking, iNES/NES 2.0 ROM construction, symbols, source maps, and
   deterministic emulator boot verification
 - Public bounded emulator execution for all 151 official CPU opcodes, reset,
@@ -56,6 +60,8 @@ ROM. The toolkit is written in stable Rust 2024.
 | `nesc check` for manifests and source semantics | Available |
 | NesC preprocessing and parsing | Available |
 | HIR, MIR, verification, and optimization | Available |
+| Target-specific inline 6502 assembly | Available |
+| Standalone relocatable 6502 assembly modules | Available |
 | 6502 code generation and Mapper 0 linking | Available |
 | ROM construction and inspection | Available |
 | Official 6502 decoding and recursive Mapper 0 disassembly | Available |
@@ -107,6 +113,86 @@ demo/
     └── main.c
 ```
 
+## Inline assembly
+
+`NES_ASM` embeds bounded official-6502 source as a volatile statement. Its
+contract names every compiler value crossing the block and every resource the
+source may change:
+
+```c
+extern void assembly_helper(void);
+
+u8 run_assembly(u8 input) {
+    u8 output;
+    NES_ASM(
+        "pha\njsr assembly_helper\npla",
+        NES_ASM_INPUT_A(input),
+        NES_ASM_OUTPUT_X(output),
+        NES_CLOBBER_A,
+        NES_CLOBBER_FLAGS,
+        NES_CLOBBER_MEMORY,
+        NES_ASM_CALL(assembly_helper),
+        NES_ASM_STACK(1)
+    );
+    return output;
+}
+```
+
+Inputs and outputs support the `A`, `X`, and `Y` registers. Other contract
+items are `NES_CLOBBER_A`, `NES_CLOBBER_X`, `NES_CLOBBER_Y`,
+`NES_CLOBBER_FLAGS`, `NES_CLOBBER_MEMORY`, `NES_ASM_BANK_EFFECT`,
+`NES_ASM_CALL(function)`, and `NES_ASM_STACK(bytes)`. Symbolic `jsr` operands
+must have a matching call declaration and become linker relocations. Inline
+branches use current-location expressions such as `*+4`; labels, equates, and
+section-placement directives remain owned by the compiler.
+
+The conventional form is also accepted with `a`, `x`, and `y` constraints:
+
+```c
+asm volatile ("tax" : "=x"(output) : "a"(input) : "flags", "memory");
+```
+
+Use `NES_ASM` when the contract must also describe direct calls, mapper-bank
+effects, or additional hardware-stack use.
+
+## Standalone assembly
+
+List assembly modules explicitly so their link order is deterministic:
+
+```toml
+[build]
+entry = "src/main.c"
+assembly = ["src/collision.s"]
+region = "ntsc"
+format = "nes2"
+```
+
+An exported assembly function needs a matching typed `extern` declaration:
+
+```c
+extern u8 fast_collision(u8 value);
+```
+
+```asm
+.setcpu "6502"
+.segment "CODE"
+.export fast_collision
+.nesc_stack fast_collision, 0
+
+fast_collision:
+    clc
+    adc #1
+    rts
+```
+
+Modules use the same object symbols and absolute or relative relocations as
+compiled NesC. `.import name` references another typed function; a compiled
+NesC definition must use `NES_EXPORT` before assembly may import it.
+`.nesc_stack name, bytes` declares the maximum extra hardware-stack use after
+entry, including nested `jsr` return addresses and explicit pushes but excluding
+the caller's `jsr` into the exported routine. Origins and undocumented opcodes
+are rejected in relocatable modules.
+
 ## Project manifest
 
 Every NesC project uses `NesC.toml`:
@@ -118,6 +204,7 @@ version = "0.1.0"
 
 [build]
 entry = "src/main.c"
+assembly = []
 region = "ntsc"
 format = "nes2"
 
