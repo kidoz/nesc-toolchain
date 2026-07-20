@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 
 pub use cpu::CpuState;
 pub use machine::{
-    BusAccess, BusAccessKind, CycleReport, EmulatorConfig, EmulatorError, EventKind, InterruptKind,
-    Machine, MachineSnapshot, ObservableEvent, PpuPosition, RunLimits, RunReport, StepReport,
-    Termination, TimingProfile,
+    BusAccess, BusAccessKind, CycleReport, EmulatorConfig, EmulatorError, EventKind, FRAME_HEIGHT,
+    FRAME_PIXELS, FRAME_WIDTH, InterruptKind, Machine, MachineSnapshot, ObservableEvent,
+    PpuPosition, PpuState, RunLimits, RunReport, StepReport, Termination, TimingProfile,
 };
 
 /// First difference between two ordered observable-event traces.

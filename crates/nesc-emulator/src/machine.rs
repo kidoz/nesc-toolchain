@@ -17,6 +17,13 @@ const RESET_VECTOR: u16 = 0xfffc;
 const NMI_VECTOR: u16 = 0xfffa;
 const STACK_BASE: u16 = 0x0100;
 
+/// Width of one rendered NES frame in pixels.
+pub const FRAME_WIDTH: usize = 256;
+/// Height of one rendered NES frame in pixels.
+pub const FRAME_HEIGHT: usize = 240;
+/// Number of palette-index pixels in one rendered NES frame.
+pub const FRAME_PIXELS: usize = FRAME_WIDTH * FRAME_HEIGHT;
+
 /// Deterministic console timing selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimingProfile {
@@ -50,29 +57,6 @@ impl TimingProfile {
             // Dendy has 51 post-render scanlines; vblank starts at line 291.
             Self::Dendy => (99_232, 3),
         }
-    }
-
-    const fn frames_at(self, cycles: u64) -> u64 {
-        let (numerator, denominator) = self.frame_cycle_ratio();
-        cycles.saturating_mul(denominator) / numerator
-    }
-
-    const fn frame_boundary(self, frame: u64) -> u64 {
-        let (numerator, denominator) = self.frame_cycle_ratio();
-        div_ceil(frame.saturating_mul(numerator), denominator)
-    }
-
-    const fn vblank_boundary(self, frame: u64) -> u64 {
-        let (frame_numerator, frame_denominator) = self.frame_cycle_ratio();
-        let (vblank_numerator, vblank_denominator) = self.vblank_cycle_ratio();
-        let frame_offset = frame
-            .saturating_mul(frame_numerator)
-            .saturating_mul(vblank_denominator)
-            / frame_denominator;
-        div_ceil(
-            frame_offset.saturating_add(vblank_numerator),
-            vblank_denominator,
-        )
     }
 
     fn from_region(region: Region) -> Option<Self> {
@@ -111,6 +95,19 @@ pub struct PpuPosition {
     pub frame: u64,
     pub scanline: u16,
     pub dot: u16,
+}
+
+/// CPU-visible and renderer-visible PPU state captured at a checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PpuState {
+    pub position: PpuPosition,
+    pub ctrl: u8,
+    pub mask: u8,
+    pub status: u8,
+    pub vram_address: u16,
+    pub temporary_address: u16,
+    pub fine_x: u8,
+    pub write_toggle: bool,
 }
 
 /// Machine construction settings.
@@ -257,6 +254,8 @@ pub struct MachineSnapshot {
     pub palette: Box<[u8; 32]>,
     pub oam: Box<[u8; 256]>,
     pub nametable_ram: Box<[u8; 0x1000]>,
+    pub framebuffer: Box<[u8; FRAME_PIXELS]>,
+    pub ppu: PpuState,
     pub mapper_state: MapperState,
 }
 
@@ -346,6 +345,15 @@ struct BusAccessContext {
     dummy: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ScanlineSprite {
+    index: u8,
+    x: u8,
+    attributes: u8,
+    pattern_low: u8,
+    pattern_high: u8,
+}
+
 /// Public deterministic NES machine.
 pub struct Machine {
     cpu: CpuState,
@@ -367,9 +375,19 @@ pub struct Machine {
     ppu_status: u8,
     oam_address: u8,
     ppu_address: u16,
-    ppu_address_high: bool,
-    ppu_scroll_high: bool,
+    ppu_temporary_address: u16,
+    ppu_fine_x: u8,
+    ppu_write_toggle: bool,
+    ppu_scroll_x: u8,
+    ppu_scroll_y: u8,
     ppu_data_buffer: u8,
+    ppu_frame: u64,
+    ppu_scanline: u16,
+    ppu_dot: u16,
+    ppu_dot_accumulator: u8,
+    framebuffer: Box<[u8; FRAME_PIXELS]>,
+    scanline_sprites: [ScanlineSprite; 8],
+    scanline_sprite_count: u8,
     controller_state: [u8; 2],
     controller_shift: [u8; 2],
     controller_strobe: bool,
@@ -452,9 +470,19 @@ impl Machine {
             ppu_status: 0,
             oam_address: 0,
             ppu_address: 0,
-            ppu_address_high: true,
-            ppu_scroll_high: true,
+            ppu_temporary_address: 0,
+            ppu_fine_x: 0,
+            ppu_write_toggle: false,
+            ppu_scroll_x: 0,
+            ppu_scroll_y: 0,
             ppu_data_buffer: 0,
+            ppu_frame: 0,
+            ppu_scanline: 0,
+            ppu_dot: 0,
+            ppu_dot_accumulator: 0,
+            framebuffer: Box::new([0; FRAME_PIXELS]),
+            scanline_sprites: [ScanlineSprite::default(); 8],
+            scanline_sprite_count: 0,
             controller_state: [0; 2],
             controller_shift: [0; 2],
             controller_strobe: false,
@@ -890,7 +918,15 @@ impl Machine {
     #[cfg(test)]
     pub(crate) fn set_cycles_for_test(&mut self, cycles: u64) {
         self.cycles = cycles;
-        self.frames = self.timing.frames_at(cycles);
+        let position = self.timing.ppu_position(cycles);
+        self.frames = position.frame;
+        self.ppu_frame = position.frame;
+        self.ppu_scanline = position.scanline;
+        self.ppu_dot = position.dot;
+        self.ppu_dot_accumulator = match self.timing {
+            TimingProfile::Ntsc | TimingProfile::Dendy => 0,
+            TimingProfile::Pal => ((cycles.saturating_mul(16)) % 5) as u8,
+        };
     }
 
     #[must_use]
@@ -912,7 +948,26 @@ impl Machine {
     /// Current PPU beam position.
     #[must_use]
     pub const fn ppu_position(&self) -> PpuPosition {
-        self.timing.ppu_position(self.cycles)
+        PpuPosition {
+            frame: self.ppu_frame,
+            scanline: self.ppu_scanline,
+            dot: self.ppu_dot,
+        }
+    }
+
+    /// Current CPU-visible and renderer-visible PPU state.
+    #[must_use]
+    pub const fn ppu_state(&self) -> PpuState {
+        PpuState {
+            position: self.ppu_position(),
+            ctrl: self.ppu_ctrl,
+            mask: self.ppu_mask,
+            status: self.ppu_status,
+            vram_address: self.ppu_address,
+            temporary_address: self.ppu_temporary_address,
+            fine_x: self.ppu_fine_x,
+            write_toggle: self.ppu_write_toggle,
+        }
     }
 
     /// Whether a cycle-stepped instruction or interrupt remains in progress.
@@ -952,6 +1007,23 @@ impl Machine {
     #[must_use]
     pub fn nametable_ram(&self) -> &[u8; 0x1000] {
         &self.nametable_ram
+    }
+
+    /// Palette-index pixels for the most recently drawn frame contents.
+    #[must_use]
+    pub fn framebuffer(&self) -> &[u8; FRAME_PIXELS] {
+        &self.framebuffer
+    }
+
+    /// Stable checksum of the palette-index framebuffer for compact reports.
+    #[must_use]
+    pub fn framebuffer_checksum(&self) -> u64 {
+        self.framebuffer
+            .iter()
+            .enumerate()
+            .fold(0_u64, |checksum, (index, pixel)| {
+                checksum.wrapping_add((index as u64 + 1).wrapping_mul(u64::from(*pixel)))
+            })
     }
 
     #[must_use]
@@ -1002,6 +1074,8 @@ impl Machine {
             palette: self.palette.clone(),
             oam: self.oam.clone(),
             nametable_ram: self.nametable_ram.clone(),
+            framebuffer: self.framebuffer.clone(),
+            ppu: self.ppu_state(),
             mapper_state: self.mapper_state,
         }
     }
@@ -1520,8 +1594,7 @@ impl Machine {
             0x2002 => {
                 let value = self.ppu_status;
                 self.ppu_status &= !0x80;
-                self.ppu_address_high = true;
-                self.ppu_scroll_high = true;
+                self.ppu_write_toggle = false;
                 Ok(value)
             }
             0x2004 => Ok(self.oam[usize::from(self.oam_address)]),
@@ -1548,6 +1621,8 @@ impl Machine {
             0x2000 => {
                 let nmi_was_enabled = self.ppu_ctrl & 0x80 != 0;
                 self.ppu_ctrl = value;
+                self.ppu_temporary_address =
+                    (self.ppu_temporary_address & 0x73ff) | (u16::from(value & 0x03) << 10);
                 if !nmi_was_enabled && value & 0x80 != 0 && self.ppu_status & 0x80 != 0 {
                     self.pending_nmi = true;
                 }
@@ -1558,14 +1633,31 @@ impl Machine {
                 self.oam[usize::from(self.oam_address)] = value;
                 self.oam_address = self.oam_address.wrapping_add(1);
             }
-            0x2005 => self.ppu_scroll_high = !self.ppu_scroll_high,
+            0x2005 if !self.ppu_write_toggle => {
+                self.ppu_scroll_x = value;
+                self.ppu_temporary_address =
+                    (self.ppu_temporary_address & !0x001f) | u16::from(value >> 3);
+                self.ppu_fine_x = value & 0x07;
+                self.ppu_write_toggle = true;
+            }
+            0x2005 => {
+                self.ppu_scroll_y = value;
+                self.ppu_temporary_address = (self.ppu_temporary_address & !0x73e0)
+                    | (u16::from(value & 0x07) << 12)
+                    | (u16::from(value & 0xf8) << 2);
+                self.ppu_write_toggle = false;
+            }
             0x2006 => {
-                if self.ppu_address_high {
-                    self.ppu_address = u16::from(value & 0x3f) << 8;
+                if !self.ppu_write_toggle {
+                    self.ppu_temporary_address =
+                        (self.ppu_temporary_address & 0x00ff) | (u16::from(value & 0x3f) << 8);
+                    self.ppu_write_toggle = true;
                 } else {
-                    self.ppu_address = (self.ppu_address & 0xff00) | u16::from(value);
+                    self.ppu_temporary_address =
+                        (self.ppu_temporary_address & 0x7f00) | u16::from(value);
+                    self.ppu_address = self.ppu_temporary_address;
+                    self.ppu_write_toggle = false;
                 }
-                self.ppu_address_high = !self.ppu_address_high;
             }
             0x2007 => {
                 self.write_ppu(self.ppu_address, value)?;
@@ -1691,53 +1783,310 @@ impl Machine {
     }
 
     fn advance_cycles(&mut self, cycles: u64) {
-        let before = self.cycles;
-        let after = before.saturating_add(cycles);
-        let before_frame = self.timing.frames_at(before);
-        let after_frame = self.timing.frames_at(after);
-        let vblank = self.timing.vblank_boundary(before_frame);
-        if before < vblank && after >= vblank {
+        let (dots_per_cycle, denominator) = match self.timing {
+            TimingProfile::Ntsc | TimingProfile::Dendy => (3_u8, 1_u8),
+            TimingProfile::Pal => (16, 5),
+        };
+        for _ in 0..cycles {
+            self.cycles = self.cycles.saturating_add(1);
+            self.ppu_dot_accumulator = self.ppu_dot_accumulator.saturating_add(dots_per_cycle);
+            while self.ppu_dot_accumulator >= denominator {
+                self.ppu_dot_accumulator -= denominator;
+                self.clock_ppu_dot();
+            }
+        }
+    }
+
+    fn clock_ppu_dot(&mut self) {
+        let pre_render = self.pre_render_scanline();
+        let skip_odd_dot = self.timing == TimingProfile::Ntsc
+            && self.ppu_frame & 1 != 0
+            && self.rendering_enabled()
+            && self.ppu_scanline == pre_render
+            && self.ppu_dot == 339;
+        if skip_odd_dot || self.ppu_dot == 340 {
+            self.ppu_dot = 0;
+            if self.ppu_scanline == pre_render {
+                self.ppu_scanline = 0;
+                self.ppu_frame = self.ppu_frame.saturating_add(1);
+                self.frames = self.ppu_frame;
+                self.record_at(EventKind::Frame, None, None, None, self.cycles, self.cpu.pc);
+            } else {
+                self.ppu_scanline += 1;
+            }
+        } else {
+            self.ppu_dot += 1;
+        }
+
+        if self.ppu_scanline == self.vblank_scanline() && self.ppu_dot == 1 {
             self.ppu_status |= 0x80;
             self.record_at(
                 EventKind::VBlank,
                 Some(0x2002),
                 Some(self.ppu_status),
                 None,
-                vblank,
+                self.cycles,
                 self.cpu.pc,
             );
             if self.ppu_ctrl & 0x80 != 0 {
                 self.pending_nmi = true;
             }
         }
-        if after_frame > before_frame {
-            self.frames = after_frame;
-            self.ppu_status &= !0x80;
-            self.record_at(
-                EventKind::Frame,
-                None,
-                None,
-                None,
-                self.timing.frame_boundary(after_frame),
-                self.cpu.pc,
-            );
-            let next_vblank = self.timing.vblank_boundary(after_frame);
-            if after >= next_vblank {
-                self.ppu_status |= 0x80;
-                self.record_at(
-                    EventKind::VBlank,
-                    Some(0x2002),
-                    Some(self.ppu_status),
-                    None,
-                    next_vblank,
-                    self.cpu.pc,
-                );
-                if self.ppu_ctrl & 0x80 != 0 {
-                    self.pending_nmi = true;
-                }
+        if self.ppu_scanline == pre_render && self.ppu_dot == 1 {
+            self.ppu_status &= !0xe0;
+        }
+
+        if self.ppu_scanline < FRAME_HEIGHT as u16 {
+            if self.ppu_dot == 1 {
+                self.evaluate_scanline_sprites();
+            }
+            if (1..=FRAME_WIDTH as u16).contains(&self.ppu_dot) {
+                self.render_pixel();
             }
         }
-        self.cycles = after;
+
+        if self.rendering_enabled()
+            && (self.ppu_scanline < FRAME_HEIGHT as u16 || self.ppu_scanline == pre_render)
+        {
+            if ((1..=256).contains(&self.ppu_dot) || (321..=336).contains(&self.ppu_dot))
+                && self.ppu_dot % 8 == 0
+            {
+                self.increment_render_x();
+            }
+            if self.ppu_dot == 256 {
+                self.increment_render_y();
+            } else if self.ppu_dot == 257 {
+                self.copy_render_x();
+            }
+            if self.ppu_scanline == pre_render && (280..=304).contains(&self.ppu_dot) {
+                self.copy_render_y();
+            }
+        }
+    }
+
+    const fn pre_render_scanline(&self) -> u16 {
+        match self.timing {
+            TimingProfile::Ntsc => 261,
+            TimingProfile::Pal | TimingProfile::Dendy => 311,
+        }
+    }
+
+    const fn vblank_scanline(&self) -> u16 {
+        match self.timing {
+            TimingProfile::Ntsc | TimingProfile::Pal => 241,
+            TimingProfile::Dendy => 291,
+        }
+    }
+
+    const fn rendering_enabled(&self) -> bool {
+        self.ppu_mask & 0x18 != 0
+    }
+
+    fn render_pixel(&mut self) {
+        let x = (self.ppu_dot - 1) as usize;
+        let y = usize::from(self.ppu_scanline);
+        let (background_opaque, background_color) = self.background_pixel(x, y);
+        let sprite = self.sprite_pixel(x);
+        if let Some((_, _, _, index)) = sprite {
+            if index == 0
+                && background_opaque
+                && x != FRAME_WIDTH - 1
+                && self.ppu_mask & 0x18 == 0x18
+            {
+                self.ppu_status |= 0x40;
+            }
+        }
+        let color = sprite.map_or(background_color, |(_, color, behind_background, _)| {
+            if background_opaque && behind_background {
+                background_color
+            } else {
+                color
+            }
+        });
+        self.framebuffer[y * FRAME_WIDTH + x] = color;
+    }
+
+    fn background_pixel(&self, x: usize, y: usize) -> (bool, u8) {
+        let backdrop = self.render_palette_color(0x3f00);
+        if self.ppu_mask & 0x08 == 0 || (x < 8 && self.ppu_mask & 0x02 == 0) {
+            return (false, backdrop);
+        }
+
+        let world_x = usize::from(self.ppu_scroll_x) + x;
+        let world_y = usize::from(self.ppu_scroll_y) + y;
+        let base_table = usize::from(self.ppu_ctrl & 0x03);
+        let table_x = (base_table & 1) ^ ((world_x / FRAME_WIDTH) & 1);
+        let table_y = ((base_table >> 1) & 1) ^ ((world_y / FRAME_HEIGHT) & 1);
+        let table = table_y * 2 + table_x;
+        let local_x = world_x % FRAME_WIDTH;
+        let local_y = world_y % FRAME_HEIGHT;
+        let tile_x = local_x / 8;
+        let tile_y = local_y / 8;
+        let name_address = 0x2000 + (table * 0x400 + tile_y * 32 + tile_x) as u16;
+        let tile = self.render_ppu_read(name_address);
+        let attribute_address = 0x23c0 + (table * 0x400 + (tile_y / 4) * 8 + tile_x / 4) as u16;
+        let attribute = self.render_ppu_read(attribute_address);
+        let attribute_shift = ((tile_y & 2) << 1) | (tile_x & 2);
+        let palette = (attribute >> attribute_shift) & 0x03;
+        let pattern_base = if self.ppu_ctrl & 0x10 == 0 { 0 } else { 0x1000 };
+        let row = (local_y & 7) as u16;
+        let pattern_address = pattern_base + u16::from(tile) * 16 + row;
+        let bit = 7 - (local_x & 7);
+        let low = (self.render_ppu_read(pattern_address) >> bit) & 1;
+        let high = (self.render_ppu_read(pattern_address + 8) >> bit) & 1;
+        let pixel = low | (high << 1);
+        if pixel == 0 {
+            (false, backdrop)
+        } else {
+            (
+                true,
+                self.render_palette_color(0x3f00 + u16::from(palette * 4 + pixel)),
+            )
+        }
+    }
+
+    fn evaluate_scanline_sprites(&mut self) {
+        self.scanline_sprite_count = 0;
+        self.scanline_sprites.fill(ScanlineSprite::default());
+        if self.ppu_mask & 0x10 == 0 {
+            return;
+        }
+        let height = if self.ppu_ctrl & 0x20 == 0 { 8 } else { 16 };
+        let scanline = self.ppu_scanline as u8;
+        let mut matches = 0_u8;
+        for index in 0..64_u8 {
+            let base = usize::from(index) * 4;
+            let row = scanline.wrapping_sub(self.oam[base].wrapping_add(1));
+            if row >= height {
+                continue;
+            }
+            matches = matches.saturating_add(1);
+            if self.scanline_sprite_count >= 8 {
+                continue;
+            }
+            let tile = self.oam[base + 1];
+            let attributes = self.oam[base + 2];
+            let row = if attributes & 0x80 == 0 {
+                row
+            } else {
+                height - 1 - row
+            };
+            let (pattern_base, tile, row) = if height == 16 {
+                (
+                    u16::from(tile & 1) * 0x1000,
+                    (tile & 0xfe).wrapping_add(row / 8),
+                    row & 7,
+                )
+            } else {
+                (
+                    if self.ppu_ctrl & 0x08 == 0 { 0 } else { 0x1000 },
+                    tile,
+                    row,
+                )
+            };
+            let address = pattern_base + u16::from(tile) * 16 + u16::from(row);
+            self.scanline_sprites[usize::from(self.scanline_sprite_count)] = ScanlineSprite {
+                index,
+                x: self.oam[base + 3],
+                attributes,
+                pattern_low: self.render_ppu_read(address),
+                pattern_high: self.render_ppu_read(address + 8),
+            };
+            self.scanline_sprite_count += 1;
+        }
+        if matches > 8 {
+            self.ppu_status |= 0x20;
+        }
+    }
+
+    fn sprite_pixel(&self, x: usize) -> Option<(u8, u8, bool, u8)> {
+        if self.ppu_mask & 0x10 == 0 || (x < 8 && self.ppu_mask & 0x04 == 0) {
+            return None;
+        }
+        for sprite in self
+            .scanline_sprites
+            .iter()
+            .take(usize::from(self.scanline_sprite_count))
+        {
+            let offset = x.wrapping_sub(usize::from(sprite.x));
+            if offset >= 8 {
+                continue;
+            }
+            let bit = if sprite.attributes & 0x40 == 0 {
+                7 - offset
+            } else {
+                offset
+            };
+            let low = (sprite.pattern_low >> bit) & 1;
+            let high = (sprite.pattern_high >> bit) & 1;
+            let pixel = low | (high << 1);
+            if pixel == 0 {
+                continue;
+            }
+            let palette = sprite.attributes & 0x03;
+            let color = self.render_palette_color(0x3f10 + u16::from(palette * 4 + pixel));
+            return Some((pixel, color, sprite.attributes & 0x20 != 0, sprite.index));
+        }
+        None
+    }
+
+    fn render_palette_color(&self, address: u16) -> u8 {
+        let color = self.render_ppu_read(address) & 0x3f;
+        if self.ppu_mask & 0x01 == 0 {
+            color
+        } else {
+            color & 0x30
+        }
+    }
+
+    fn render_ppu_read(&self, address: u16) -> u8 {
+        let address = address & 0x3fff;
+        match address {
+            0x0000..=0x1fff if self.chr_rom.is_empty() => self.chr_ram[usize::from(address)],
+            0x0000..=0x1fff => self
+                .mapper
+                .map_ppu(PpuAddress(address), self.mapper_state)
+                .and_then(|offset| self.chr_rom.get(offset.0).copied())
+                .unwrap_or(0),
+            0x2000..=0x3eff => self.nametable_ram[self.nametable_index(address)],
+            0x3f00..=0x3fff => self.palette[palette_index(address)],
+            _ => unreachable!(),
+        }
+    }
+
+    fn increment_render_x(&mut self) {
+        if self.ppu_address & 0x001f == 31 {
+            self.ppu_address &= !0x001f;
+            self.ppu_address ^= 0x0400;
+        } else {
+            self.ppu_address += 1;
+        }
+    }
+
+    fn increment_render_y(&mut self) {
+        if self.ppu_address & 0x7000 != 0x7000 {
+            self.ppu_address += 0x1000;
+            return;
+        }
+        self.ppu_address &= !0x7000;
+        let mut coarse_y = (self.ppu_address & 0x03e0) >> 5;
+        if coarse_y == 29 {
+            coarse_y = 0;
+            self.ppu_address ^= 0x0800;
+        } else if coarse_y == 31 {
+            coarse_y = 0;
+        } else {
+            coarse_y += 1;
+        }
+        self.ppu_address = (self.ppu_address & !0x03e0) | (coarse_y << 5);
+    }
+
+    fn copy_render_x(&mut self) {
+        self.ppu_address = (self.ppu_address & !0x041f) | (self.ppu_temporary_address & 0x041f);
+    }
+
+    fn copy_render_y(&mut self) {
+        self.ppu_address = (self.ppu_address & !0x7be0) | (self.ppu_temporary_address & 0x7be0);
     }
 
     fn physical_bank(&self, address: u16) -> Option<u16> {
@@ -2536,6 +2885,215 @@ fn palette_index(address: u16) -> usize {
     index
 }
 
-const fn div_ceil(numerator: u64, denominator: u64) -> u64 {
-    numerator / denominator + if numerator % denominator == 0 { 0 } else { 1 }
+#[cfg(test)]
+mod ppu_tests {
+    use nesc_rom::{Format, Metadata};
+
+    use super::*;
+
+    fn machine_with_chr(mapper: u16, mirroring: Mirroring, chr_rom: Vec<u8>) -> Machine {
+        let mut prg_rom = vec![0xea; 32 * 1024];
+        let vectors = prg_rom.len() - 6;
+        for offset in [0, 2, 4] {
+            prg_rom[vectors + offset..vectors + offset + 2]
+                .copy_from_slice(&0x8000_u16.to_le_bytes());
+        }
+        Machine::from_rom(
+            Rom {
+                metadata: Metadata {
+                    format: Format::Nes2,
+                    mapper,
+                    submapper: 0,
+                    mirroring,
+                    battery: false,
+                    region: Region::Ntsc,
+                    prg_rom_len: prg_rom.len(),
+                    chr_rom_len: chr_rom.len(),
+                },
+                trainer: None,
+                prg_rom,
+                chr_rom,
+            },
+            EmulatorConfig::default(),
+        )
+        .expect("PPU test machine")
+    }
+
+    fn solid_tiles() -> Vec<u8> {
+        let mut chr = vec![0; 8 * 1024];
+        chr[16..24].fill(0xff);
+        chr[32..40].fill(0xff);
+        chr
+    }
+
+    #[test]
+    fn implements_scroll_and_address_write_latches() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine
+            .write_ppu_register(0x2000, 0x03)
+            .expect("PPUCTRL write");
+        machine
+            .write_ppu_register(0x2005, 0x2d)
+            .expect("first PPUSCROLL write");
+        assert_eq!(machine.ppu_fine_x, 5);
+        assert!(machine.ppu_write_toggle);
+        machine
+            .write_ppu_register(0x2005, 0x56)
+            .expect("second PPUSCROLL write");
+        assert!(!machine.ppu_write_toggle);
+        assert_eq!(machine.ppu_scroll_x, 0x2d);
+        assert_eq!(machine.ppu_scroll_y, 0x56);
+        assert_eq!(machine.ppu_temporary_address & 0x0c00, 0x0c00);
+        assert_eq!(machine.ppu_temporary_address & 0x001f, 5);
+        assert_eq!((machine.ppu_temporary_address >> 5) & 0x1f, 10);
+        assert_eq!((machine.ppu_temporary_address >> 12) & 7, 6);
+
+        machine
+            .write_ppu_register(0x2006, 0x21)
+            .expect("high PPUADDR write");
+        assert!(machine.ppu_write_toggle);
+        machine
+            .write_ppu_register(0x2006, 0x34)
+            .expect("low PPUADDR write");
+        assert_eq!(machine.ppu_address, 0x2134);
+        assert_eq!(machine.ppu_temporary_address, 0x2134);
+        assert!(!machine.ppu_write_toggle);
+
+        machine.ppu_status = 0x80;
+        assert_eq!(machine.read_ppu_register(0x2002).expect("PPUSTATUS"), 0x80);
+        assert_eq!(machine.ppu_status & 0x80, 0);
+        assert!(!machine.ppu_write_toggle);
+    }
+
+    #[test]
+    fn renders_scrolled_background_pixels_to_palette_indices() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.write_ppu(0x2001, 1).expect("second tile");
+        machine.write_ppu(0x3f01, 0x21).expect("background palette");
+        machine
+            .write_ppu_register(0x2005, 8)
+            .expect("horizontal scroll");
+        machine
+            .write_ppu_register(0x2005, 0)
+            .expect("vertical scroll");
+        machine
+            .write_ppu_register(0x2001, 0x0a)
+            .expect("background rendering");
+
+        machine.advance_cycles(1);
+
+        assert_eq!(&machine.framebuffer()[..3], &[0x21; 3]);
+        assert_eq!(
+            machine.ppu_position(),
+            PpuPosition {
+                frame: 0,
+                scanline: 0,
+                dot: 3,
+            }
+        );
+        assert_eq!(machine.snapshot().framebuffer[0], 0x21);
+    }
+
+    #[test]
+    fn composes_sprites_and_sets_sprite_status_flags() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.write_ppu(0x2000, 1).expect("background tile");
+        machine.write_ppu(0x3f01, 0x11).expect("background palette");
+        machine.write_ppu(0x3f11, 0x2a).expect("sprite palette");
+        machine.oam[0] = 0xff;
+        machine.oam[1] = 2;
+        machine.oam[2] = 0;
+        machine.oam[3] = 0;
+        machine
+            .write_ppu_register(0x2001, 0x1e)
+            .expect("background and sprite rendering");
+
+        machine.advance_cycles(1);
+
+        assert_eq!(&machine.framebuffer()[..3], &[0x2a; 3]);
+        assert_ne!(machine.ppu_status & 0x40, 0, "sprite zero hit");
+
+        let mut overflow = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        for index in 0..9 {
+            overflow.oam[index * 4] = 0xff;
+            overflow.oam[index * 4 + 1] = 2;
+            overflow.oam[index * 4 + 3] = (index * 8) as u8;
+        }
+        overflow.ppu_mask = 0x14;
+        overflow.advance_cycles(1);
+        assert_ne!(overflow.ppu_status & 0x20, 0, "sprite overflow");
+    }
+
+    #[test]
+    fn renderer_observes_mapper_three_chr_bank_selection() {
+        let mut chr = vec![0; 16 * 1024];
+        chr[16..24].fill(0xff);
+        chr[8 * 1024 + 24..8 * 1024 + 32].fill(0xff);
+        let mut machine = machine_with_chr(3, Mirroring::Vertical, chr);
+        machine.write_ppu(0x2000, 1).expect("tile selection");
+        machine.write_ppu(0x3f01, 0x12).expect("pattern value one");
+        machine.write_ppu(0x3f02, 0x24).expect("pattern value two");
+        machine.mapper_state.chr_bank = 1;
+        machine.ppu_mask = 0x0a;
+
+        machine.advance_cycles(1);
+
+        assert_eq!(machine.framebuffer()[0], 0x24);
+    }
+
+    #[test]
+    fn clocks_region_vblank_boundaries_and_ntsc_odd_frames() {
+        for (timing, boundary) in [
+            (TimingProfile::Ntsc, 27_394),
+            (TimingProfile::Pal, 25_682),
+            (TimingProfile::Dendy, 33_078),
+        ] {
+            let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+            machine.timing = timing;
+            machine.set_cycles_for_test(boundary - 1);
+            machine.advance_cycles(1);
+            assert_ne!(machine.ppu_status & 0x80, 0, "{timing:?} vblank");
+            assert!(
+                machine
+                    .events
+                    .iter()
+                    .any(|event| { event.kind == EventKind::VBlank && event.cycle == boundary })
+            );
+        }
+
+        let mut ntsc = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        ntsc.ppu_mask = 0x08;
+        ntsc.advance_cycles(59_561);
+        let frame_cycles = ntsc
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::Frame)
+            .map(|event| event.cycle)
+            .collect::<Vec<_>>();
+        assert_eq!(frame_cycles, vec![29_781, 59_561]);
+        assert_eq!(ntsc.frames, 2);
+    }
+
+    #[test]
+    fn rendering_reads_follow_cartridge_nametable_mirroring() {
+        let mut horizontal = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        horizontal.write_ppu(0x2000, 0x31).expect("first nametable");
+        assert_eq!(
+            horizontal.peek_ppu(0x2400).expect("horizontal mirror"),
+            0x31
+        );
+        horizontal
+            .write_ppu(0x2800, 0x42)
+            .expect("second nametable");
+        assert_eq!(
+            horizontal.peek_ppu(0x2c00).expect("horizontal mirror"),
+            0x42
+        );
+
+        let mut vertical = machine_with_chr(0, Mirroring::Vertical, solid_tiles());
+        vertical.write_ppu(0x2000, 0x53).expect("first nametable");
+        assert_eq!(vertical.peek_ppu(0x2800).expect("vertical mirror"), 0x53);
+        vertical.write_ppu(0x2400, 0x64).expect("second nametable");
+        assert_eq!(vertical.peek_ppu(0x2c00).expect("vertical mirror"), 0x64);
+    }
 }

@@ -99,7 +99,7 @@ fn rom_with_interrupts_and_frame_boundary(mapper: u16) -> Vec<u8> {
     let program = [
         0xa9, 0x2a, // lda #$2a
         0x85, 0x00, // sta $00
-        0xa9, 0x1e, // lda #$1e
+        0xa9, 0x00, // lda #0; keep rendering off during VRAM setup
         0x8d, 0x01, 0x20, // sta $2001
         0xa9, 0x03, // lda #3
         0x8d, 0x03, 0x20, // sta $2003
