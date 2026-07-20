@@ -147,6 +147,21 @@ pub enum EventKind {
     Trap,
 }
 
+/// CPU-bus access performed by the most recent instruction or interrupt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BusAccess {
+    pub address: u16,
+    pub value: u8,
+    pub kind: BusAccessKind,
+}
+
+/// Direction of one CPU-bus access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BusAccessKind {
+    Read,
+    Write,
+}
+
 /// One deterministic execution event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservableEvent {
@@ -283,6 +298,7 @@ pub struct Machine {
     dropped_events: u64,
     trap_address: Option<u16>,
     trap_reason_address: Option<u16>,
+    last_bus_accesses: Vec<BusAccess>,
 }
 
 impl Machine {
@@ -363,6 +379,7 @@ impl Machine {
             dropped_events: 0,
             trap_address: config.trap_address,
             trap_reason_address: config.trap_reason_address,
+            last_bus_accesses: Vec::new(),
         })
     }
 
@@ -377,6 +394,7 @@ impl Machine {
         self.pending_nmi = false;
         self.irq_line = false;
         self.cpu.pc = self.read_word(RESET_VECTOR)?;
+        self.last_bus_accesses.clear();
         self.advance_cycles(7);
         Ok(())
     }
@@ -387,6 +405,7 @@ impl Machine {
     ///
     /// Fails on undocumented opcodes or required unmapped bus accesses.
     pub fn step(&mut self) -> Result<StepReport, EmulatorError> {
+        self.last_bus_accesses.clear();
         if self.trap_address == Some(self.cpu.pc) {
             let reason = self
                 .trap_reason_address
@@ -561,6 +580,20 @@ impl Machine {
                 .and_then(|offset| self.prg_rom.get(offset.0).copied())
                 .ok_or_else(|| self.failure(format!("unmapped PRG read ${address:04X}"))),
         }
+    }
+
+    /// Returns the physical 16 KiB PRG bank currently mapped at an address.
+    ///
+    /// This is observational and does not change mapper or MMIO state.
+    #[must_use]
+    pub fn mapped_prg_bank(&self, address: u16) -> Option<u16> {
+        self.physical_bank(address)
+    }
+
+    /// CPU-bus accesses performed by the most recent instruction or interrupt.
+    #[must_use]
+    pub fn last_bus_accesses(&self) -> &[BusAccess] {
+        &self.last_bus_accesses
     }
 
     #[must_use]
@@ -1092,10 +1125,20 @@ impl Machine {
         if (0x2000..=0x4017).contains(&address) {
             self.record(EventKind::VolatileRead, Some(address), Some(value), None);
         }
+        self.last_bus_accesses.push(BusAccess {
+            address,
+            value,
+            kind: BusAccessKind::Read,
+        });
         Ok(value)
     }
 
     fn cpu_write(&mut self, address: u16, value: u8) -> Result<(), EmulatorError> {
+        self.last_bus_accesses.push(BusAccess {
+            address,
+            value,
+            kind: BusAccessKind::Write,
+        });
         match address {
             0x0000..=0x1fff => self.ram[usize::from(address & 0x07ff)] = value,
             0x2000..=0x3fff => self.write_ppu_register(0x2000 | (address & 7), value)?,

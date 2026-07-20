@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 pub use cpu::CpuState;
 pub use machine::{
-    EmulatorConfig, EmulatorError, EventKind, InterruptKind, Machine, MachineSnapshot,
-    ObservableEvent, RunLimits, RunReport, StepReport, Termination, TimingProfile,
+    BusAccess, BusAccessKind, EmulatorConfig, EmulatorError, EventKind, InterruptKind, Machine,
+    MachineSnapshot, ObservableEvent, RunLimits, RunReport, StepReport, Termination, TimingProfile,
 };
 
 /// First difference between two ordered observable-event traces.
@@ -407,5 +407,24 @@ mod tests {
         let divergence =
             first_divergent_event(&original_events, &translated_events).expect("first divergence");
         assert_eq!(divergence.index, 1);
+    }
+
+    #[test]
+    fn exposes_observational_bus_accesses_for_watchpoints() {
+        let rom = rom_with_program(&[0xa9, 0x2a, 0x85, 0x10], Region::Ntsc);
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        machine.step().expect("load accumulator");
+        machine.step().expect("store zero page");
+        assert!(machine.last_bus_accesses().iter().any(|access| {
+            access.kind == super::BusAccessKind::Write
+                && access.address == 0x0010
+                && access.value == 0x2a
+        }));
+        let accesses = machine.last_bus_accesses().to_vec();
+        assert_eq!(machine.peek(0x0010).expect("observational read"), 0x2a);
+        assert_eq!(machine.last_bus_accesses(), accesses);
+        assert_eq!(machine.mapped_prg_bank(0x8000), Some(0));
     }
 }
