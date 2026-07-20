@@ -14,8 +14,8 @@ ROM. The toolkit is written in stable Rust 2024.
 > The compiler currently generates Mapper 0 ROMs. Mapper-aware ROM models for
 > UxROM and CNROM exist. Recursive disassembly currently accepts Mapper 0 ROMs;
 > SSA/value, call-graph, calling-convention, conservative type, and reducible
-> control-flow recovery are available as a library, while NesC and Rust source
-> emission remains under development.
+> control-flow recovery support hybrid NesC and stable Rust 2024 translation
+> with bounded fallback. Differential verification is available for Rust output.
 
 ## Highlights
 
@@ -27,14 +27,21 @@ ROM. The toolkit is written in stable Rust 2024.
   indirect access, and configurable bounds checks
 - Mapper 0 linking, iNES/NES 2.0 ROM construction, symbols, source maps, and
   deterministic emulator boot verification
-- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, and Mapper 0
-  `nesc disassemble` workflows
+- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0
+  `nesc disassemble`, `nesc decompile --emit=nesc`, and
+  `nesc decompile --emit=rust` workflows
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
 - Bank-qualified call graphs, recursive-component detection, evidence-scored
   `nescall` signatures, and conservative scalar and pointer type facts
 - Dominance-backed `if`, natural-loop, counted-loop, call, and return regions
   with explicit fallbacks for unresolved, recursive, or irreducible control
+- Stable Rust 2024 semantic translation using explicit CPU state, ordered bus
+  events, shared instruction budgets, and original-byte interpreter fallback
+- Hybrid NesC output with native reducible control flow and a bounded
+  target-side dispatcher for unresolved or irreducible functions
+- Original-6502-versus-Rust differential checks across deterministic CPU and
+  memory states, with the generated tests and pass report retained as artifacts
 - Rustc-style diagnostics with source spans and suggested corrections
 
 ## Current status
@@ -51,8 +58,11 @@ ROM. The toolkit is written in stable Rust 2024.
 | Official 6502 decoding and recursive Mapper 0 disassembly | Available |
 | Bank-qualified NROM CFG and semantic 6502 IR | Available as a library |
 | SSA/value, ABI/type, and reducible control-flow recovery | Available as a library |
+| Stable Rust host-side translation with bounded fallback | Available |
+| Hybrid NesC translation with bounded dispatcher fallback | Available |
+| Original-versus-Rust differential verification | Available |
 | Deterministic emulator boot verification | Available as a library |
-| Debugger and NesC/Rust source emission | Planned |
+| Debugger integration | Planned |
 
 ## Quick start
 
@@ -66,6 +76,10 @@ cargo run --manifest-path ../Cargo.toml -p nesc-cli -- check
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- build
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
   disassemble target/demo.nes --round-trip-check
+cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
+  decompile target/demo.nes --emit=rust --verify --output target/demo-rust
+cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
+  decompile target/demo.nes --emit=nesc --output target/demo-nesc
 ```
 
 Expected output:
@@ -75,6 +89,8 @@ Created `demo` at demo
 Checked `demo` v0.1.0 (src/main.c)
 Built `demo` at target
 Disassembled `target/demo.nes` into target/demo-disassembly (..., exact ROM round trip verified)
+Decompiled `target/demo.nes` into target/demo-rust as host-side stable Rust (..., verified)
+Decompiled `target/demo.nes` into target/demo-nesc as hybrid NesC (...)
 ```
 
 The generated project contains:
@@ -146,6 +162,7 @@ concerns. Core implementation crates include:
 | `nesc-codegen-6502`, `nesc-runtime` | Machine-code selection and runtime support |
 | `nesc-object`, `nesc-linker`, `nesc-rom` | Relocatable objects, linking, and cartridge containers |
 | `nesc-emulator` | Deterministic generated-ROM verification |
+| `nesc-decompiler`, `nesc-decompile-runtime` | ROM analysis, stable Rust emission, and host execution |
 
 SDK declarations live under `sdk/include/`.
 
@@ -165,8 +182,8 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete debugger integration and richer emulator timing coverage
 2. Add mapper-aware compilation for UxROM and CNROM
-3. Add verified stable-Rust and hybrid NesC emission, then extend recovery to
-   bank-switched cartridges
+3. Extend recovery and verification to bank-switched cartridges and compiled
+   NesC output
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
