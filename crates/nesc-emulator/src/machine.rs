@@ -197,6 +197,7 @@ pub struct MachineSnapshot {
     pub ram: Box<[u8; 0x800]>,
     pub prg_ram: Box<[u8; 0x2000]>,
     pub apu_io: Box<[u8; 0x18]>,
+    pub chr_ram: Box<[u8; 0x2000]>,
     pub palette: Box<[u8; 32]>,
     pub oam: Box<[u8; 256]>,
     pub nametable_ram: Box<[u8; 0x1000]>,
@@ -625,6 +626,11 @@ impl Machine {
     }
 
     #[must_use]
+    pub fn chr_ram(&self) -> &[u8; 0x2000] {
+        &self.chr_ram
+    }
+
+    #[must_use]
     pub fn events(&self) -> &VecDeque<ObservableEvent> {
         &self.events
     }
@@ -658,6 +664,7 @@ impl Machine {
             ram: self.ram.clone(),
             prg_ram: self.prg_ram.clone(),
             apu_io: self.apu_io.clone(),
+            chr_ram: self.chr_ram.clone(),
             palette: self.palette.clone(),
             oam: self.oam.clone(),
             nametable_ram: self.nametable_ram.clone(),
