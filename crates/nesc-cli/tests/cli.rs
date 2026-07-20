@@ -860,6 +860,31 @@ fn verifies_interrupt_schedules_and_frame_boundaries_for_supported_mappers() {
         assert!(report.contains("\"palette_bytes_compared_per_completed_execution\": 32"));
         assert!(report.contains("\"oam_bytes_compared_per_completed_execution\": 256"));
         assert!(report.contains("\"nametable_bytes_compared_per_completed_execution\": 4096"));
+        assert!(report.contains("\"kind\": \"nmi\""));
+        assert!(report.contains("\"kind\": \"irq\""));
+        assert!(report.contains("\"kind\": \"frame\""));
+        for (view, expected) in [
+            ("summary", "Verification passed"),
+            ("checkpoints", "frame function"),
+            ("ppu", "nametable RAM"),
+            ("apu", "APU I/O"),
+            ("cartridge", &format!("Mapper {mapper}")),
+            ("trace", "Checkpoint"),
+            ("divergence", "No divergence recorded"),
+        ] {
+            let debugged = nesc()
+                .current_dir(temporary.path())
+                .args(["debug", &output_name, "--view", view])
+                .output()
+                .expect("inspect verification artifact");
+            assert!(
+                debugged.status.success(),
+                "{}",
+                String::from_utf8_lossy(&debugged.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&debugged.stdout);
+            assert!(stdout.contains(expected), "{view}: {stdout}");
+        }
         let source = fs::read_to_string(temporary.path().join(&output_name).join("src/main.c"))
             .expect("instrumented source");
         assert!(source.contains("verification_observe(5, 0xfffa, 0)"));
@@ -984,13 +1009,19 @@ fn keeps_unknown_mapper_two_bank_state_in_rust_fallback() {
     assert!(!verification_rejected.status.success());
     let stderr = String::from_utf8_lossy(&verification_rejected.stderr);
     assert!(stderr.contains("error[E4212]"), "{stderr}");
-    assert!(stderr.contains("original execution failed"), "{stderr}");
-    assert!(
-        !temporary
-            .path()
-            .join("nesc-unverified/verification.json")
-            .exists()
-    );
+    assert!(stderr.contains("original execution differs"), "{stderr}");
+    let report = fs::read_to_string(temporary.path().join("nesc-unverified/verification.json"))
+        .expect("failed verification report");
+    assert!(report.contains("\"status\": \"failed\""), "{report}");
+    assert!(report.contains("\"divergence\""), "{report}");
+    let debugged = nesc()
+        .current_dir(temporary.path())
+        .args(["debug", "nesc-unverified", "--view", "divergence"])
+        .output()
+        .expect("inspect failed verification artifact");
+    assert!(debugged.status.success());
+    let stdout = String::from_utf8_lossy(&debugged.stdout);
+    assert!(stdout.contains("original execution differs"), "{stdout}");
 }
 
 #[test]

@@ -11,6 +11,7 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use clap::{Parser, Subcommand, ValueEnum};
 use nesc_asm::AssemblyLimits;
 use nesc_compiler::{BuildArtifacts, CompilerConfig, build_project, check_project};
+use nesc_debug::{DebugRequest, VerificationView, load_verification, render_verification};
 use nesc_decompiler::{
     AnalysisLimits as DecompilerLimits, ControlFlowLimits, NesCEmissionLimits, NesCEmitConfig,
     RecoveryLimits, RustEmissionLimits, RustEmitConfig, RustVerificationLimits,
@@ -107,6 +108,18 @@ enum Command {
         #[arg(long, default_value_t = 100_000)]
         max_work_items: usize,
     },
+    /// Inspect a structured decompilation verification artifact.
+    Debug {
+        /// Verification JSON file or decompiled project directory.
+        #[arg(value_name = "VERIFICATION_OR_DIRECTORY")]
+        artifact: PathBuf,
+        /// State view to render.
+        #[arg(long, value_enum, default_value_t = DebugViewKind::Summary)]
+        view: DebugViewKind,
+        /// Checkpoint identifier; state views default to the last checkpoint.
+        #[arg(long, value_name = "ID")]
+        checkpoint: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -118,6 +131,31 @@ enum AnalysisKind {
 enum DecompileKind {
     Nesc,
     Rust,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DebugViewKind {
+    Summary,
+    Checkpoints,
+    Ppu,
+    Apu,
+    Cartridge,
+    Trace,
+    Divergence,
+}
+
+impl From<DebugViewKind> for VerificationView {
+    fn from(value: DebugViewKind) -> Self {
+        match value {
+            DebugViewKind::Summary => Self::Summary,
+            DebugViewKind::Checkpoints => Self::Checkpoints,
+            DebugViewKind::Ppu => Self::Ppu,
+            DebugViewKind::Apu => Self::Apu,
+            DebugViewKind::Cartridge => Self::Cartridge,
+            DebugViewKind::Trace => Self::Trace,
+            DebugViewKind::Divergence => Self::Divergence,
+        }
+    }
 }
 
 /// Parses and executes a CLI invocation.
@@ -221,7 +259,29 @@ fn execute(command: Command) -> Result<String, Vec<Diagnostic>> {
                 max_work_items,
             },
         ),
+        Command::Debug {
+            artifact,
+            view,
+            checkpoint,
+        } => debug_verification(&artifact, view, checkpoint),
     }
+}
+
+fn debug_verification(
+    path: &Path,
+    view: DebugViewKind,
+    checkpoint: Option<usize>,
+) -> Result<String, Vec<Diagnostic>> {
+    let artifact = load_verification(path)
+        .map_err(|error| vec![Diagnostic::error("E4300", error.to_string())])?;
+    render_verification(
+        &artifact,
+        DebugRequest {
+            view: view.into(),
+            checkpoint,
+        },
+    )
+    .map_err(|error| vec![Diagnostic::error("E4301", error.to_string())])
 }
 
 fn write_artifacts(
@@ -602,28 +662,27 @@ fn decompile_rom_file(
                 let artifacts = build_project(&project, &CompilerConfig::bundled_sdk())?;
                 let target = destination.join("target");
                 write_artifacts(&target, &project.manifest().package.name, &artifacts)?;
-                let report = nesc_verification::verify(
+                match nesc_verification::verify(
                     &bytes,
                     &artifacts,
                     &program,
                     limits.max_instructions as u64,
-                )
-                .map_err(|error| {
-                    vec![Diagnostic::error(
-                        "E4212",
-                        format!("generated NesC failed differential verification: {error}"),
-                    )]
-                })?;
-                fs::write(destination.join("verification.json"), report.json).map_err(|error| {
-                    vec![Diagnostic::error(
-                        "E4212",
-                        format!(
-                            "could not write NesC verification report `{}`: {error}",
-                            destination.join("verification.json").display()
-                        ),
-                    )]
-                })?;
-                Some(report.executions)
+                ) {
+                    Ok(report) => {
+                        write_nesc_verification(&destination, &report.artifact)?;
+                        Some(report.executions)
+                    }
+                    Err(failure) => {
+                        write_nesc_verification(&destination, &failure.artifact)?;
+                        return Err(vec![Diagnostic::error(
+                            "E4212",
+                            format!(
+                                "generated NesC failed differential verification: {}",
+                                failure.message
+                            ),
+                        )]);
+                    }
+                }
             } else {
                 None
             };
@@ -639,6 +698,28 @@ fn decompile_rom_file(
             ))
         }
     }
+}
+
+fn write_nesc_verification(
+    destination: &Path,
+    artifact: &nesc_debug::VerificationArtifact,
+) -> Result<(), Vec<Diagnostic>> {
+    let path = destination.join("verification.json");
+    let json = artifact.to_json().map_err(|error| {
+        vec![Diagnostic::error(
+            "E4212",
+            format!("could not serialize NesC verification report: {error}"),
+        )]
+    })?;
+    fs::write(&path, json).map_err(|error| {
+        vec![Diagnostic::error(
+            "E4212",
+            format!(
+                "could not write NesC verification report `{}`: {error}",
+                path.display()
+            ),
+        )]
+    })
 }
 
 fn decompiler_diagnostics(

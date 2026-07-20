@@ -1,6 +1,10 @@
 use std::fmt;
 
 use nesc_compiler::BuildArtifacts;
+use nesc_debug::{
+    CpuCheckpoint, HardwareCheckpoint, MemoryValue, VerificationArtifact, VerificationCheckpoint,
+    VerificationDivergence, VerificationEvent, VerificationStatus,
+};
 use nesc_decompiler::{Function, FunctionEvidence, Program, Terminator};
 use nesc_disasm::VectorKind;
 use nesc_emulator::{
@@ -71,6 +75,24 @@ impl VerificationSchedule {
             Self::FrameCheckpoint { instruction } => (3, instruction),
         }
     }
+
+    const fn kind(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Nmi { .. } => Some("nmi"),
+            Self::Irq { .. } => Some("irq"),
+            Self::FrameCheckpoint { .. } => Some("frame"),
+        }
+    }
+
+    const fn instruction(self) -> Option<u16> {
+        match self {
+            Self::None => None,
+            Self::Nmi { instruction }
+            | Self::Irq { instruction }
+            | Self::FrameCheckpoint { instruction } => Some(instruction),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,8 +155,26 @@ struct TranslatedResult {
 }
 
 pub(crate) struct VerificationReport {
-    pub(crate) json: String,
+    pub(crate) artifact: VerificationArtifact,
     pub(crate) executions: usize,
+}
+
+pub(crate) struct VerificationFailure {
+    pub(crate) message: String,
+    pub(crate) artifact: Box<VerificationArtifact>,
+}
+
+type ComparisonResult = Result<(), Box<VerificationDivergence>>;
+
+struct VerificationCase<'a> {
+    case_index: usize,
+    function: &'a Function,
+    initial_bank: u16,
+    status: u8,
+    controller: u8,
+    schedule: VerificationSchedule,
+    frame: Option<usize>,
+    context: String,
 }
 
 pub(crate) fn verify(
@@ -142,23 +182,40 @@ pub(crate) fn verify(
     translated: &BuildArtifacts,
     program: &Program,
     instruction_limit: u64,
-) -> Result<VerificationReport, String> {
+) -> Result<VerificationReport, VerificationFailure> {
+    let mut artifact = base_artifact(program, instruction_limit);
     if instruction_limit == 0 {
-        return Err("verification instruction limit must be greater than zero".to_owned());
+        return Err(configuration_failure(
+            artifact,
+            "verification instruction limit must be greater than zero",
+        ));
     }
     let main_address = translated
         .symbol_addresses
         .get("main")
         .copied()
-        .ok_or_else(|| "generated ROM does not export `main`".to_owned())?;
-    let original = nesc_rom::parse(original_rom)
-        .map_err(|error| format!("original ROM is invalid: {error}"))?;
-    let translated_rom = nesc_rom::parse(&translated.rom)
-        .map_err(|error| format!("generated ROM is invalid: {error}"))?;
+        .ok_or_else(|| {
+            configuration_failure(artifact.clone(), "generated ROM does not export `main`")
+        })?;
+    let original = nesc_rom::parse(original_rom).map_err(|error| {
+        configuration_failure(
+            artifact.clone(),
+            format!("original ROM is invalid: {error}"),
+        )
+    })?;
+    let translated_rom = nesc_rom::parse(&translated.rom).map_err(|error| {
+        configuration_failure(
+            artifact.clone(),
+            format!("generated ROM is invalid: {error}"),
+        )
+    })?;
     if original.metadata.mapper != program.mapper
         || translated_rom.metadata.mapper != program.mapper
     {
-        return Err("verification ROM mapper metadata does not match semantic analysis".to_owned());
+        return Err(configuration_failure(
+            artifact,
+            "verification ROM mapper metadata does not match semantic analysis",
+        ));
     }
     let prg_bank_count = original.prg_rom.len() / 0x4000;
     let switchable_banks = if program.mapper == 2 {
@@ -167,65 +224,29 @@ pub(crate) fn verify(
         1
     };
     if switchable_banks == 0 || switchable_banks > usize::from(u8::MAX) {
-        return Err(format!(
-            "verification cannot represent {switchable_banks} switchable PRG bank contexts"
+        return Err(configuration_failure(
+            artifact,
+            format!(
+                "verification cannot represent {switchable_banks} switchable PRG bank contexts"
+            ),
         ));
     }
     if program.functions.is_empty() {
-        return Err("verification requires at least one recovered function".to_owned());
+        return Err(configuration_failure(
+            artifact,
+            "verification requires at least one recovered function",
+        ));
     }
 
     let semantic_limit = instruction_limit.min(u64::from(u16::MAX));
     let translated_limit = semantic_limit
         .saturating_mul(PHYSICAL_INSTRUCTION_MULTIPLIER)
         .max(1_024);
+    artifact.prg_banks = prg_bank_count;
+    artifact.switchable_bank_contexts = switchable_banks;
+    artifact.semantic_instruction_limit_per_execution = semantic_limit;
+    artifact.generated_instruction_limit_per_execution = translated_limit;
     let profiles = [(0x20_u8, 0x00_u8), (0x21, 0x01), (0x6f, 0x80), (0xef, 0xff)];
-    let mut executions = 0_usize;
-    let mut compared_events = 0_usize;
-    let mut direct_executions = 0_usize;
-    let mut nmi_executions = 0_usize;
-    let mut irq_executions = 0_usize;
-    let mut frame_executions = 0_usize;
-
-    let mut verify_case = |case_index: usize,
-                           function: &Function,
-                           initial_bank: u16,
-                           status: u8,
-                           controller: u8,
-                           schedule: VerificationSchedule,
-                           context: String|
-     -> Result<(), String> {
-        let original_result = run_original(
-            original_rom,
-            function.entry.cpu_address,
-            ExecutionConfig {
-                initial_bank,
-                status,
-                controller,
-                instruction_limit: semantic_limit,
-                schedule,
-            },
-        )
-        .map_err(|error| format!("original execution failed for {context}: {error}"))?;
-        let translated_result = run_translated(
-            &translated.rom,
-            main_address,
-            case_index,
-            ExecutionConfig {
-                initial_bank,
-                status,
-                controller,
-                instruction_limit: translated_limit,
-                schedule,
-            },
-        )
-        .map_err(|error| format!("generated execution failed for {context}: {error}"))?;
-        compare_results(&original_result, &translated_result, &context)?;
-        executions += 1;
-        compared_events += original_result.events.len();
-        Ok(())
-    };
-
     for (case_index, function) in program.functions.iter().enumerate() {
         if is_interrupt_handler(function, program) {
             continue;
@@ -237,15 +258,23 @@ pub(crate) fn verify(
                     function.id.0, function.entry.bank, function.entry.cpu_address, initial_bank
                 );
                 verify_case(
-                    case_index,
-                    function,
-                    initial_bank,
-                    status,
-                    controller,
-                    VerificationSchedule::None,
-                    context,
+                    original_rom,
+                    translated,
+                    main_address,
+                    semantic_limit,
+                    translated_limit,
+                    &mut artifact,
+                    VerificationCase {
+                        case_index,
+                        function,
+                        initial_bank,
+                        status,
+                        controller,
+                        schedule: VerificationSchedule::None,
+                        frame: None,
+                        context,
+                    },
                 )?;
-                direct_executions += 1;
             }
         }
     }
@@ -281,12 +310,24 @@ pub(crate) fn verify(
                 "reset function {} with {label} before semantic instruction 0, initial bank {initial_bank}",
                 reset.id.0
             );
-            verify_case(reset_case, reset, initial_bank, 0x20, 0, schedule, context)?;
-            if label == "NMI" {
-                nmi_executions += 1;
-            } else {
-                irq_executions += 1;
-            }
+            verify_case(
+                original_rom,
+                translated,
+                main_address,
+                semantic_limit,
+                translated_limit,
+                &mut artifact,
+                VerificationCase {
+                    case_index: reset_case,
+                    function: reset,
+                    initial_bank,
+                    status: 0x20,
+                    controller: 0,
+                    schedule,
+                    frame: None,
+                    context,
+                },
+            )?;
         }
 
         let frame_checkpoints = discover_frame_checkpoints(
@@ -296,7 +337,15 @@ pub(crate) fn verify(
             0x20,
             0,
             semantic_limit,
-        )?;
+        )
+        .map_err(|error| {
+            execution_failure(
+                &artifact,
+                "original frame discovery",
+                &format!("reset function {}, initial bank {initial_bank}", reset.id.0),
+                error,
+            )
+        })?;
         for (frame_index, instruction) in frame_checkpoints.into_iter().enumerate() {
             let frame = frame_index + 1;
             let context = format!(
@@ -304,26 +353,243 @@ pub(crate) fn verify(
                 reset.id.0
             );
             verify_case(
-                reset_case,
-                reset,
-                initial_bank,
-                0x20,
-                0,
-                VerificationSchedule::FrameCheckpoint { instruction },
-                context,
+                original_rom,
+                translated,
+                main_address,
+                semantic_limit,
+                translated_limit,
+                &mut artifact,
+                VerificationCase {
+                    case_index: reset_case,
+                    function: reset,
+                    initial_bank,
+                    status: 0x20,
+                    controller: 0,
+                    schedule: VerificationSchedule::FrameCheckpoint { instruction },
+                    frame: Some(frame),
+                    context,
+                },
             )?;
-            frame_executions += 1;
         }
     }
+    let executions = artifact.executions;
+    Ok(VerificationReport {
+        artifact,
+        executions,
+    })
+}
 
-    let json = format!(
-        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-nesc\",\n  \"status\": \"passed\",\n  \"mapper\": {},\n  \"prg_banks\": {},\n  \"functions\": {},\n  \"input_profiles_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {},\n  \"executions\": {executions},\n  \"direct_function_executions\": {direct_executions},\n  \"nmi_schedule_executions\": {nmi_executions},\n  \"irq_schedule_executions\": {irq_executions},\n  \"frame_checkpoint_limit_per_bank_context\": {FRAME_CHECKPOINT_LIMIT},\n  \"frame_boundary_executions\": {frame_executions},\n  \"interrupt_schedule_instruction\": 0,\n  \"observable_events_compared\": {compared_events},\n  \"semantic_event_capacity\": {EVENT_LIMIT},\n  \"ram_bytes_compared_per_completed_execution\": 2048,\n  \"prg_ram_bytes_compared_per_completed_execution\": 4096,\n  \"apu_io_bytes_compared_per_completed_execution\": 24,\n  \"chr_ram_bytes_compared_per_completed_execution\": 8192,\n  \"palette_bytes_compared_per_completed_execution\": 32,\n  \"oam_bytes_compared_per_completed_execution\": 256,\n  \"nametable_bytes_compared_per_completed_execution\": 4096,\n  \"verification_workspace\": \"0x7000..0x7fff\",\n  \"semantic_instruction_limit_per_execution\": {semantic_limit},\n  \"generated_instruction_limit_per_execution\": {translated_limit}\n}}\n",
-        program.mapper,
-        prg_bank_count,
-        program.functions.len(),
-        switchable_banks,
-    );
-    Ok(VerificationReport { json, executions })
+#[allow(clippy::too_many_arguments)]
+fn verify_case(
+    original_rom: &[u8],
+    translated: &BuildArtifacts,
+    main_address: u16,
+    semantic_limit: u64,
+    translated_limit: u64,
+    artifact: &mut VerificationArtifact,
+    case: VerificationCase<'_>,
+) -> Result<(), VerificationFailure> {
+    let original_result = run_original(
+        original_rom,
+        case.function.entry.cpu_address,
+        ExecutionConfig {
+            initial_bank: case.initial_bank,
+            status: case.status,
+            controller: case.controller,
+            instruction_limit: semantic_limit,
+            schedule: case.schedule,
+        },
+    )
+    .map_err(|error| execution_failure(artifact, "original execution", &case.context, error))?;
+    let translated_result = run_translated(
+        &translated.rom,
+        main_address,
+        case.case_index,
+        ExecutionConfig {
+            initial_bank: case.initial_bank,
+            status: case.status,
+            controller: case.controller,
+            instruction_limit: translated_limit,
+            schedule: case.schedule,
+        },
+    )
+    .map_err(|error| execution_failure(artifact, "generated execution", &case.context, error))?;
+    compare_results(&original_result, &translated_result, &case.context).map_err(
+        |mut divergence| {
+            if divergence.recent_original_events.is_empty() {
+                divergence.recent_original_events = recent_events(&original_result.events);
+            }
+            if divergence.recent_generated_events.is_empty() {
+                divergence.recent_generated_events = recent_events(&translated_result.events);
+            }
+            divergence_failure(artifact, *divergence)
+        },
+    )?;
+    artifact.executions += 1;
+    artifact.observable_events_compared += original_result.events.len();
+    if case.schedule == VerificationSchedule::None {
+        artifact.direct_function_executions += 1;
+    } else {
+        let checkpoint = checkpoint(artifact.checkpoints.len(), &case, &original_result);
+        artifact.checkpoints.push(checkpoint);
+        match case.schedule {
+            VerificationSchedule::None => {}
+            VerificationSchedule::Nmi { .. } => artifact.nmi_schedule_executions += 1,
+            VerificationSchedule::Irq { .. } => artifact.irq_schedule_executions += 1,
+            VerificationSchedule::FrameCheckpoint { .. } => {
+                artifact.frame_boundary_executions += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn base_artifact(program: &Program, instruction_limit: u64) -> VerificationArtifact {
+    VerificationArtifact {
+        schema_version: 1,
+        mode: "original-6502-vs-nesc".to_owned(),
+        status: VerificationStatus::Passed,
+        mapper: program.mapper,
+        functions: program.functions.len(),
+        input_profiles_per_bank_context: 4,
+        frame_checkpoint_limit_per_bank_context: FRAME_CHECKPOINT_LIMIT,
+        interrupt_schedule_instruction: 0,
+        semantic_event_capacity: EVENT_LIMIT,
+        ram_bytes_compared_per_completed_execution: 2048,
+        prg_ram_bytes_compared_per_completed_execution: 4096,
+        apu_io_bytes_compared_per_completed_execution: 24,
+        chr_ram_bytes_compared_per_completed_execution: 8192,
+        palette_bytes_compared_per_completed_execution: 32,
+        oam_bytes_compared_per_completed_execution: 256,
+        nametable_bytes_compared_per_completed_execution: 4096,
+        verification_workspace: "0x7000..0x7fff".to_owned(),
+        semantic_instruction_limit_per_execution: instruction_limit.min(u64::from(u16::MAX)),
+        ..VerificationArtifact::default()
+    }
+}
+
+fn configuration_failure(
+    artifact: VerificationArtifact,
+    message: impl Into<String>,
+) -> VerificationFailure {
+    let message = message.into();
+    divergence_failure(
+        &artifact,
+        VerificationDivergence {
+            category: "configuration".to_owned(),
+            context: "verification setup".to_owned(),
+            original: "valid configuration".to_owned(),
+            generated: message,
+            ..VerificationDivergence::default()
+        },
+    )
+}
+
+fn execution_failure(
+    artifact: &VerificationArtifact,
+    category: &str,
+    context: &str,
+    error: String,
+) -> VerificationFailure {
+    divergence_failure(
+        artifact,
+        VerificationDivergence {
+            category: category.to_owned(),
+            context: context.to_owned(),
+            original: "completed".to_owned(),
+            generated: error,
+            ..VerificationDivergence::default()
+        },
+    )
+}
+
+fn divergence_failure(
+    artifact: &VerificationArtifact,
+    divergence: VerificationDivergence,
+) -> VerificationFailure {
+    let message = divergence.message();
+    let mut artifact = artifact.clone();
+    artifact.status = VerificationStatus::Failed;
+    artifact.divergence = Some(divergence);
+    VerificationFailure {
+        message,
+        artifact: Box::new(artifact),
+    }
+}
+
+fn checkpoint(
+    id: usize,
+    case: &VerificationCase<'_>,
+    result: &OriginalResult,
+) -> VerificationCheckpoint {
+    VerificationCheckpoint {
+        id,
+        kind: case.schedule.kind().unwrap_or("completion").to_owned(),
+        function: case.function.id.0,
+        entry_bank: case.function.entry.bank,
+        entry_address: case.function.entry.cpu_address,
+        initial_bank: case.initial_bank,
+        status: case.status,
+        controller: case.controller,
+        frame: case.frame,
+        semantic_instruction: case.schedule.instruction(),
+        termination: result.termination.to_string(),
+        cpu: CpuCheckpoint {
+            a: result.cpu.a,
+            x: result.cpu.x,
+            y: result.cpu.y,
+            sp: result.cpu.sp,
+            status: result.cpu.status,
+            pc: result.cpu.pc,
+        },
+        mapper_prg_bank: result.prg_bank,
+        event_count: result.events.len(),
+        recent_events: recent_events(&result.events),
+        hardware: hardware_checkpoint(&result.hardware),
+    }
+}
+
+fn hardware_checkpoint(hardware: &HardwareState) -> HardwareCheckpoint {
+    HardwareCheckpoint {
+        apu_io: sparse_memory(&hardware.apu_io[..], 0x4000),
+        chr_ram: sparse_memory(&hardware.chr_ram[..], 0x0000),
+        palette: sparse_memory(&hardware.palette[..], 0x3f00),
+        oam: sparse_memory(&hardware.oam[..], 0x0000),
+        nametable_ram: sparse_memory(&hardware.nametable_ram[..], 0x2000),
+    }
+}
+
+fn sparse_memory(memory: &[u8], base: u16) -> Vec<MemoryValue> {
+    memory
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| **value != 0)
+        .map(|(index, value)| MemoryValue {
+            address: base.saturating_add(index as u16),
+            value: *value,
+        })
+        .collect()
+}
+
+fn recent_events(events: &[SemanticEvent]) -> Vec<VerificationEvent> {
+    let start = events.len().saturating_sub(8);
+    events[start..].iter().map(verification_event).collect()
+}
+
+fn verification_event(event: &SemanticEvent) -> VerificationEvent {
+    VerificationEvent {
+        kind: match event.kind {
+            1 => "volatile-read",
+            2 => "volatile-write",
+            3 => "mapper-write",
+            4 => "dma",
+            5 => "interrupt",
+            _ => "unknown",
+        }
+        .to_owned(),
+        address: event.address,
+        value: event.value,
+    }
 }
 
 fn has_vector(function: &Function, vector: VectorKind) -> bool {
@@ -689,31 +955,46 @@ fn compare_results(
     original: &OriginalResult,
     translated: &TranslatedResult,
     context: &str,
-) -> Result<(), String> {
+) -> ComparisonResult {
     if translated.termination != original.termination {
-        return Err(format!(
-            "termination differs for {context}: original {}, generated {}",
-            original.termination, translated.termination
-        ));
+        return Err(Box::new(divergence(
+            "termination",
+            context,
+            None,
+            original.termination.to_string(),
+            translated.termination.to_string(),
+        )));
     }
     if matches!(
         original.termination,
         RootTermination::Returned | RootTermination::Checkpoint
     ) {
         let translated_cpu = translated.cpu.ok_or_else(|| {
-            format!("generated execution returned without a completion record for {context}")
+            Box::new(divergence(
+                "completion record",
+                context,
+                None,
+                "present".to_owned(),
+                "missing".to_owned(),
+            ))
         })?;
         if translated_cpu != original.cpu {
-            return Err(format!(
-                "CPU state differs for {context}: original {:?}, generated {:?}",
-                original.cpu, translated_cpu
-            ));
+            return Err(Box::new(divergence(
+                "CPU state",
+                context,
+                None,
+                format!("{:?}", original.cpu),
+                format!("{translated_cpu:?}"),
+            )));
         }
         if translated.prg_bank != Some(original.prg_bank) {
-            return Err(format!(
-                "mapper state differs for {context}: original bank {}, generated bank {:?}",
-                original.prg_bank, translated.prg_bank
-            ));
+            return Err(Box::new(divergence(
+                "mapper state",
+                context,
+                Some("PRG bank".to_owned()),
+                original.prg_bank.to_string(),
+                format!("{:?}", translated.prg_bank),
+            )));
         }
         compare_memory(
             "RAM",
@@ -773,14 +1054,22 @@ fn compare_results(
             .position(|(translated, original)| translated != original)
             .unwrap_or_else(|| translated.events.len().min(original.events.len()));
         let trace_start = first.saturating_sub(4);
-        return Err(format!(
-            "first divergent semantic event {first} for {context}: original {:?}, generated {:?}; recent original events {:?}; recent generated events {:?}",
-            original.events.get(first),
-            translated.events.get(first),
-            &original.events[trace_start..first.min(original.events.len())],
-            &translated.events
+        return Err(Box::new(VerificationDivergence {
+            category: "semantic event".to_owned(),
+            context: context.to_owned(),
+            location: Some(first.to_string()),
+            original: format!("{:?}", original.events.get(first)),
+            generated: format!("{:?}", translated.events.get(first)),
+            recent_original_events: original.events[trace_start..first.min(original.events.len())]
+                .iter()
+                .map(verification_event)
+                .collect(),
+            recent_generated_events: translated.events
                 [trace_start.min(translated.events.len())..first.min(translated.events.len())]
-        ));
+                .iter()
+                .map(verification_event)
+                .collect(),
+        }));
     }
     Ok(())
 }
@@ -791,18 +1080,39 @@ fn compare_memory(
     translated: &[u8],
     address_base: u16,
     context: &str,
-) -> Result<(), String> {
+) -> ComparisonResult {
     if let Some(index) = original
         .iter()
         .zip(translated)
         .position(|(original, translated)| original != translated)
     {
-        return Err(format!(
-            "{name} differs at ${:04X} for {context}: original ${:02X}, generated ${:02X}",
-            address_base.saturating_add(index as u16),
-            original[index],
-            translated[index]
-        ));
+        return Err(Box::new(divergence(
+            name,
+            context,
+            Some(format!(
+                "${:04X}",
+                address_base.saturating_add(index as u16)
+            )),
+            format!("${:02X}", original[index]),
+            format!("${:02X}", translated[index]),
+        )));
     }
     Ok(())
+}
+
+fn divergence(
+    category: &str,
+    context: &str,
+    location: Option<String>,
+    original: String,
+    generated: String,
+) -> VerificationDivergence {
+    VerificationDivergence {
+        category: category.to_owned(),
+        context: context.to_owned(),
+        location,
+        original,
+        generated,
+        ..VerificationDivergence::default()
+    }
 }
