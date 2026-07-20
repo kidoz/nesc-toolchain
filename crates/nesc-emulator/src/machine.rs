@@ -178,9 +178,13 @@ pub enum EventKind {
 /// CPU-bus access performed by the most recent instruction or interrupt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BusAccess {
+    pub cycle: u64,
+    pub pc: u16,
+    pub physical_bank: Option<u16>,
     pub address: u16,
     pub value: u8,
     pub kind: BusAccessKind,
+    pub dummy: bool,
 }
 
 /// Direction of one CPU-bus access.
@@ -226,6 +230,7 @@ pub struct StepReport {
 pub struct CycleReport {
     pub cycle: u64,
     pub instruction_complete: bool,
+    pub access: Option<BusAccess>,
     pub step: Option<StepReport>,
 }
 
@@ -297,9 +302,48 @@ struct AddressResult {
 }
 
 #[derive(Clone, Copy)]
+enum MicroOperation {
+    Read {
+        address: u16,
+        dummy: bool,
+        semantic: bool,
+    },
+    Write {
+        address: u16,
+        value: u8,
+        dummy: bool,
+    },
+    DmaRead {
+        address: u16,
+    },
+    DmaWrite,
+}
+
+impl MicroOperation {
+    const fn is_dummy(self) -> bool {
+        match self {
+            Self::Read { dummy, .. } | Self::Write { dummy, .. } => dummy,
+            Self::DmaRead { .. } | Self::DmaWrite => false,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PendingStep {
     report: StepReport,
-    remaining_cycles: u64,
+    mnemonic: Option<Mnemonic>,
+    initial_cpu: CpuState,
+    final_cpu: CpuState,
+    operations: VecDeque<MicroOperation>,
+    dma_latch: u8,
+    count_instruction: bool,
+}
+
+#[derive(Clone, Copy)]
+struct BusAccessContext {
+    cycle: u64,
+    pc: u16,
+    dummy: bool,
 }
 
 /// Public deterministic NES machine.
@@ -342,6 +386,9 @@ pub struct Machine {
     trap_reason_address: Option<u16>,
     last_bus_accesses: Vec<BusAccess>,
     pending_step: Option<PendingStep>,
+    bus_access_context: Option<BusAccessContext>,
+    defer_dma: bool,
+    planning: bool,
 }
 
 impl Machine {
@@ -424,6 +471,9 @@ impl Machine {
             trap_reason_address: config.trap_reason_address,
             last_bus_accesses: Vec::new(),
             pending_step: None,
+            bus_access_context: None,
+            defer_dma: false,
+            planning: false,
         })
     }
 
@@ -438,6 +488,9 @@ impl Machine {
         self.pending_nmi = false;
         self.irq_line = false;
         self.pending_step = None;
+        self.bus_access_context = None;
+        self.defer_dma = false;
+        self.planning = false;
         self.cpu.pc = self.read_word(RESET_VECTOR)?;
         self.last_bus_accesses.clear();
         self.advance_cycles(7);
@@ -450,46 +503,54 @@ impl Machine {
     ///
     /// Fails on undocumented opcodes or required unmapped bus accesses.
     pub fn step(&mut self) -> Result<StepReport, EmulatorError> {
-        if self.pending_step.is_some() {
-            loop {
-                if let Some(report) = self.step_cycle()?.step {
-                    return Ok(report);
-                }
+        loop {
+            if let Some(report) = self.step_cycle()?.step {
+                return Ok(report);
             }
         }
-        let report = self.begin_step()?;
-        self.advance_cycles(report.cycles);
-        Ok(report)
     }
 
     /// Advances exactly one CPU clock.
     ///
-    /// Instruction-visible CPU and bus effects are applied when the first
-    /// clock begins; timing, stalls, vblank, and frame transitions then advance
-    /// one clock per call until the completed instruction report is returned.
+    /// One scheduled CPU-bus operation, including dummy accesses and DMA
+    /// transfers, is performed on each clock. Architectural CPU state commits
+    /// when the instruction's final clock completes.
     pub fn step_cycle(&mut self) -> Result<CycleReport, EmulatorError> {
-        let mut pending = if let Some(pending) = self.pending_step.take() {
-            pending
-        } else {
-            let report = self.begin_step()?;
-            if report.cycles == 0 {
+        if self.pending_step.is_none() {
+            if let Some(report) = self.prepare_step()? {
                 return Ok(CycleReport {
                     cycle: self.cycles,
                     instruction_complete: true,
+                    access: None,
                     step: Some(report),
                 });
             }
-            PendingStep {
-                report,
-                remaining_cycles: report.cycles,
-            }
-        };
+        }
+        let mut pending = self
+            .pending_step
+            .take()
+            .ok_or_else(|| self.failure("cycle scheduler did not prepare an instruction"))?;
+        let operation = pending.operations.pop_front().ok_or_else(|| {
+            self.failure("cycle scheduler prepared an instruction without bus operations")
+        })?;
         self.advance_cycles(1);
-        pending.remaining_cycles -= 1;
-        if pending.remaining_cycles == 0 {
+        self.bus_access_context = Some(BusAccessContext {
+            cycle: self.cycles,
+            pc: pending.report.pc,
+            dummy: operation.is_dummy(),
+        });
+        let performed = self.perform_micro_operation(operation, &mut pending);
+        self.bus_access_context = None;
+        let access = performed?;
+        if pending.operations.is_empty() {
+            self.cpu = pending.final_cpu;
+            if pending.count_instruction {
+                self.instructions = self.instructions.saturating_add(1);
+            }
             Ok(CycleReport {
                 cycle: self.cycles,
                 instruction_complete: true,
+                access,
                 step: Some(pending.report),
             })
         } else {
@@ -497,9 +558,128 @@ impl Machine {
             Ok(CycleReport {
                 cycle: self.cycles,
                 instruction_complete: false,
+                access,
                 step: None,
             })
         }
+    }
+
+    fn prepare_step(&mut self) -> Result<Option<StepReport>, EmulatorError> {
+        let initial_cpu = self.cpu;
+        let initial_instructions = self.instructions;
+        let initial_pending_nmi = self.pending_nmi;
+        let initial_stall_cycles = self.stall_cycles;
+        self.planning = true;
+        self.last_bus_accesses.clear();
+        let planned_report = self.begin_step();
+        let final_cpu = self.cpu;
+        let count_instruction = self.instructions > initial_instructions;
+        let planned_stall_cycles = self.stall_cycles;
+        let planned_accesses = std::mem::take(&mut self.last_bus_accesses);
+        self.cpu = initial_cpu;
+        self.instructions = initial_instructions;
+        self.pending_nmi = initial_pending_nmi;
+        self.stall_cycles = initial_stall_cycles;
+        self.planning = false;
+        let mut report = planned_report?;
+        if report.cycles == 0 {
+            return self.begin_step().map(Some);
+        }
+        if planned_stall_cycles != 0 {
+            let instruction_cycles = report
+                .cycles
+                .checked_sub(planned_stall_cycles)
+                .ok_or_else(|| self.failure("DMA stall exceeds the complete step time"))?;
+            let write_cycle = self.cycles.saturating_add(instruction_cycles);
+            report.cycles = instruction_cycles
+                .saturating_add(513)
+                .saturating_add(write_cycle & 1);
+        }
+        let operations = build_micro_operations(report, initial_cpu, final_cpu, &planned_accesses)
+            .map_err(|message| self.failure(message))?;
+        if operations.len() as u64 != report.cycles {
+            return Err(self.failure(format!(
+                "cycle scheduler produced {} clocks for a {}-clock step",
+                operations.len(),
+                report.cycles
+            )));
+        }
+        if report.interrupt == Some(InterruptKind::Nmi) {
+            self.pending_nmi = false;
+        }
+        self.last_bus_accesses.clear();
+        self.pending_step = Some(PendingStep {
+            report,
+            mnemonic: report
+                .opcode
+                .and_then(opcode)
+                .map(|instruction| instruction.mnemonic),
+            initial_cpu,
+            final_cpu,
+            operations,
+            dma_latch: 0,
+            count_instruction,
+        });
+        Ok(None)
+    }
+
+    fn perform_micro_operation(
+        &mut self,
+        operation: MicroOperation,
+        pending: &mut PendingStep,
+    ) -> Result<Option<BusAccess>, EmulatorError> {
+        let before = self.last_bus_accesses.len();
+        match operation {
+            MicroOperation::Read {
+                address, semantic, ..
+            } => {
+                let value = self.cpu_read(address)?;
+                if semantic {
+                    apply_semantic_read(pending, value);
+                }
+            }
+            MicroOperation::Write { address, value, .. } => {
+                self.defer_dma = address == 0x4014;
+                let result = self.cpu_write(address, value);
+                self.defer_dma = false;
+                result?;
+            }
+            MicroOperation::DmaRead { address } => {
+                pending.dma_latch = self.cpu_read(address)?;
+            }
+            MicroOperation::DmaWrite => self.dma_write(pending.dma_latch),
+        }
+        if self.last_bus_accesses.len() != before + 1 {
+            return Err(self.failure("one CPU clock performed an invalid number of bus accesses"));
+        }
+        let access = self.last_bus_accesses.last().copied();
+        if before == 0 {
+            if let Some(opcode) = pending.report.opcode {
+                self.record_at(
+                    EventKind::Instruction,
+                    Some(pending.report.pc),
+                    Some(opcode),
+                    access.and_then(|access| access.physical_bank),
+                    self.cycles,
+                    pending.report.pc,
+                );
+            }
+            if let Some(interrupt) = pending.report.interrupt {
+                let vector = match interrupt {
+                    InterruptKind::Nmi => NMI_VECTOR,
+                    InterruptKind::Irq | InterruptKind::Brk => IRQ_VECTOR,
+                };
+                self.record_at(
+                    EventKind::Interrupt,
+                    Some(vector),
+                    None,
+                    None,
+                    self.cycles,
+                    pending.report.pc,
+                );
+            }
+        }
+        Ok(access)
     }
 
     fn begin_step(&mut self) -> Result<StepReport, EmulatorError> {
@@ -567,7 +747,7 @@ impl Machine {
             pc: instruction_pc,
             opcode: Some(opcode_byte),
             cycles,
-            interrupt: None,
+            interrupt: (instruction.mnemonic == Mnemonic::Brk).then_some(InterruptKind::Brk),
             termination: None,
         })
     }
@@ -705,6 +885,12 @@ impl Machine {
     #[must_use]
     pub const fn cycles(&self) -> u64 {
         self.cycles
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cycles_for_test(&mut self, cycles: u64) {
+        self.cycles = cycles;
+        self.frames = self.timing.frames_at(cycles);
     }
 
     #[must_use]
@@ -1223,41 +1409,48 @@ impl Machine {
     }
 
     fn cpu_read(&mut self, address: u16) -> Result<u8, EmulatorError> {
-        let value = match address {
-            0x0000..=0x1fff => self.ram[usize::from(address & 0x07ff)],
-            0x2000..=0x3fff => self.read_ppu_register(0x2000 | (address & 7))?,
-            0x4000..=0x4015 => self.apu_io[usize::from(address - 0x4000)],
-            0x4016 | 0x4017 => self.read_controller(usize::from(address - 0x4016)),
-            0x4018..=0x5fff => 0,
-            0x6000..=0x7fff => self.prg_ram[usize::from(address - 0x6000)],
-            0x8000..=0xffff => self
-                .mapper
-                .map_cpu(CpuAddress(address), self.mapper_state)
-                .and_then(|offset| self.prg_rom.get(offset.0).copied())
-                .ok_or_else(|| self.failure(format!("unmapped PRG read ${address:04X}")))?,
+        let physical_bank = self.physical_bank(address);
+        let value = if self.planning {
+            self.planning_read(address)?
+        } else {
+            match address {
+                0x0000..=0x1fff => self.ram[usize::from(address & 0x07ff)],
+                0x2000..=0x3fff => self.read_ppu_register(0x2000 | (address & 7))?,
+                0x4000..=0x4015 => self.apu_io[usize::from(address - 0x4000)],
+                0x4016 | 0x4017 => self.read_controller(usize::from(address - 0x4016)),
+                0x4018..=0x5fff => 0,
+                0x6000..=0x7fff => self.prg_ram[usize::from(address - 0x6000)],
+                0x8000..=0xffff => self
+                    .mapper
+                    .map_cpu(CpuAddress(address), self.mapper_state)
+                    .and_then(|offset| self.prg_rom.get(offset.0).copied())
+                    .ok_or_else(|| self.failure(format!("unmapped PRG read ${address:04X}")))?,
+            }
         };
-        if (0x2000..=0x4017).contains(&address) {
+        if !self.planning && (0x2000..=0x4017).contains(&address) {
             self.record(EventKind::VolatileRead, Some(address), Some(value), None);
         }
-        self.last_bus_accesses.push(BusAccess {
-            address,
-            value,
-            kind: BusAccessKind::Read,
-        });
+        self.record_bus_access(address, value, BusAccessKind::Read, physical_bank);
         Ok(value)
     }
 
     fn cpu_write(&mut self, address: u16, value: u8) -> Result<(), EmulatorError> {
-        self.last_bus_accesses.push(BusAccess {
-            address,
-            value,
-            kind: BusAccessKind::Write,
-        });
+        let physical_bank = self.physical_bank(address);
+        self.record_bus_access(address, value, BusAccessKind::Write, physical_bank);
+        if self.planning {
+            if address == 0x4014 {
+                self.oam_dma(value)?;
+            }
+            return Ok(());
+        }
         match address {
             0x0000..=0x1fff => self.ram[usize::from(address & 0x07ff)] = value,
             0x2000..=0x3fff => self.write_ppu_register(0x2000 | (address & 7), value)?,
             0x4000..=0x4013 | 0x4015 | 0x4017 => {
                 self.apu_io[usize::from(address - 0x4000)] = value;
+            }
+            0x4014 if self.defer_dma => {
+                self.record(EventKind::Dma, Some(0x4014), Some(value), None);
             }
             0x4014 => self.oam_dma(value)?,
             0x4016 => self.write_controller_strobe(value),
@@ -1266,7 +1459,12 @@ impl Machine {
             0x8000..=0xffff => {
                 self.mapper
                     .cpu_write(CpuAddress(address), value, &mut self.mapper_state);
-                self.record(EventKind::MapperWrite, Some(address), Some(value), None);
+                self.record(
+                    EventKind::MapperWrite,
+                    Some(address),
+                    Some(value),
+                    physical_bank,
+                );
                 return Ok(());
             }
         }
@@ -1274,6 +1472,47 @@ impl Machine {
             self.record(EventKind::VolatileWrite, Some(address), Some(value), None);
         }
         Ok(())
+    }
+
+    fn planning_read(&self, address: u16) -> Result<u8, EmulatorError> {
+        if (0x2000..=0x3fff).contains(&address) && (address & 7) == 7 {
+            let ppu_address = self.ppu_address & 0x3fff;
+            return if ppu_address >= 0x3f00 {
+                self.peek_ppu(ppu_address)
+            } else {
+                Ok(self.ppu_data_buffer)
+            };
+        }
+        self.peek(address)
+    }
+
+    fn record_bus_access(
+        &mut self,
+        address: u16,
+        value: u8,
+        kind: BusAccessKind,
+        physical_bank: Option<u16>,
+    ) {
+        let context = self.bus_access_context.unwrap_or(BusAccessContext {
+            cycle: self.cycles,
+            pc: self.cpu.pc,
+            dummy: false,
+        });
+        self.last_bus_accesses.push(BusAccess {
+            cycle: context.cycle,
+            pc: context.pc,
+            physical_bank,
+            address,
+            value,
+            kind,
+            dummy: context.dummy,
+        });
+    }
+
+    fn dma_write(&mut self, value: u8) {
+        self.record_bus_access(0x2004, value, BusAccessKind::Write, None);
+        self.oam[usize::from(self.oam_address)] = value;
+        self.oam_address = self.oam_address.wrapping_add(1);
     }
 
     fn read_ppu_register(&mut self, register: u16) -> Result<u8, EmulatorError> {
@@ -1409,8 +1648,10 @@ impl Machine {
         let base = u16::from(page) << 8;
         for offset in 0..=u8::MAX {
             let value = self.cpu_read(base | u16::from(offset))?;
-            let index = self.oam_address.wrapping_add(offset);
-            self.oam[usize::from(index)] = value;
+            if !self.planning {
+                let index = self.oam_address.wrapping_add(offset);
+                self.oam[usize::from(index)] = value;
+            }
         }
         let dma_cycles = 513 + (self.cycles & 1);
         self.stall_cycles = self.stall_cycles.saturating_add(dma_cycles);
@@ -1531,6 +1772,9 @@ impl Machine {
         cycle: u64,
         pc: u16,
     ) {
+        if self.planning {
+            return;
+        }
         if self.events.len() == self.event_capacity {
             self.events.pop_front();
             self.dropped_events = self.dropped_events.saturating_add(1);
@@ -1564,6 +1808,635 @@ impl Machine {
                 .collect(),
         }
     }
+}
+
+fn build_micro_operations(
+    report: StepReport,
+    initial_cpu: CpuState,
+    final_cpu: CpuState,
+    accesses: &[BusAccess],
+) -> Result<VecDeque<MicroOperation>, String> {
+    let mut operations = if let Some(opcode_byte) = report.opcode {
+        let instruction = opcode(opcode_byte)
+            .ok_or_else(|| format!("cannot schedule undocumented opcode ${opcode_byte:02X}"))?;
+        schedule_instruction(
+            instruction.mnemonic,
+            instruction.mode,
+            initial_cpu,
+            final_cpu,
+            report.cycles,
+            accesses,
+        )?
+    } else {
+        schedule_interrupt(initial_cpu, accesses)?
+    };
+
+    let dma_page = operations.iter().find_map(|operation| match operation {
+        MicroOperation::Write {
+            address: 0x4014,
+            value,
+            ..
+        } => Some(*value),
+        _ => None,
+    });
+    if let Some(page) = dma_page {
+        let base_cycles = operations.len() as u64;
+        let stall_cycles = report.cycles.checked_sub(base_cycles).ok_or_else(|| {
+            "DMA cycle count is shorter than its triggering instruction".to_owned()
+        })?;
+        let idle_cycles = stall_cycles
+            .checked_sub(512)
+            .ok_or_else(|| "DMA stall omits required transfer clocks".to_owned())?;
+        if !(1..=2).contains(&idle_cycles) {
+            return Err(format!(
+                "DMA requires one or two alignment clocks, got {idle_cycles}"
+            ));
+        }
+        for _ in 0..idle_cycles {
+            operations.push_back(dummy_read(final_cpu.pc));
+        }
+        let base = u16::from(page) << 8;
+        for offset in 0..=u8::MAX {
+            operations.push_back(MicroOperation::DmaRead {
+                address: base | u16::from(offset),
+            });
+            operations.push_back(MicroOperation::DmaWrite);
+        }
+    }
+    Ok(operations)
+}
+
+fn schedule_interrupt(
+    initial_cpu: CpuState,
+    accesses: &[BusAccess],
+) -> Result<VecDeque<MicroOperation>, String> {
+    require_accesses(accesses, 5, "external interrupt")?;
+    Ok(VecDeque::from([
+        dummy_read(initial_cpu.pc),
+        dummy_read(initial_cpu.pc),
+        logical(accesses[0]),
+        logical(accesses[1]),
+        logical(accesses[2]),
+        logical(accesses[3]),
+        logical(accesses[4]),
+    ]))
+}
+
+fn schedule_instruction(
+    mnemonic: Mnemonic,
+    mode: AddressingMode,
+    initial_cpu: CpuState,
+    final_cpu: CpuState,
+    cycles: u64,
+    accesses: &[BusAccess],
+) -> Result<VecDeque<MicroOperation>, String> {
+    if is_branch(mnemonic) {
+        return schedule_branch(initial_cpu, final_cpu, cycles, accesses);
+    }
+    if is_modify(mnemonic, mode) {
+        let mut operations = schedule_modify(mode, accesses)?;
+        mark_semantic_read(&mut operations)?;
+        return Ok(operations);
+    }
+    if is_store(mnemonic) {
+        return schedule_store(mode, accesses);
+    }
+    let mut operations = match mnemonic {
+        Mnemonic::Brk => {
+            require_accesses(accesses, 6, "BRK")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                dummy_read(initial_cpu.pc.wrapping_add(1)),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                logical(accesses[3]),
+                logical(accesses[4]),
+                logical(accesses[5]),
+            ])
+        }
+        Mnemonic::Jmp if mode == AddressingMode::Indirect => {
+            require_accesses(accesses, 5, "indirect JMP")?;
+            accesses[..5].iter().copied().map(logical).collect()
+        }
+        Mnemonic::Jmp => {
+            require_accesses(accesses, 3, "absolute JMP")?;
+            accesses[..3].iter().copied().map(logical).collect()
+        }
+        Mnemonic::Jsr => {
+            require_accesses(accesses, 5, "JSR")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                dummy_read(STACK_BASE | u16::from(initial_cpu.sp)),
+                logical(accesses[3]),
+                logical(accesses[4]),
+                logical(accesses[2]),
+            ])
+        }
+        Mnemonic::Pha | Mnemonic::Php => {
+            require_accesses(accesses, 2, "stack push")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                dummy_read(initial_cpu.pc.wrapping_add(1)),
+                logical(accesses[1]),
+            ])
+        }
+        Mnemonic::Pla | Mnemonic::Plp => {
+            require_accesses(accesses, 2, "stack pull")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                dummy_read(initial_cpu.pc.wrapping_add(1)),
+                dummy_read(STACK_BASE | u16::from(initial_cpu.sp)),
+                logical(accesses[1]),
+            ])
+        }
+        Mnemonic::Rti => {
+            require_accesses(accesses, 4, "RTI")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                dummy_read(initial_cpu.pc.wrapping_add(1)),
+                dummy_read(STACK_BASE | u16::from(initial_cpu.sp)),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                logical(accesses[3]),
+            ])
+        }
+        Mnemonic::Rts => {
+            require_accesses(accesses, 3, "RTS")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                dummy_read(initial_cpu.pc.wrapping_add(1)),
+                dummy_read(STACK_BASE | u16::from(initial_cpu.sp)),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                dummy_read(final_cpu.pc.wrapping_sub(1)),
+            ])
+        }
+        _ if matches!(mode, AddressingMode::Implied | AddressingMode::Accumulator) => {
+            require_accesses(accesses, 1, "implied instruction")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                dummy_read(initial_cpu.pc.wrapping_add(1)),
+            ])
+        }
+        _ => schedule_read(mode, accesses)?,
+    };
+    if is_alu_read(mnemonic) {
+        mark_semantic_read(&mut operations)?;
+    }
+    Ok(operations)
+}
+
+fn schedule_read(
+    mode: AddressingMode,
+    accesses: &[BusAccess],
+) -> Result<VecDeque<MicroOperation>, String> {
+    let operations = match mode {
+        AddressingMode::Immediate => {
+            require_accesses(accesses, 2, "immediate read")?;
+            VecDeque::from([logical(accesses[0]), logical(accesses[1])])
+        }
+        AddressingMode::ZeroPage => {
+            require_accesses(accesses, 3, "zero-page read")?;
+            accesses[..3].iter().copied().map(logical).collect()
+        }
+        AddressingMode::ZeroPageX | AddressingMode::ZeroPageY => {
+            require_accesses(accesses, 3, "indexed zero-page read")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                dummy_read(u16::from(accesses[1].value)),
+                logical(accesses[2]),
+            ])
+        }
+        AddressingMode::Absolute => {
+            require_accesses(accesses, 4, "absolute read")?;
+            accesses[..4].iter().copied().map(logical).collect()
+        }
+        AddressingMode::AbsoluteX | AddressingMode::AbsoluteY => {
+            require_accesses(accesses, 4, "indexed absolute read")?;
+            let base = operand_word(accesses, 1)?;
+            let effective = accesses[3].address;
+            let mut result = VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                logical(accesses[2]),
+            ]);
+            if base & 0xff00 != effective & 0xff00 {
+                result.push_back(dummy_read(indexed_dummy_address(base, effective)));
+            }
+            result.push_back(logical(accesses[3]));
+            result
+        }
+        AddressingMode::IndexedIndirect => {
+            require_accesses(accesses, 5, "indexed-indirect read")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                dummy_read(u16::from(accesses[1].value)),
+                logical(accesses[2]),
+                logical(accesses[3]),
+                logical(accesses[4]),
+            ])
+        }
+        AddressingMode::IndirectIndexed => {
+            require_accesses(accesses, 5, "indirect-indexed read")?;
+            let base = u16::from_le_bytes([accesses[2].value, accesses[3].value]);
+            let effective = accesses[4].address;
+            let mut result = VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                logical(accesses[3]),
+            ]);
+            if base & 0xff00 != effective & 0xff00 {
+                result.push_back(dummy_read(indexed_dummy_address(base, effective)));
+            }
+            result.push_back(logical(accesses[4]));
+            result
+        }
+        _ => return Err(format!("cannot schedule read addressing mode {mode:?}")),
+    };
+    Ok(operations)
+}
+
+fn schedule_store(
+    mode: AddressingMode,
+    accesses: &[BusAccess],
+) -> Result<VecDeque<MicroOperation>, String> {
+    let operations = match mode {
+        AddressingMode::ZeroPage => {
+            require_accesses(accesses, 3, "zero-page store")?;
+            accesses[..3].iter().copied().map(logical).collect()
+        }
+        AddressingMode::ZeroPageX | AddressingMode::ZeroPageY => {
+            require_accesses(accesses, 3, "indexed zero-page store")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                dummy_read(u16::from(accesses[1].value)),
+                logical(accesses[2]),
+            ])
+        }
+        AddressingMode::Absolute => {
+            require_accesses(accesses, 4, "absolute store")?;
+            accesses[..4].iter().copied().map(logical).collect()
+        }
+        AddressingMode::AbsoluteX | AddressingMode::AbsoluteY => {
+            require_accesses(accesses, 4, "indexed absolute store")?;
+            let base = operand_word(accesses, 1)?;
+            let effective = accesses[3].address;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                dummy_read(indexed_dummy_address(base, effective)),
+                logical(accesses[3]),
+            ])
+        }
+        AddressingMode::IndexedIndirect => {
+            require_accesses(accesses, 5, "indexed-indirect store")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                dummy_read(u16::from(accesses[1].value)),
+                logical(accesses[2]),
+                logical(accesses[3]),
+                logical(accesses[4]),
+            ])
+        }
+        AddressingMode::IndirectIndexed => {
+            require_accesses(accesses, 5, "indirect-indexed store")?;
+            let base = u16::from_le_bytes([accesses[2].value, accesses[3].value]);
+            let effective = accesses[4].address;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                logical(accesses[3]),
+                dummy_read(indexed_dummy_address(base, effective)),
+                logical(accesses[4]),
+            ])
+        }
+        _ => return Err(format!("cannot schedule store addressing mode {mode:?}")),
+    };
+    Ok(operations)
+}
+
+fn schedule_modify(
+    mode: AddressingMode,
+    accesses: &[BusAccess],
+) -> Result<VecDeque<MicroOperation>, String> {
+    let operations = match mode {
+        AddressingMode::ZeroPage => {
+            require_accesses(accesses, 4, "zero-page modify")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                dummy_write(accesses[2].address, accesses[2].value),
+                logical(accesses[3]),
+            ])
+        }
+        AddressingMode::ZeroPageX | AddressingMode::ZeroPageY => {
+            require_accesses(accesses, 4, "indexed zero-page modify")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                dummy_read(u16::from(accesses[1].value)),
+                logical(accesses[2]),
+                dummy_write(accesses[2].address, accesses[2].value),
+                logical(accesses[3]),
+            ])
+        }
+        AddressingMode::Absolute => {
+            require_accesses(accesses, 5, "absolute modify")?;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                logical(accesses[3]),
+                dummy_write(accesses[3].address, accesses[3].value),
+                logical(accesses[4]),
+            ])
+        }
+        AddressingMode::AbsoluteX | AddressingMode::AbsoluteY => {
+            require_accesses(accesses, 5, "indexed absolute modify")?;
+            let base = operand_word(accesses, 1)?;
+            let effective = accesses[3].address;
+            VecDeque::from([
+                logical(accesses[0]),
+                logical(accesses[1]),
+                logical(accesses[2]),
+                dummy_read(indexed_dummy_address(base, effective)),
+                logical(accesses[3]),
+                dummy_write(accesses[3].address, accesses[3].value),
+                logical(accesses[4]),
+            ])
+        }
+        _ => return Err(format!("cannot schedule modify addressing mode {mode:?}")),
+    };
+    Ok(operations)
+}
+
+fn schedule_branch(
+    initial_cpu: CpuState,
+    final_cpu: CpuState,
+    cycles: u64,
+    accesses: &[BusAccess],
+) -> Result<VecDeque<MicroOperation>, String> {
+    require_accesses(accesses, 2, "branch")?;
+    let sequential = initial_cpu.pc.wrapping_add(2);
+    let mut operations = VecDeque::from([logical(accesses[0]), logical(accesses[1])]);
+    if cycles >= 3 {
+        operations.push_back(dummy_read(sequential));
+        if cycles == 4 {
+            operations.push_back(dummy_read(indexed_dummy_address(sequential, final_cpu.pc)));
+        }
+    }
+    Ok(operations)
+}
+
+const fn is_branch(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Bcc
+            | Mnemonic::Bcs
+            | Mnemonic::Beq
+            | Mnemonic::Bmi
+            | Mnemonic::Bne
+            | Mnemonic::Bpl
+            | Mnemonic::Bvc
+            | Mnemonic::Bvs
+    )
+}
+
+const fn is_store(mnemonic: Mnemonic) -> bool {
+    matches!(mnemonic, Mnemonic::Sta | Mnemonic::Stx | Mnemonic::Sty)
+}
+
+const fn is_modify(mnemonic: Mnemonic, mode: AddressingMode) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Asl
+            | Mnemonic::Dec
+            | Mnemonic::Inc
+            | Mnemonic::Lsr
+            | Mnemonic::Rol
+            | Mnemonic::Ror
+    ) && !matches!(mode, AddressingMode::Accumulator)
+}
+
+const fn is_alu_read(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Adc
+            | Mnemonic::And
+            | Mnemonic::Bit
+            | Mnemonic::Cmp
+            | Mnemonic::Cpx
+            | Mnemonic::Cpy
+            | Mnemonic::Eor
+            | Mnemonic::Lda
+            | Mnemonic::Ldx
+            | Mnemonic::Ldy
+            | Mnemonic::Ora
+            | Mnemonic::Sbc
+    )
+}
+
+fn mark_semantic_read(operations: &mut VecDeque<MicroOperation>) -> Result<(), String> {
+    let semantic = operations.iter_mut().rev().find_map(|operation| {
+        if let MicroOperation::Read {
+            dummy: false,
+            semantic,
+            ..
+        } = operation
+        {
+            Some(semantic)
+        } else {
+            None
+        }
+    });
+    let semantic = semantic.ok_or_else(|| "instruction has no semantic operand read".to_owned())?;
+    *semantic = true;
+    Ok(())
+}
+
+fn apply_semantic_read(pending: &mut PendingStep, value: u8) {
+    let Some(mnemonic) = pending.mnemonic else {
+        return;
+    };
+    if matches!(
+        mnemonic,
+        Mnemonic::Asl
+            | Mnemonic::Dec
+            | Mnemonic::Inc
+            | Mnemonic::Lsr
+            | Mnemonic::Rol
+            | Mnemonic::Ror
+    ) {
+        let mut cpu = pending.initial_cpu;
+        let carry_in = u8::from(cpu.flag(FLAG_CARRY));
+        let output = match mnemonic {
+            Mnemonic::Asl => {
+                cpu.set_flag(FLAG_CARRY, value & 0x80 != 0);
+                value << 1
+            }
+            Mnemonic::Lsr => {
+                cpu.set_flag(FLAG_CARRY, value & 1 != 0);
+                value >> 1
+            }
+            Mnemonic::Rol => {
+                cpu.set_flag(FLAG_CARRY, value & 0x80 != 0);
+                (value << 1) | carry_in
+            }
+            Mnemonic::Ror => {
+                cpu.set_flag(FLAG_CARRY, value & 1 != 0);
+                (value >> 1) | (carry_in << 7)
+            }
+            Mnemonic::Inc => value.wrapping_add(1),
+            Mnemonic::Dec => value.wrapping_sub(1),
+            _ => unreachable!(),
+        };
+        cpu.set_negative_zero(output);
+        cpu.pc = pending.final_cpu.pc;
+        pending.final_cpu = cpu;
+        for operation in &mut pending.operations {
+            if let MicroOperation::Write {
+                value: scheduled,
+                dummy,
+                ..
+            } = operation
+            {
+                *scheduled = if *dummy { value } else { output };
+            }
+        }
+        return;
+    }
+
+    let mut cpu = pending.initial_cpu;
+    match mnemonic {
+        Mnemonic::Adc => adc_cpu(&mut cpu, value),
+        Mnemonic::And => {
+            cpu.a &= value;
+            cpu.set_negative_zero(cpu.a);
+        }
+        Mnemonic::Bit => {
+            cpu.set_flag(FLAG_ZERO, cpu.a & value == 0);
+            cpu.set_flag(FLAG_NEGATIVE, value & FLAG_NEGATIVE != 0);
+            cpu.set_flag(FLAG_OVERFLOW, value & FLAG_OVERFLOW != 0);
+        }
+        Mnemonic::Cmp => {
+            let left = cpu.a;
+            compare_cpu(&mut cpu, left, value);
+        }
+        Mnemonic::Cpx => {
+            let left = cpu.x;
+            compare_cpu(&mut cpu, left, value);
+        }
+        Mnemonic::Cpy => {
+            let left = cpu.y;
+            compare_cpu(&mut cpu, left, value);
+        }
+        Mnemonic::Eor => {
+            cpu.a ^= value;
+            cpu.set_negative_zero(cpu.a);
+        }
+        Mnemonic::Lda => {
+            cpu.a = value;
+            cpu.set_negative_zero(value);
+        }
+        Mnemonic::Ldx => {
+            cpu.x = value;
+            cpu.set_negative_zero(value);
+        }
+        Mnemonic::Ldy => {
+            cpu.y = value;
+            cpu.set_negative_zero(value);
+        }
+        Mnemonic::Ora => {
+            cpu.a |= value;
+            cpu.set_negative_zero(cpu.a);
+        }
+        Mnemonic::Sbc => adc_cpu(&mut cpu, !value),
+        _ => return,
+    }
+    cpu.pc = pending.final_cpu.pc;
+    pending.final_cpu = cpu;
+}
+
+fn adc_cpu(cpu: &mut CpuState, value: u8) {
+    let carry = u16::from(cpu.flag(FLAG_CARRY));
+    let sum = u16::from(cpu.a) + u16::from(value) + carry;
+    let output = sum as u8;
+    let overflow = (!(cpu.a ^ value) & (cpu.a ^ output) & 0x80) != 0;
+    cpu.set_flag(FLAG_CARRY, sum > 0xff);
+    cpu.set_flag(FLAG_OVERFLOW, overflow);
+    cpu.a = output;
+    cpu.set_negative_zero(output);
+}
+
+fn compare_cpu(cpu: &mut CpuState, left: u8, right: u8) {
+    cpu.set_flag(FLAG_CARRY, left >= right);
+    cpu.set_negative_zero(left.wrapping_sub(right));
+}
+
+fn logical(access: BusAccess) -> MicroOperation {
+    match access.kind {
+        BusAccessKind::Read => MicroOperation::Read {
+            address: access.address,
+            dummy: false,
+            semantic: false,
+        },
+        BusAccessKind::Write => MicroOperation::Write {
+            address: access.address,
+            value: access.value,
+            dummy: false,
+        },
+    }
+}
+
+const fn dummy_read(address: u16) -> MicroOperation {
+    MicroOperation::Read {
+        address,
+        dummy: true,
+        semantic: false,
+    }
+}
+
+const fn dummy_write(address: u16, value: u8) -> MicroOperation {
+    MicroOperation::Write {
+        address,
+        value,
+        dummy: true,
+    }
+}
+
+fn operand_word(accesses: &[BusAccess], start: usize) -> Result<u16, String> {
+    let low = accesses
+        .get(start)
+        .ok_or_else(|| "missing low operand byte".to_owned())?
+        .value;
+    let high = accesses
+        .get(start + 1)
+        .ok_or_else(|| "missing high operand byte".to_owned())?
+        .value;
+    Ok(u16::from_le_bytes([low, high]))
+}
+
+const fn indexed_dummy_address(base: u16, effective: u16) -> u16 {
+    (base & 0xff00) | (effective & 0x00ff)
+}
+
+fn require_accesses(accesses: &[BusAccess], expected: usize, context: &str) -> Result<(), String> {
+    if accesses.len() < expected {
+        return Err(format!(
+            "{context} produced {} logical bus accesses; expected at least {expected}",
+            accesses.len()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

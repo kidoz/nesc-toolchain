@@ -115,8 +115,23 @@ pub fn verify_compiler_boot(
     }
     Err(EmulatorError {
         message: format!(
-            "boot oracle timed out; reached_main={reached_main}, palette=${:02X}",
-            machine.palette()[0]
+            "boot oracle timed out; reached_main={reached_main}, palette=${:02X}, frames={}, retained_vblank_events={}, retained_vblank_reads={}",
+            machine.palette()[0],
+            machine.frames(),
+            machine
+                .events()
+                .iter()
+                .filter(|event| event.kind == EventKind::VBlank)
+                .count(),
+            machine
+                .events()
+                .iter()
+                .filter(|event| {
+                    event.kind == EventKind::VolatileRead
+                        && event.address == Some(0x2002)
+                        && event.value.is_some_and(|value| value & 0x80 != 0)
+                })
+                .count()
         ),
         pc: machine.cpu().pc,
         cycle: machine.cycles(),
@@ -130,8 +145,8 @@ mod tests {
     use nesc_rom::{Format, Metadata, Mirroring, Region, Rom, build};
 
     use super::{
-        EmulatorConfig, EventKind, InterruptKind, Machine, RunLimits, Termination, TimingProfile,
-        first_divergent_event,
+        BusAccess, BusAccessKind, EmulatorConfig, EventKind, InterruptKind, Machine, RunLimits,
+        StepReport, Termination, TimingProfile, first_divergent_event,
     };
 
     fn rom_with_program(program: &[u8], region: Region) -> Vec<u8> {
@@ -157,6 +172,17 @@ mod tests {
             chr_rom: Vec::new(),
         })
         .expect("ROM")
+    }
+
+    fn clock_instruction(machine: &mut Machine) -> (StepReport, Vec<BusAccess>) {
+        let mut accesses = Vec::new();
+        loop {
+            let cycle = machine.step_cycle().expect("CPU clock");
+            accesses.push(cycle.access.expect("one bus access per CPU clock"));
+            if let Some(report) = cycle.step {
+                return (report, accesses);
+            }
+        }
     }
 
     #[test]
@@ -204,6 +230,103 @@ mod tests {
         assert_eq!(machine.cpu().sp, initial_sp);
         assert_eq!(machine.ram()[0x200], 0x80);
         assert_eq!(machine.cycles(), 7 + 2 + 2 + 5 + 3 + 2 + 4 + 5);
+    }
+
+    #[test]
+    fn schedules_indexed_reads_and_read_modify_writes_per_clock() {
+        let rom = rom_with_program(
+            &[
+                0xa2, 0x01, // ldx #1
+                0xbd, 0xff, 0x01, // lda $01ff,x
+                0xe6, 0x10, // inc $10
+            ],
+            Region::Ntsc,
+        );
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        machine.ram_mut()[0x0200] = 0x80;
+        machine.ram_mut()[0x0010] = 0x2a;
+        machine.step().expect("load index");
+
+        let (load, accesses) = clock_instruction(&mut machine);
+        assert_eq!(load.cycles, 5);
+        assert_eq!(
+            accesses
+                .iter()
+                .map(|access| (access.address, access.kind, access.dummy))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x8002, BusAccessKind::Read, false),
+                (0x8003, BusAccessKind::Read, false),
+                (0x8004, BusAccessKind::Read, false),
+                (0x0100, BusAccessKind::Read, true),
+                (0x0200, BusAccessKind::Read, false),
+            ]
+        );
+        assert_eq!(machine.cpu().a, 0x80);
+
+        let first = machine.step_cycle().expect("INC opcode clock");
+        let second = machine.step_cycle().expect("INC operand clock");
+        let third = machine.step_cycle().expect("INC read clock");
+        let fourth = machine.step_cycle().expect("INC dummy write clock");
+        assert_eq!(machine.ram()[0x0010], 0x2a);
+        let fifth = machine.step_cycle().expect("INC final write clock");
+        assert!(fifth.instruction_complete);
+        assert_eq!(machine.ram()[0x0010], 0x2b);
+        assert_eq!(
+            [first, second, third, fourth, fifth]
+                .map(|cycle| cycle.access.expect("INC bus access"))
+                .map(|access| (access.address, access.kind, access.dummy)),
+            [
+                (0x8005, BusAccessKind::Read, false),
+                (0x8006, BusAccessKind::Read, false),
+                (0x0010, BusAccessKind::Read, false),
+                (0x0010, BusAccessKind::Write, true),
+                (0x0010, BusAccessKind::Write, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn uses_the_value_observed_on_the_scheduled_mmio_read_clock() {
+        let rom = rom_with_program(&[0xad, 0x02, 0x20], Region::Ntsc); // lda $2002
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        machine.set_cycles_for_test(27_390);
+
+        let (report, accesses) = clock_instruction(&mut machine);
+        assert_eq!(report.cycles, 4);
+        assert_eq!(accesses[3].cycle, 27_394);
+        assert_eq!(accesses[3].address, 0x2002);
+        assert_eq!(accesses[3].value & 0x80, 0x80);
+        assert_eq!(machine.cpu().a & 0x80, 0x80);
+        assert_eq!(machine.peek(0x2002).expect("PPU status") & 0x80, 0);
+
+        let rom = rom_with_program(
+            &[
+                0x2c, 0x02, 0x20, // bit $2002
+                0x10, 0xfb, // bpl $8000
+            ],
+            Region::Ntsc,
+        );
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        machine.set_cycles_for_test(27_390);
+        machine.step().expect("vblank BIT");
+        assert_ne!(machine.cpu().status & 0x80, 0);
+        machine.step().expect("not-taken BPL");
+        assert_eq!(machine.cpu().pc, 0x8005);
+
+        let mut machine =
+            Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
+        machine.reset().expect("reset");
+        while machine.cpu().pc != 0x8005 && machine.cycles() < 30_000 {
+            machine.step().expect("vblank polling instruction");
+        }
+        assert_eq!(machine.cpu().pc, 0x8005);
     }
 
     #[test]
@@ -367,9 +490,20 @@ mod tests {
         let mut machine =
             Machine::from_rom_bytes(&rom, EmulatorConfig::default()).expect("machine");
         machine.reset().expect("reset");
-        for _ in 0..4 {
-            machine.step().expect("instruction");
-        }
+        machine.step().expect("bank number");
+        let (_, mapper_write) = clock_instruction(&mut machine);
+        assert_eq!(mapper_write.len(), 4);
+        assert_eq!(mapper_write[0].physical_bank, Some(3));
+        assert_eq!(mapper_write[3].address, 0x8000);
+        assert_eq!(mapper_write[3].physical_bank, Some(0));
+        assert_eq!(machine.mapped_prg_bank(0x8000), Some(1));
+        machine.step().expect("jump to switchable bank");
+        let banked_fetch = machine.step_cycle().expect("banked opcode fetch");
+        assert_eq!(
+            banked_fetch.access.expect("banked access").physical_bank,
+            Some(1)
+        );
+        machine.step().expect("finish banked load");
         assert_eq!(machine.cpu().a, 0x42);
         assert!(
             machine
@@ -455,9 +589,11 @@ mod tests {
 
         let dma_start = machine.cycles();
         let mut dma_clocks = 0_u64;
+        let mut dma_accesses = Vec::new();
         let dma = loop {
             dma_clocks += 1;
             let cycle = machine.step_cycle().expect("DMA instruction clock");
+            dma_accesses.push(cycle.access.expect("DMA bus access"));
             if let Some(report) = cycle.step {
                 break report;
             }
@@ -465,13 +601,27 @@ mod tests {
         assert_eq!(dma_clocks, dma.cycles);
         assert_eq!(dma.cycles, 518);
         assert_eq!(machine.cycles(), dma_start + dma.cycles);
+        assert_eq!(dma_accesses.len(), 518);
+        assert_eq!(dma_accesses[0].address, 0x8002);
+        assert_eq!(dma_accesses[3].address, 0x4014);
+        assert_eq!(dma_accesses[3].kind, BusAccessKind::Write);
+        assert!(dma_accesses[4].dummy);
+        assert!(dma_accesses[5].dummy);
+        assert_eq!(dma_accesses[6].address, 0x0000);
+        assert_eq!(dma_accesses[6].kind, BusAccessKind::Read);
+        assert_eq!(dma_accesses[7].address, 0x2004);
+        assert_eq!(dma_accesses[7].kind, BusAccessKind::Write);
+        assert_eq!(dma_accesses[516].address, 0x00ff);
+        assert_eq!(dma_accesses[517].address, 0x2004);
 
         machine.request_nmi();
         let interrupt_start = machine.cycles();
         let mut interrupt_clocks = 0_u64;
+        let mut interrupt_accesses = Vec::new();
         let interrupt = loop {
             interrupt_clocks += 1;
             let cycle = machine.step_cycle().expect("NMI clock");
+            interrupt_accesses.push(cycle.access.expect("NMI bus access"));
             if let Some(report) = cycle.step {
                 break report;
             }
@@ -479,6 +629,21 @@ mod tests {
         assert_eq!(interrupt_clocks, 7);
         assert_eq!(interrupt.interrupt, Some(InterruptKind::Nmi));
         assert_eq!(machine.cycles(), interrupt_start + 7);
+        assert_eq!(
+            interrupt_accesses
+                .iter()
+                .map(|access| (access.address, access.kind, access.dummy))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x8005, BusAccessKind::Read, true),
+                (0x8005, BusAccessKind::Read, true),
+                (0x01fd, BusAccessKind::Write, false),
+                (0x01fc, BusAccessKind::Write, false),
+                (0x01fb, BusAccessKind::Write, false),
+                (0xfffa, BusAccessKind::Read, false),
+                (0xfffb, BusAccessKind::Read, false),
+            ]
+        );
     }
 
     #[test]
