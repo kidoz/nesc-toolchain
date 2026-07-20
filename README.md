@@ -44,10 +44,10 @@ ROM. The toolkit is written in stable Rust 2024.
 - `nesc debug` inspection of verification summaries, interrupt and frame
   checkpoints, sparse PPU/APU state, cartridge banks, event traces, and the
   first structured divergence
-- Interactive and scripted Mapper 0/2 ROM debugging with instruction stepping,
-  call stepping, bank-qualified breakpoints, CPU-bus watchpoints, source and
-  symbol lookup, hardware state, disassembly, stack inspection, and bounded
-  execution
+- Interactive and scripted Mapper 0/2 ROM debugging with instruction, cycle,
+  frame, source, and call stepping; cooperative pause; bank-qualified
+  breakpoints; CPU-bus watchpoints; source and symbol lookup; hardware state;
+  disassembly; stack inspection; and bounded execution
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
 - Bank-qualified call graphs, recursive-component detection, evidence-scored
@@ -88,8 +88,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | Mapper 0/2 original-versus-NesC differential verification with interrupt and multi-frame hardware checkpoints | Available |
 | Structured verification artifact inspection with `nesc debug` | Available |
 | Interactive and scripted Mapper 0/2 ROM debugger | Available |
+| CPU-cycle stepping and NTSC/PAL/Dendy PPU beam position | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Cycle stepping and complete PPU/APU timing | Planned |
+| Mid-instruction bus micro-operations and complete PPU/APU timing | Planned |
 
 ## Quick start
 
@@ -285,7 +286,8 @@ The shell supports:
 
 ```text
 run                  continue              pause
-step                 step-frame            next                 finish
+step                 step-cycle            step-frame
+step-source          next                  finish
 break main           break 001:$8000       delete 1
 watch $0010          watch-read $2002      watch-write $4000
 registers            memory $0000 64       disassemble main 12
@@ -313,10 +315,17 @@ nesc debug target/demo.nes \
   --command "disassemble main 8"
 ```
 
-Every resume command enforces instruction and cycle limits. The current CPU
-core executes instructions atomically, so single-cycle stepping and pausing a
-resume command from another thread are not yet available. `pause` confirms the
-shell is already stopped at a command boundary.
+Every resume command enforces instruction and cycle limits. `step-cycle`
+advances the CPU timing clock once and reports the current PPU frame, scanline,
+and dot. Long resume commands check a thread-safe cooperative pause signal on
+every clock; the interactive shell's `pause` command confirms that execution
+is already stopped at its command boundary.
+
+Instruction-visible CPU and bus effects are currently applied when an
+instruction's first clock begins. Its remaining clocks, DMA stalls, interrupt
+entry time, vblank changes, and frame transitions then advance one clock per
+call. Distributing individual bus micro-operations across those clocks remains
+future timing work.
 
 ## Verification artifact inspection
 
@@ -427,7 +436,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Add single-cycle stepping, asynchronous pause, and complete PPU/APU timing
+1. Distribute instruction bus micro-operations across clocks and complete PPU/APU timing
 2. Add Mapper 3 compilation and recovery
 3. Add emulator-backed `NES_TEST` discovery and execution
 4. Expand optimization quality and generated-code cost modeling
