@@ -8,6 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+nesc-disasm = { path = "../nesc-disasm" }
+nesc-emulator = { path = "../nesc-emulator" }
+nesc-rom = { path = "../nesc-rom" }
 serde.workspace = true
 serde_json.workspace = true
 

@@ -1,5 +1,12 @@
 //! Read-only inspection of structured decompilation verification artifacts.
 
+mod session;
+
+pub use session::{
+    DebugAddress, DebugCommandOutput, DebugSession, DebugSessionConfig, DebugSessionError,
+    SourceLocation,
+};
+
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};

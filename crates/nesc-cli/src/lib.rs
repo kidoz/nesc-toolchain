@@ -4,14 +4,17 @@ mod nesc_verification;
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nesc_asm::AssemblyLimits;
 use nesc_compiler::{BuildArtifacts, CompilerConfig, build_project, check_project};
-use nesc_debug::{DebugRequest, VerificationView, load_verification, render_verification};
+use nesc_debug::{
+    DebugRequest, DebugSession, DebugSessionConfig, VerificationView, load_verification,
+    render_verification,
+};
 use nesc_decompiler::{
     AnalysisLimits as DecompilerLimits, ControlFlowLimits, NesCEmissionLimits, NesCEmitConfig,
     RecoveryLimits, RustEmissionLimits, RustEmitConfig, RustVerificationLimits,
@@ -108,17 +111,35 @@ enum Command {
         #[arg(long, default_value_t = 100_000)]
         max_work_items: usize,
     },
-    /// Inspect a structured decompilation verification artifact.
+    /// Debug a ROM or inspect a structured verification artifact.
     Debug {
-        /// Verification JSON file or decompiled project directory.
-        #[arg(value_name = "VERIFICATION_OR_DIRECTORY")]
-        artifact: PathBuf,
-        /// State view to render.
-        #[arg(long, value_enum, default_value_t = DebugViewKind::Summary)]
-        view: DebugViewKind,
+        /// ROM, verification JSON file, or decompiled project directory.
+        #[arg(value_name = "ROM_OR_VERIFICATION")]
+        input: PathBuf,
+        /// Verification artifact view to render.
+        #[arg(long, value_enum)]
+        view: Option<DebugViewKind>,
         /// Checkpoint identifier; state views default to the last checkpoint.
         #[arg(long, value_name = "ID")]
         checkpoint: Option<usize>,
+        /// Symbol file; defaults to the ROM's sibling `.sym` file.
+        #[arg(long, value_name = "FILE")]
+        symbols: Option<PathBuf>,
+        /// Source-map file; defaults to the ROM's sibling `.source-map` file.
+        #[arg(long, value_name = "FILE")]
+        source_map: Option<PathBuf>,
+        /// Execute a debugger command; may be repeated for scripted sessions.
+        #[arg(long = "command", value_name = "COMMAND")]
+        commands: Vec<String>,
+        /// Maximum instructions executed by one resume command.
+        #[arg(long, default_value_t = 1_000_000)]
+        instruction_limit: u64,
+        /// Maximum CPU cycles executed by one resume command.
+        #[arg(long, default_value_t = 10_000_000)]
+        cycle_limit: u64,
+        /// Explicit timing for a multi-region ROM.
+        #[arg(long, value_enum)]
+        timing: Option<DebugTimingKind>,
     },
 }
 
@@ -144,6 +165,23 @@ enum DebugViewKind {
     Divergence,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DebugTimingKind {
+    Ntsc,
+    Pal,
+    Dendy,
+}
+
+impl From<DebugTimingKind> for nesc_emulator::TimingProfile {
+    fn from(value: DebugTimingKind) -> Self {
+        match value {
+            DebugTimingKind::Ntsc => Self::Ntsc,
+            DebugTimingKind::Pal => Self::Pal,
+            DebugTimingKind::Dendy => Self::Dendy,
+        }
+    }
+}
+
 impl From<DebugViewKind> for VerificationView {
     fn from(value: DebugViewKind) -> Self {
         match value {
@@ -165,6 +203,21 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    run_with_input(args, &mut std::io::empty(), stdout, stderr)
+}
+
+/// Parses and executes a CLI invocation with input available to interactive commands.
+#[must_use]
+pub fn run_with_input<I, T>(
+    args: I,
+    input: &mut dyn BufRead,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -173,7 +226,37 @@ where
         }
     };
 
-    match execute(cli.command) {
+    let command = match cli.command {
+        Command::Debug {
+            input: debug_input,
+            view,
+            checkpoint,
+            symbols,
+            source_map,
+            commands,
+            instruction_limit,
+            cycle_limit,
+            timing,
+        } => {
+            return run_debug(
+                &debug_input,
+                view,
+                checkpoint,
+                symbols,
+                source_map,
+                &commands,
+                instruction_limit,
+                cycle_limit,
+                timing,
+                input,
+                stdout,
+                stderr,
+            );
+        }
+        command => command,
+    };
+
+    match execute(command) {
         Ok(message) => {
             if writeln!(stdout, "{message}").is_err() {
                 return ExitCode::FAILURE;
@@ -259,12 +342,147 @@ fn execute(command: Command) -> Result<String, Vec<Diagnostic>> {
                 max_work_items,
             },
         ),
-        Command::Debug {
-            artifact,
-            view,
-            checkpoint,
-        } => debug_verification(&artifact, view, checkpoint),
+        Command::Debug { .. } => unreachable!("debug commands are handled before dispatch"),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_debug(
+    path: &Path,
+    view: Option<DebugViewKind>,
+    checkpoint: Option<usize>,
+    symbols: Option<PathBuf>,
+    source_map: Option<PathBuf>,
+    commands: &[String],
+    instruction_limit: u64,
+    cycle_limit: u64,
+    timing: Option<DebugTimingKind>,
+    input: &mut dyn BufRead,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    if is_rom_path(path) {
+        if view.is_some() || checkpoint.is_some() {
+            return write_debug_error(
+                stderr,
+                "E4302",
+                "`--view` and `--checkpoint` apply only to verification artifacts",
+            );
+        }
+        let mut session = match DebugSession::load(
+            path,
+            DebugSessionConfig {
+                instruction_limit,
+                cycle_limit,
+                timing: timing.map(Into::into),
+                symbols_path: symbols,
+                source_map_path: source_map,
+            },
+        ) {
+            Ok(session) => session,
+            Err(error) => return write_debug_error(stderr, "E4302", &error.to_string()),
+        };
+        if write!(stdout, "{}", session.greeting()).is_err() {
+            return ExitCode::FAILURE;
+        }
+        if commands.is_empty() {
+            return run_debug_shell(&mut session, input, stdout, stderr);
+        }
+        for command in commands {
+            match session.execute_command(command) {
+                Ok(result) => {
+                    if write!(stdout, "{}", result.text).is_err() {
+                        return ExitCode::FAILURE;
+                    }
+                    if result.quit {
+                        break;
+                    }
+                }
+                Err(error) => return write_debug_error(stderr, "E4303", &error.to_string()),
+            }
+        }
+        ExitCode::SUCCESS
+    } else {
+        if symbols.is_some() || source_map.is_some() || !commands.is_empty() || timing.is_some() {
+            return write_debug_error(
+                stderr,
+                "E4300",
+                "ROM debugger settings require a `.nes` input",
+            );
+        }
+        match debug_verification(path, view.unwrap_or(DebugViewKind::Summary), checkpoint) {
+            Ok(message) => {
+                if writeln!(stdout, "{message}").is_err() {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(diagnostics) => {
+                for diagnostic in diagnostics {
+                    if write!(stderr, "{}", diagnostic.render()).is_err() {
+                        break;
+                    }
+                }
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run_debug_shell(
+    session: &mut DebugSession,
+    input: &mut dyn BufRead,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    let mut line = String::new();
+    loop {
+        if write!(stdout, "nesc-debug> ")
+            .and_then(|()| stdout.flush())
+            .is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+        line.clear();
+        match input.read_line(&mut line) {
+            Ok(0) => return ExitCode::SUCCESS,
+            Ok(_) => match session.execute_command(&line) {
+                Ok(result) => {
+                    if write!(stdout, "{}", result.text).is_err() {
+                        return ExitCode::FAILURE;
+                    }
+                    if result.quit {
+                        return ExitCode::SUCCESS;
+                    }
+                }
+                Err(error) => {
+                    let diagnostic = Diagnostic::error("E4303", error.to_string());
+                    if write!(stderr, "{}", diagnostic.render()).is_err() {
+                        return ExitCode::FAILURE;
+                    }
+                }
+            },
+            Err(error) => {
+                return write_debug_error(
+                    stderr,
+                    "E4303",
+                    &format!("could not read debugger command: {error}"),
+                );
+            }
+        }
+    }
+}
+
+fn is_rom_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nes"))
+}
+
+fn write_debug_error(stderr: &mut dyn Write, code: &'static str, message: &str) -> ExitCode {
+    let diagnostic = Diagnostic::error(code, message);
+    let _ = write!(stderr, "{}", diagnostic.render());
+    ExitCode::FAILURE
 }
 
 fn debug_verification(

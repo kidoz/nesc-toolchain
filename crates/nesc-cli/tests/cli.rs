@@ -1,5 +1,6 @@
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use nesc_rom::{Format, Metadata, Mirroring, Region, Rom};
 use tempfile::tempdir;
@@ -293,6 +294,55 @@ fn build_and_inspect_generated_project() {
     let stdout = String::from_utf8_lossy(&inspected.stdout);
     assert!(stdout.contains("Mapper 0"), "{stdout}");
     assert!(stdout.contains("32 KiB PRG"), "{stdout}");
+
+    let debugged = nesc()
+        .current_dir(&project)
+        .args([
+            "debug",
+            "target/rom-demo.nes",
+            "--command",
+            "break main",
+            "--command",
+            "continue",
+            "--command",
+            "source",
+            "--command",
+            "disassemble main 2",
+            "--command",
+            "cartridge",
+        ])
+        .output()
+        .expect("debug generated ROM");
+    assert!(
+        debugged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&debugged.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&debugged.stdout);
+    assert!(stdout.contains("Loaded Mapper 0 ROM"), "{stdout}");
+    assert!(stdout.contains("Stopped: breakpoint 1"), "{stdout}");
+    assert!(stdout.contains("src/main.c"), "{stdout}");
+    assert!(stdout.contains("<main>"), "{stdout}");
+
+    let mut interactive = nesc()
+        .current_dir(&project)
+        .args(["debug", "target/rom-demo.nes"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start interactive debugger");
+    interactive
+        .stdin
+        .take()
+        .expect("debugger stdin")
+        .write_all(b"registers\nquit\n")
+        .expect("write debugger commands");
+    let interactive = interactive.wait_with_output().expect("finish debugger");
+    assert!(interactive.status.success());
+    let stdout = String::from_utf8_lossy(&interactive.stdout);
+    assert!(stdout.contains("nesc-debug>"), "{stdout}");
+    assert!(stdout.contains("A=$00"), "{stdout}");
 
     let disassembly_dir = project.join("target/recovered");
     let disassembled = nesc()
@@ -717,6 +767,33 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
         uxrom_with_banked_call(true),
     )
     .expect("write UxROM");
+
+    let debugged = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "debug",
+            "banked.nes",
+            "--command",
+            "break 001:$8000",
+            "--command",
+            "continue",
+            "--command",
+            "cartridge",
+        ])
+        .output()
+        .expect("debug UxROM");
+    assert!(
+        debugged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&debugged.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&debugged.stdout);
+    assert!(stdout.contains("Loaded Mapper 2 ROM"), "{stdout}");
+    assert!(
+        stdout.contains("Stopped: breakpoint 1 at 001:$8000"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Selected PRG bank: 1"), "{stdout}");
 
     let output = nesc()
         .current_dir(temporary.path())

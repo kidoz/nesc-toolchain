@@ -254,6 +254,9 @@ dependencies = [
 name = "nesc-debug"
 version = "0.1.0"
 dependencies = [
+ "nesc-disasm",
+ "nesc-emulator",
+ "nesc-rom",
  "serde",
  "serde_json",
 ]
