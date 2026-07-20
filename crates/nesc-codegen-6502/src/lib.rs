@@ -9,8 +9,9 @@ use std::error::Error;
 use std::fmt;
 
 use nesc_mir::{
-    AssemblyOutputTarget, AssemblyRegister, BinaryOperator, BlockId, Function, InlineAssembly,
-    Instruction, InstructionKind, Module, SourceSpan, Terminator, TypeKind, UnaryOperator, ValueId,
+    AddressSpace, AssemblyOutputTarget, AssemblyRegister, BinaryOperator, BlockId, Function,
+    InlineAssembly, Instruction, InstructionKind, Module, SourceSpan, Terminator, TypeKind,
+    UnaryOperator, ValueId,
 };
 use nesc_object::{
     Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SectionPlacement,
@@ -315,9 +316,13 @@ impl Emitter {
                 self.load_indirect(function, instruction, *address);
             }
             InstructionKind::StoreIndirect {
-                address, value, ty, ..
+                address,
+                value,
+                ty,
+                address_space,
+                volatile,
             } => {
-                self.store_indirect(function, *address, *value, ty);
+                self.store_indirect(function, *address, *value, ty, *address_space, *volatile);
             }
             InstructionKind::Unary { operator, operand } => {
                 self.unary(function, instruction, *operator, *operand);
@@ -485,17 +490,53 @@ impl Emitter {
         address: ValueId,
         value: ValueId,
         ty: &nesc_mir::Type,
+        address_space: AddressSpace,
+        volatile: bool,
     ) {
         let source = self.value_location(function, value);
         self.prepare_indirect_address(function, address);
         for offset in 0..source.size.min(allocation::type_size(ty)) {
-            self.ldy_immediate(offset as u8);
-            self.lda_location(source, offset);
-            self.emit_bytes(
-                &[0x91, ARGUMENT_SPILL_BASE],
-                &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
-            );
+            if volatile && address_space == AddressSpace::PpuRegister {
+                self.store_ppu_register(source, offset);
+            } else {
+                self.ldy_immediate(offset as u8);
+                self.lda_location(source, offset);
+                self.emit_bytes(
+                    &[0x91, ARGUMENT_SPILL_BASE],
+                    &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
+                );
+            }
         }
+    }
+
+    fn store_ppu_register(&mut self, source: Location, offset: u16) {
+        let done_name = self.fresh_label("ppu_store_done");
+        let done_symbol = self.local_symbol(&done_name);
+        self.lda_zero_page(ARGUMENT_SPILL_BASE);
+        if offset != 0 {
+            self.emit_byte(0x18, "clc");
+            self.immediate(0x69, "adc", offset as u8);
+        }
+        self.immediate(0x29, "and", 0x07);
+        for register in 0x2000_u16..=0x2007 {
+            let next_name = self.fresh_label("ppu_store_next");
+            let next_symbol = self.local_symbol(&next_name);
+            self.immediate(0xc9, "cmp", (register & 7) as u8);
+            self.relative_symbol(0xd0, "bne", next_symbol);
+            self.lda_location(source, offset);
+            self.absolute_address(0x8d, "sta", register);
+            self.absolute_symbol(0x4c, "jmp", done_symbol);
+            self.define(next_symbol);
+            self.assembly.push_str(&format!("{next_name}:\n"));
+        }
+        self.ldy_immediate(offset as u8);
+        self.lda_location(source, offset);
+        self.emit_bytes(
+            &[0x91, ARGUMENT_SPILL_BASE],
+            &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
+        );
+        self.define(done_symbol);
+        self.assembly.push_str(&format!("{done_name}:\n"));
     }
 
     fn bounds_check(&mut self, function: &Function, index: ValueId, length: u32) {

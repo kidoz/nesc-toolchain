@@ -388,6 +388,7 @@ impl Emitter<'_> {
         self.line(1, "cpu_set_flag(0x80, (u8)((value & 0x80) != 0));")?;
         self.line(1, "cpu_set_flag(0x02, (u8)(value == 0));")?;
         self.line(0, "}")?;
+        self.emit_hardware_write_helper()?;
         if self.config.verification {
             self.emit_verification_helpers()?;
         }
@@ -423,7 +424,9 @@ impl Emitter<'_> {
             self.line(1, "verification_observe_write(address, value);")?;
             self.line(1, "verification_bus_write(address, value);")?;
         } else {
-            self.line(1, "*((ptr<unknown, volatile u8>)address) = value;")?;
+            self.line(1, "if (cpu_write_hardware(address, value) == 0) {")?;
+            self.line(2, "*((ptr<unknown, volatile u8>)address) = value;")?;
+            self.line(1, "}")?;
         }
         if self.program.mapper == 2 {
             self.line(1, "if (address >= 0x8000) {")?;
@@ -501,6 +504,52 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    fn emit_hardware_write_helper(&mut self) -> Result<(), Vec<AnalysisError>> {
+        for register in [0x2002_u16, 0x2007, 0x4014, 0x4015, 0x4016, 0x4017] {
+            self.line(
+                0,
+                &format!("static void cpu_store_{register:04x}(u8 value) {{"),
+            )?;
+            self.line(
+                1,
+                &format!("asm volatile (\"sta ${register:04x}\" : : \"a\"(value) : \"memory\");"),
+            )?;
+            self.line(0, "}")?;
+        }
+        self.line(0, "static u8 cpu_write_ppu(u16 address, u8 value) {")?;
+        for register in [0x2002_u16, 0x2007] {
+            self.line(
+                1,
+                &format!(
+                    "if ((address & 0x0007) == 0x{:04x}) {{ cpu_store_{register:04x}(value); return 1; }}",
+                    register & 7
+                ),
+            )?;
+        }
+        self.line(1, "return 0;")?;
+        self.line(0, "}")?;
+        self.line(0, "static u8 cpu_write_io(u16 address, u8 value) {")?;
+        for register in 0x4014_u16..=0x4017 {
+            self.line(
+                1,
+                &format!(
+                    "if (address == 0x{register:04x}) {{ cpu_store_{register:04x}(value); return 1; }}"
+                ),
+            )?;
+        }
+        self.line(1, "return 0;")?;
+        self.line(0, "}")?;
+        self.line(0, "static u8 cpu_write_hardware(u16 address, u8 value) {")?;
+        self.line(1, "if ((address >= 0x2000) && (address < 0x4000)) {")?;
+        self.line(2, "return cpu_write_ppu(address, value);")?;
+        self.line(1, "}")?;
+        self.line(1, "if ((address >= 0x4014) && (address <= 0x4017)) {")?;
+        self.line(2, "return cpu_write_io(address, value);")?;
+        self.line(1, "}")?;
+        self.line(1, "return 0;")?;
+        self.line(0, "}")
+    }
+
     fn emit_verification_helpers(&mut self) -> Result<(), Vec<AnalysisError>> {
         self.line(0, "static u8 verification_load(u16 address) {")?;
         self.line(1, "return *((ptr<unknown, volatile u8>)address);")?;
@@ -568,6 +617,7 @@ impl Emitter<'_> {
             2,
             "*((ptr<unknown, volatile u8>)(0x7000 + (address & 0x07ff))) = value;",
         )?;
+        self.line(1, "} else if (cpu_write_hardware(address, value) != 0) {")?;
         self.line(1, "} else {")?;
         self.line(2, "*((ptr<unknown, volatile u8>)address) = value;")?;
         self.line(1, "}")?;
