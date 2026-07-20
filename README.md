@@ -55,7 +55,7 @@ ROM. The toolkit is written in stable Rust 2024.
   memory states, with the generated tests and pass report retained as artifacts
 - Original-6502-versus-NesC emulator checks across recovered functions,
   deterministic inputs, Mapper 2 bank contexts, scheduled NMI/IRQ entry, and
-  equivalent first-frame checkpoints
+  equivalent multi-frame PPU/APU checkpoints
 - Rustc-style diagnostics with source spans and suggested corrections
 
 ## Current status
@@ -78,7 +78,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | Mapper 0/2 stable Rust translation with bounded fallback | Available |
 | Mapper 0/2 hybrid NesC translation with bounded dispatcher fallback | Available |
 | Mapper 0/2 original-versus-Rust differential verification | Available |
-| Mapper 0/2 original-versus-NesC differential verification with interrupt and frame checkpoints | Available |
+| Mapper 0/2 original-versus-NesC differential verification with interrupt and multi-frame hardware checkpoints | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
 | Complete PPU/APU timing and debugger integration | Planned |
 
@@ -239,12 +239,15 @@ with `NES_BANK`, tracks mapper writes, and qualifies fallback dispatch by
 physical PRG bank. For either output, `--verify` compares bounded executions
 across recovered functions, deterministic input profiles, and every applicable
 switchable-bank context. NesC verification compares CPU state, RAM, PRG RAM,
-mapper state, ordered semantic bus events, and termination through the
-deterministic emulator. Recognized `RTI`-terminated NMI and IRQ handlers run
-from emulated interrupt stack frames before reset semantic instruction zero.
-When reset execution crosses a frame within its instruction bound, the
+mapper state, APU registers, CHR RAM, palette, OAM, nametable RAM, ordered
+semantic bus events, and termination through the deterministic emulator.
+Recognized `RTI`-terminated NMI and IRQ handlers run from emulated interrupt
+stack frames before reset semantic instruction zero. When reset execution
+crosses either of its first two frames within the instruction bound, the
 verifier locates that original instruction boundary and compares generated
-state at the equivalent semantic checkpoint. Coverage counts are retained in
+state at the equivalent semantic checkpoint. Verification-only DMA copies
+from the isolated semantic RAM shadow, so OAM comparison observes original
+source bytes instead of compiler-runtime RAM. Coverage counts are retained in
 `verification.json`. Unknown bank selections remain unresolved rather than
 selecting a guessed target, and verification reports an actionable failure
 when the conservative fallback cannot reproduce an exercised execution.
@@ -341,7 +344,7 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete PPU/APU timing and debugger integration
 2. Add Mapper 3 compilation and recovery
-3. Compare PPU/APU state at multi-frame decompilation checkpoints
+3. Surface decompilation checkpoints and divergent hardware state in debugger traces
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
