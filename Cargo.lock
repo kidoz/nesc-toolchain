@@ -197,6 +197,7 @@ dependencies = [
  "clap",
  "nesc-asm",
  "nesc-compiler",
+ "nesc-decompiler",
  "nesc-diagnostics",
  "nesc-disasm",
  "nesc-linker",
@@ -238,6 +239,9 @@ version = "0.1.0"
 [[package]]
 name = "nesc-decompile-runtime"
 version = "0.1.0"
+dependencies = [
+ "nesc-disasm",
+]
 
 [[package]]
 name = "nesc-decompiler"
@@ -246,6 +250,7 @@ dependencies = [
  "nesc-codegen-6502",
  "nesc-disasm",
  "nesc-rom",
+ "tempfile",
 ]
 
 [[package]]

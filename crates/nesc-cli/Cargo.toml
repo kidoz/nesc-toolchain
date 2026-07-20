@@ -11,6 +11,7 @@ publish = false
 clap.workspace = true
 nesc-asm = { path = "../nesc-asm" }
 nesc-compiler = { path = "../nesc-compiler" }
+nesc-decompiler = { path = "../nesc-decompiler" }
 nesc-disasm = { path = "../nesc-disasm" }
 nesc-diagnostics = { path = "../nesc-diagnostics" }
 nesc-linker = { path = "../nesc-linker" }

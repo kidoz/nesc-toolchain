@@ -4,11 +4,17 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nesc_asm::AssemblyLimits;
 use nesc_compiler::{BuildArtifacts, CompilerConfig, build_project, check_project};
+use nesc_decompiler::{
+    AnalysisLimits as DecompilerLimits, ControlFlowLimits, NesCEmissionLimits, NesCEmitConfig,
+    RecoveryLimits, RustEmissionLimits, RustEmitConfig, RustVerificationLimits,
+    ValueAnalysisLimits, analyze, analyze_recovery, analyze_values, emit_nesc_project,
+    emit_rust_project, emit_rust_verification, structure_control_flow,
+};
 use nesc_diagnostics::Diagnostic;
 use nesc_disasm::{AnalysisLimits, ByteClassification, Disassembly, disassemble};
 use nesc_linker::{RecoveryLinkInput, relink_nrom};
@@ -75,11 +81,41 @@ enum Command {
         #[arg(long, default_value_t = 100_000)]
         max_work_items: usize,
     },
+    /// Translate a Mapper 0 ROM into hybrid NesC or host-side stable Rust.
+    Decompile {
+        /// ROM file to translate.
+        #[arg(value_name = "ROM")]
+        rom: PathBuf,
+        /// Destination directory; defaults beside the ROM.
+        #[arg(long, value_name = "DIRECTORY")]
+        output: Option<PathBuf>,
+        /// Generated source language.
+        #[arg(long, value_enum, default_value_t = DecompileKind::Rust)]
+        emit: DecompileKind,
+        /// Reject output if any interpreter fallback is required.
+        #[arg(long)]
+        high_level_only: bool,
+        /// Differentially verify generated Rust against the original 6502 instructions.
+        #[arg(long)]
+        verify: bool,
+        /// Maximum number of instructions accepted from untrusted input.
+        #[arg(long, default_value_t = 1_000_000)]
+        max_instructions: usize,
+        /// Maximum number of control-flow destinations accepted from untrusted input.
+        #[arg(long, default_value_t = 100_000)]
+        max_work_items: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AnalysisKind {
     Recursive,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DecompileKind {
+    Nesc,
+    Rust,
 }
 
 /// Parses and executes a CLI invocation.
@@ -159,6 +195,25 @@ fn execute(command: Command) -> Result<String, Vec<Diagnostic>> {
             &rom,
             output.as_deref(),
             round_trip_check,
+            AnalysisLimits {
+                max_instructions,
+                max_work_items,
+            },
+        ),
+        Command::Decompile {
+            rom,
+            output,
+            emit,
+            high_level_only,
+            verify,
+            max_instructions,
+            max_work_items,
+        } => decompile_rom_file(
+            &rom,
+            output.as_deref(),
+            emit,
+            high_level_only,
+            verify,
             AnalysisLimits {
                 max_instructions,
                 max_work_items,
@@ -398,6 +453,349 @@ fn render_analysis_report(disassembly: &Disassembly, trailing_bytes: usize) -> S
         report.push('\n');
     }
     report
+}
+
+fn decompile_rom_file(
+    path: &Path,
+    output: Option<&Path>,
+    emit: DecompileKind,
+    high_level_only: bool,
+    verify: bool,
+    limits: AnalysisLimits,
+) -> Result<String, Vec<Diagnostic>> {
+    let bytes = fs::read(path).map_err(|error| {
+        vec![Diagnostic::error(
+            "E4200",
+            format!("could not read ROM `{}`: {error}", path.display()),
+        )]
+    })?;
+    let disassembly = disassemble(&bytes, limits)
+        .map_err(|error| vec![Diagnostic::error("E4201", error.to_string())])?;
+    let program = analyze(&disassembly, DecompilerLimits::default())
+        .map_err(|errors| decompiler_diagnostics("E4202", "semantic analysis", errors))?;
+    let values = analyze_values(&program, ValueAnalysisLimits::default())
+        .map_err(|errors| decompiler_diagnostics("E4203", "value analysis", errors))?;
+    let recovery = analyze_recovery(&program, &values, RecoveryLimits::default())
+        .map_err(|errors| decompiler_diagnostics("E4204", "function recovery", errors))?;
+    let control =
+        structure_control_flow(&program, &values, &recovery, ControlFlowLimits::default())
+            .map_err(|errors| {
+                decompiler_diagnostics("E4205", "control-flow structuring", errors)
+            })?;
+    let crate_name = decompiled_crate_name(path);
+    let destination = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_decompilation_path(path, emit));
+    let fallback_count = control
+        .functions
+        .iter()
+        .flat_map(|function| &function.regions)
+        .filter(|region| {
+            matches!(
+                region.kind,
+                nesc_decompiler::StructuredRegionKind::Fallback { .. }
+            )
+        })
+        .count();
+    match emit {
+        DecompileKind::Rust => {
+            let runtime_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../nesc-decompile-runtime")
+                .canonicalize()
+                .map_err(|error| {
+                    vec![Diagnostic::error(
+                        "E4206",
+                        format!("could not locate decompilation runtime: {error}"),
+                    )]
+                })?;
+            let generated = emit_rust_project(
+                &program,
+                &values,
+                &recovery,
+                &control,
+                &RustEmitConfig {
+                    crate_name: crate_name.clone(),
+                    runtime_path: runtime_path.to_string_lossy().into_owned(),
+                    high_level_only,
+                    max_fallback_call_depth: 256,
+                },
+                RustEmissionLimits::default(),
+            )
+            .map_err(|errors| decompiler_diagnostics("E4206", "Rust emission", errors))?;
+            let verification = verify
+                .then(|| {
+                    emit_rust_verification(
+                        &program,
+                        &disassembly.rom.prg_rom,
+                        &crate_name,
+                        RustVerificationLimits {
+                            instruction_limit: limits.max_instructions as u64,
+                            ..RustVerificationLimits::default()
+                        },
+                    )
+                })
+                .transpose()
+                .map_err(|errors| {
+                    decompiler_diagnostics("E4209", "Rust verification generation", errors)
+                })?;
+            write_rust_project(&destination, &generated, verification.as_deref())?;
+            if verify {
+                run_rust_verification(
+                    &destination,
+                    program.functions.len(),
+                    limits.max_instructions as u64,
+                )?;
+            }
+            Ok(format!(
+                "Decompiled `{}` into {} as host-side stable Rust ({} functions, {} fallbacks{})",
+                path.display(),
+                destination.display(),
+                program.functions.len(),
+                fallback_count,
+                if verify { ", verified" } else { "" }
+            ))
+        }
+        DecompileKind::Nesc => {
+            if verify {
+                return Err(vec![
+                    Diagnostic::error(
+                        "E4210",
+                        "differential verification currently supports `--emit=rust` only",
+                    )
+                    .with_help("omit `--verify` or select `--emit=rust`"),
+                ]);
+            }
+            let generated = emit_nesc_project(
+                &disassembly,
+                &program,
+                &values,
+                &recovery,
+                &control,
+                &NesCEmitConfig {
+                    package_name: crate_name,
+                    high_level_only,
+                    fallback_instruction_limit: u16::MAX,
+                    max_fallback_call_depth: u8::MAX,
+                },
+                NesCEmissionLimits::default(),
+            )
+            .map_err(|errors| decompiler_diagnostics("E4211", "NesC emission", errors))?;
+            write_nesc_project(&destination, &generated)?;
+            Ok(format!(
+                "Decompiled `{}` into {} as hybrid NesC ({} functions, {} fallbacks)",
+                path.display(),
+                destination.display(),
+                program.functions.len(),
+                fallback_count
+            ))
+        }
+    }
+}
+
+fn decompiler_diagnostics(
+    code: &'static str,
+    context: &str,
+    errors: Vec<nesc_decompiler::AnalysisError>,
+) -> Vec<Diagnostic> {
+    errors
+        .into_iter()
+        .map(|error| Diagnostic::error(code, format!("{context}: {error}")))
+        .collect()
+}
+
+fn default_decompilation_path(path: &Path, emit: DecompileKind) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            "{stem}-{}",
+            match emit {
+                DecompileKind::Nesc => "nesc",
+                DecompileKind::Rust => "rust",
+            }
+        ))
+}
+
+fn decompiled_crate_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    let normalized = stem
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() || !normalized.starts_with(char::is_alphabetic) {
+        "decompiled_rom".to_owned()
+    } else {
+        format!("decompiled_{normalized}")
+    }
+}
+
+fn write_rust_project(
+    destination: &Path,
+    project: &nesc_decompiler::RustProject,
+    verification: Option<&str>,
+) -> Result<(), Vec<Diagnostic>> {
+    fs::create_dir(destination).map_err(|error| {
+        vec![
+            Diagnostic::error(
+                "E4207",
+                format!(
+                    "could not create decompilation directory `{}`: {error}",
+                    destination.display()
+                ),
+            )
+            .with_help("choose a new directory with `--output`; existing output is never replaced"),
+        ]
+    })?;
+    let source_directory = destination.join("src");
+    fs::create_dir(&source_directory).map_err(|error| {
+        vec![Diagnostic::error(
+            "E4208",
+            format!(
+                "could not create source directory `{}`: {error}",
+                source_directory.display()
+            ),
+        )]
+    })?;
+    for (path, contents) in [
+        (destination.join("Cargo.toml"), project.cargo_toml.as_str()),
+        (source_directory.join("lib.rs"), project.source.as_str()),
+        (
+            destination.join("decompilation.json"),
+            project.report_json.as_str(),
+        ),
+    ] {
+        fs::write(&path, contents).map_err(|error| {
+            vec![Diagnostic::error(
+                "E4208",
+                format!("could not write artifact `{}`: {error}", path.display()),
+            )]
+        })?;
+    }
+    if let Some(verification) = verification {
+        let tests_directory = destination.join("tests");
+        fs::create_dir(&tests_directory).map_err(|error| {
+            vec![Diagnostic::error(
+                "E4208",
+                format!(
+                    "could not create verification directory `{}`: {error}",
+                    tests_directory.display()
+                ),
+            )]
+        })?;
+        let path = tests_directory.join("decompilation_verification.rs");
+        fs::write(&path, verification).map_err(|error| {
+            vec![Diagnostic::error(
+                "E4208",
+                format!("could not write artifact `{}`: {error}", path.display()),
+            )]
+        })?;
+    }
+    Ok(())
+}
+
+fn write_nesc_project(
+    destination: &Path,
+    project: &nesc_decompiler::NesCProject,
+) -> Result<(), Vec<Diagnostic>> {
+    fs::create_dir(destination).map_err(|error| {
+        vec![
+            Diagnostic::error(
+                "E4207",
+                format!(
+                    "could not create decompilation directory `{}`: {error}",
+                    destination.display()
+                ),
+            )
+            .with_help("choose a new directory with `--output`; existing output is never replaced"),
+        ]
+    })?;
+    let source_directory = destination.join("src");
+    fs::create_dir(&source_directory).map_err(|error| {
+        vec![Diagnostic::error(
+            "E4208",
+            format!(
+                "could not create source directory `{}`: {error}",
+                source_directory.display()
+            ),
+        )]
+    })?;
+    for (path, contents) in [
+        (destination.join("NesC.toml"), project.manifest.as_str()),
+        (source_directory.join("main.c"), project.source.as_str()),
+        (
+            destination.join("decompilation.json"),
+            project.report_json.as_str(),
+        ),
+    ] {
+        fs::write(&path, contents).map_err(|error| {
+            vec![Diagnostic::error(
+                "E4208",
+                format!("could not write artifact `{}`: {error}", path.display()),
+            )]
+        })?;
+    }
+    Ok(())
+}
+
+fn run_rust_verification(
+    destination: &Path,
+    function_count: usize,
+    instruction_limit: u64,
+) -> Result<(), Vec<Diagnostic>> {
+    let output = ProcessCommand::new("cargo")
+        .arg("test")
+        .arg("--offline")
+        .arg("--quiet")
+        .arg("--manifest-path")
+        .arg(destination.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", destination.join("target/verification"))
+        .output()
+        .map_err(|error| {
+            vec![Diagnostic::error(
+                "E4209",
+                format!("could not start generated Rust verification: {error}"),
+            )]
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let details = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        let details = details.chars().take(8_192).collect::<String>();
+        return Err(vec![Diagnostic::error(
+            "E4209",
+            format!("generated Rust failed differential verification: {details}"),
+        )]);
+    }
+    let report = format!(
+        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-rust\",\n  \"status\": \"passed\",\n  \"functions\": {function_count},\n  \"initial_states_per_function\": 4,\n  \"instruction_limit_per_execution\": {instruction_limit}\n}}\n"
+    );
+    let path = destination.join("verification.json");
+    fs::write(&path, report).map_err(|error| {
+        vec![Diagnostic::error(
+            "E4209",
+            format!(
+                "could not write verification report `{}`: {error}",
+                path.display()
+            ),
+        )]
+    })
 }
 
 #[cfg(test)]
