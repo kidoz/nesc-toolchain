@@ -1,4 +1,4 @@
-//! Deterministic Ricoh APU timing for the non-DMC channels.
+//! Deterministic Ricoh APU channel and sample-reader timing.
 
 const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
@@ -23,6 +23,12 @@ const NTSC_NOISE_PERIODS: [u16; 16] = [
 const PAL_NOISE_PERIODS: [u16; 16] = [
     4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778,
 ];
+const NTSC_DMC_PERIODS: [u16; 16] = [
+    428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 85, 72, 54,
+];
+const PAL_DMC_PERIODS: [u16; 16] = [
+    398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApuTiming {
@@ -45,6 +51,13 @@ impl ApuTiming {
             Self::Pal => &PAL_NOISE_PERIODS,
         }
     }
+
+    const fn dmc_periods(self) -> &'static [u16; 16] {
+        match self {
+            Self::Ntsc | Self::Dendy => &NTSC_DMC_PERIODS,
+            Self::Pal => &PAL_DMC_PERIODS,
+        }
+    }
 }
 
 /// Public APU state captured at deterministic emulator checkpoints.
@@ -59,8 +72,158 @@ pub struct ApuState {
     pub pulse_outputs: [u8; 2],
     pub triangle_output: u8,
     pub noise_output: u8,
+    pub dmc_output: u8,
+    pub dmc_active: bool,
+    pub dmc_irq_pending: bool,
+    pub dmc_rate_index: u8,
+    pub dmc_timer_counter: u16,
+    pub dmc_current_address: u16,
+    pub dmc_bytes_remaining: u16,
+    pub dmc_sample_buffer: Option<u8>,
+    pub dmc_bits_remaining: u8,
+    pub dmc_silence: bool,
     pub mixed_output: u16,
     pub output_checksum: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Dmc {
+    irq_enabled: bool,
+    loop_flag: bool,
+    rate_index: u8,
+    timer_counter: u16,
+    output_level: u8,
+    sample_address: u16,
+    sample_length: u16,
+    current_address: u16,
+    bytes_remaining: u16,
+    sample_buffer: Option<u8>,
+    shift_register: u8,
+    bits_remaining: u8,
+    silence: bool,
+    dma_in_flight: bool,
+    irq_pending: bool,
+}
+
+impl Default for Dmc {
+    fn default() -> Self {
+        Self {
+            irq_enabled: false,
+            loop_flag: false,
+            rate_index: 0,
+            timer_counter: 0,
+            output_level: 0,
+            sample_address: 0xc000,
+            sample_length: 1,
+            current_address: 0xc000,
+            bytes_remaining: 0,
+            sample_buffer: None,
+            shift_register: 0,
+            bits_remaining: 8,
+            silence: true,
+            dma_in_flight: false,
+            irq_pending: false,
+        }
+    }
+}
+
+impl Dmc {
+    fn write_control(&mut self, value: u8) {
+        self.irq_enabled = value & 0x80 != 0;
+        self.loop_flag = value & 0x40 != 0;
+        self.rate_index = value & 0x0f;
+        if !self.irq_enabled {
+            self.irq_pending = false;
+        }
+    }
+
+    fn write_output(&mut self, value: u8) {
+        self.output_level = value & 0x7f;
+    }
+
+    fn write_address(&mut self, value: u8) {
+        self.sample_address = 0xc000 | (u16::from(value) << 6);
+    }
+
+    fn write_length(&mut self, value: u8) {
+        self.sample_length = u16::from(value) * 16 + 1;
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.irq_pending = false;
+        if !enabled {
+            self.bytes_remaining = 0;
+            self.dma_in_flight = false;
+        } else if self.bytes_remaining == 0 {
+            self.restart_sample();
+        }
+    }
+
+    fn restart_sample(&mut self) {
+        self.current_address = self.sample_address;
+        self.bytes_remaining = self.sample_length;
+    }
+
+    fn clock_timer(&mut self, periods: &[u16; 16]) {
+        if self.timer_counter == 0 {
+            self.timer_counter = periods[usize::from(self.rate_index)] - 1;
+            self.clock_output();
+        } else {
+            self.timer_counter -= 1;
+        }
+    }
+
+    fn clock_output(&mut self) {
+        if !self.silence {
+            if self.shift_register & 1 == 0 {
+                if self.output_level >= 2 {
+                    self.output_level -= 2;
+                }
+            } else if self.output_level <= 125 {
+                self.output_level += 2;
+            }
+        }
+        self.shift_register >>= 1;
+        self.bits_remaining -= 1;
+        if self.bits_remaining == 0 {
+            self.bits_remaining = 8;
+            if let Some(sample) = self.sample_buffer.take() {
+                self.shift_register = sample;
+                self.silence = false;
+            } else {
+                self.silence = true;
+            }
+        }
+    }
+
+    fn begin_dma(&mut self) -> Option<u16> {
+        if self.sample_buffer.is_some() || self.bytes_remaining == 0 || self.dma_in_flight {
+            return None;
+        }
+        self.dma_in_flight = true;
+        Some(self.current_address)
+    }
+
+    fn complete_dma(&mut self, value: u8) {
+        if !self.dma_in_flight {
+            return;
+        }
+        self.dma_in_flight = false;
+        self.sample_buffer = Some(value);
+        self.current_address = if self.current_address == 0xffff {
+            0x8000
+        } else {
+            self.current_address + 1
+        };
+        self.bytes_remaining -= 1;
+        if self.bytes_remaining == 0 {
+            if self.loop_flag {
+                self.restart_sample();
+            } else if self.irq_enabled {
+                self.irq_pending = true;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -405,6 +568,7 @@ pub(crate) struct Apu {
     pulse: [Pulse; 2],
     triangle: Triangle,
     noise: Noise,
+    dmc: Dmc,
     output_checksum: u64,
 }
 
@@ -421,6 +585,7 @@ impl Apu {
             pulse: [Pulse::default(); 2],
             triangle: Triangle::default(),
             noise: Noise::default(),
+            dmc: Dmc::default(),
             output_checksum: 0,
         }
     }
@@ -439,6 +604,7 @@ impl Apu {
         }
         self.triangle.clock_timer();
         self.noise.clock_timer(self.timing.noise_periods());
+        self.dmc.clock_timer(self.timing.dmc_periods());
 
         if let Some(delay) = self.frame_reset_delay {
             if delay <= 1 {
@@ -512,11 +678,16 @@ impl Apu {
             0x400c => self.noise.write_control(value),
             0x400e => self.noise.write_period(value),
             0x400f => self.noise.write_length(value),
+            0x4010 => self.dmc.write_control(value),
+            0x4011 => self.dmc.write_output(value),
+            0x4012 => self.dmc.write_address(value),
+            0x4013 => self.dmc.write_length(value),
             0x4015 => {
                 self.pulse[0].set_enabled(value & 0x01 != 0);
                 self.pulse[1].set_enabled(value & 0x02 != 0);
                 self.triangle.set_enabled(value & 0x04 != 0);
                 self.noise.set_enabled(value & 0x08 != 0);
+                self.dmc.set_enabled(value & 0x10 != 0);
             }
             0x4017 => {
                 self.five_step_mode = value & 0x80 != 0;
@@ -535,7 +706,9 @@ impl Apu {
             | (u8::from(self.pulse[1].length_counter != 0) << 1)
             | (u8::from(self.triangle.length_counter != 0) << 2)
             | (u8::from(self.noise.length_counter != 0) << 3)
+            | (u8::from(self.dmc.bytes_remaining != 0) << 4)
             | (u8::from(self.frame_irq_pending) << 6)
+            | (u8::from(self.dmc.irq_pending) << 7)
     }
 
     pub(crate) fn read_status(&mut self) -> u8 {
@@ -545,7 +718,15 @@ impl Apu {
     }
 
     pub(crate) const fn irq_pending(&self) -> bool {
-        self.frame_irq_pending
+        self.frame_irq_pending || self.dmc.irq_pending
+    }
+
+    pub(crate) fn begin_dmc_dma(&mut self) -> Option<u16> {
+        self.dmc.begin_dma()
+    }
+
+    pub(crate) fn complete_dmc_dma(&mut self, value: u8) {
+        self.dmc.complete_dma(value);
     }
 
     fn mixed_output(&self) -> u16 {
@@ -553,18 +734,20 @@ impl Apu {
             + u16::from(self.pulse[1].output(false))
             + u16::from(self.triangle.output())
             + u16::from(self.noise.output())
+            + u16::from(self.dmc.output_level)
     }
 
     pub(crate) fn state(&self) -> ApuState {
         let pulse_outputs = [self.pulse[0].output(true), self.pulse[1].output(false)];
         let triangle_output = self.triangle.output();
         let noise_output = self.noise.output();
+        let dmc_output = self.dmc.output_level;
         ApuState {
             cycles: self.cycles,
             frame_counter_cycle: self.frame_counter_cycle,
             five_step_mode: self.five_step_mode,
             frame_irq_pending: self.frame_irq_pending,
-            channel_status: self.peek_status() & 0x0f,
+            channel_status: self.peek_status() & 0x1f,
             length_counters: [
                 self.pulse[0].length_counter,
                 self.pulse[1].length_counter,
@@ -574,10 +757,21 @@ impl Apu {
             pulse_outputs,
             triangle_output,
             noise_output,
+            dmc_output,
+            dmc_active: self.dmc.bytes_remaining != 0,
+            dmc_irq_pending: self.dmc.irq_pending,
+            dmc_rate_index: self.dmc.rate_index,
+            dmc_timer_counter: self.dmc.timer_counter,
+            dmc_current_address: self.dmc.current_address,
+            dmc_bytes_remaining: self.dmc.bytes_remaining,
+            dmc_sample_buffer: self.dmc.sample_buffer,
+            dmc_bits_remaining: self.dmc.bits_remaining,
+            dmc_silence: self.dmc.silence,
             mixed_output: u16::from(pulse_outputs[0])
                 + u16::from(pulse_outputs[1])
                 + u16::from(triangle_output)
-                + u16::from(noise_output),
+                + u16::from(noise_output)
+                + u16::from(dmc_output),
             output_checksum: self.output_checksum,
         }
     }
@@ -685,5 +879,73 @@ mod tests {
         pal.write_register(0x400e, 2);
         pal.clock();
         assert_eq!(pal.noise.timer_counter, 13);
+    }
+
+    #[test]
+    fn configures_fetches_wraps_and_reports_dmc_status() {
+        let mut apu = Apu::new(ApuTiming::Ntsc);
+        apu.write_register(0x4010, 0x8f);
+        apu.write_register(0x4011, 0xff);
+        apu.write_register(0x4012, 0xff);
+        apu.write_register(0x4013, 2);
+        apu.write_register(0x4015, 0x10);
+        let state = apu.state();
+        assert_eq!(state.dmc_output, 0x7f);
+        assert_eq!(state.dmc_current_address, 0xffc0);
+        assert_eq!(state.dmc_bytes_remaining, 33);
+        assert_ne!(apu.peek_status() & 0x10, 0);
+        assert_eq!(apu.begin_dmc_dma(), Some(0xffc0));
+        apu.complete_dmc_dma(0xa5);
+        assert_eq!(apu.state().dmc_sample_buffer, Some(0xa5));
+        assert_eq!(apu.state().dmc_current_address, 0xffc1);
+        assert_eq!(apu.state().dmc_bytes_remaining, 32);
+
+        apu.dmc.sample_buffer = None;
+        apu.dmc.current_address = 0xffff;
+        apu.dmc.bytes_remaining = 2;
+        assert_eq!(apu.begin_dmc_dma(), Some(0xffff));
+        apu.complete_dmc_dma(0x5a);
+        assert_eq!(apu.state().dmc_current_address, 0x8000);
+    }
+
+    #[test]
+    fn loops_or_raises_and_clears_dmc_irq() {
+        let mut irq = Apu::new(ApuTiming::Ntsc);
+        irq.write_register(0x4010, 0x80);
+        irq.write_register(0x4015, 0x10);
+        assert_eq!(irq.begin_dmc_dma(), Some(0xc000));
+        irq.complete_dmc_dma(0xff);
+        assert!(irq.state().dmc_irq_pending);
+        assert_ne!(irq.read_status() & 0x80, 0);
+        assert!(irq.state().dmc_irq_pending, "status reads retain DMC IRQ");
+        irq.write_register(0x4015, 0);
+        assert!(!irq.state().dmc_irq_pending);
+
+        let mut looping = Apu::new(ApuTiming::Ntsc);
+        looping.write_register(0x4010, 0xc0);
+        looping.write_register(0x4015, 0x10);
+        assert_eq!(looping.begin_dmc_dma(), Some(0xc000));
+        looping.complete_dmc_dma(0);
+        assert!(looping.state().dmc_active);
+        assert_eq!(looping.state().dmc_bytes_remaining, 1);
+        assert!(!looping.state().dmc_irq_pending);
+    }
+
+    #[test]
+    fn clocks_dmc_output_and_region_specific_rates() {
+        let mut ntsc = Apu::new(ApuTiming::Ntsc);
+        ntsc.write_register(0x4010, 0x0f);
+        ntsc.dmc.output_level = 64;
+        ntsc.dmc.shift_register = 1;
+        ntsc.dmc.bits_remaining = 1;
+        ntsc.dmc.silence = false;
+        ntsc.clock();
+        assert_eq!(ntsc.state().dmc_output, 66);
+        assert_eq!(ntsc.dmc.timer_counter, 53);
+
+        let mut pal = Apu::new(ApuTiming::Pal);
+        pal.write_register(0x4010, 0x0f);
+        pal.clock();
+        assert_eq!(pal.dmc.timer_counter, 49);
     }
 }

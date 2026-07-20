@@ -183,6 +183,7 @@ pub struct BusAccess {
     pub value: u8,
     pub kind: BusAccessKind,
     pub dummy: bool,
+    pub source: BusAccessSource,
 }
 
 /// Direction of one CPU-bus access.
@@ -190,6 +191,14 @@ pub struct BusAccess {
 pub enum BusAccessKind {
     Read,
     Write,
+}
+
+/// Hardware source that owns one CPU-bus clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BusAccessSource {
+    Cpu,
+    OamDma,
+    DmcDma,
 }
 
 /// One deterministic execution event.
@@ -327,6 +336,17 @@ impl MicroOperation {
             Self::DmaRead { .. } | Self::DmaWrite => false,
         }
     }
+
+    const fn source(self) -> BusAccessSource {
+        match self {
+            Self::DmaRead { .. } | Self::DmaWrite => BusAccessSource::OamDma,
+            Self::Read { .. } | Self::Write { .. } => BusAccessSource::Cpu,
+        }
+    }
+
+    const fn allows_dmc_halt(self) -> bool {
+        matches!(self, Self::Read { .. } | Self::DmaRead { .. })
+    }
 }
 
 #[derive(Clone)]
@@ -345,6 +365,13 @@ struct BusAccessContext {
     cycle: u64,
     pc: u16,
     dummy: bool,
+    source: BusAccessSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DmcDma {
+    address: u16,
+    clock: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -407,6 +434,7 @@ pub struct Machine {
     trap_reason_address: Option<u16>,
     last_bus_accesses: Vec<BusAccess>,
     pending_step: Option<PendingStep>,
+    dmc_dma: Option<DmcDma>,
     bus_access_context: Option<BusAccessContext>,
     defer_dma: bool,
     planning: bool,
@@ -508,6 +536,7 @@ impl Machine {
             trap_reason_address: config.trap_reason_address,
             last_bus_accesses: Vec::new(),
             pending_step: None,
+            dmc_dma: None,
             bus_access_context: None,
             defer_dma: false,
             planning: false,
@@ -527,6 +556,7 @@ impl Machine {
         self.pending_nmi = false;
         self.irq_line = false;
         self.pending_step = None;
+        self.dmc_dma = None;
         self.bus_access_context = None;
         self.defer_dma = false;
         self.planning = false;
@@ -569,6 +599,20 @@ impl Machine {
             .pending_step
             .take()
             .ok_or_else(|| self.failure("cycle scheduler did not prepare an instruction"))?;
+        if self.dmc_dma.is_none()
+            && pending
+                .operations
+                .front()
+                .is_some_and(|operation| operation.allows_dmc_halt())
+        {
+            self.dmc_dma = self
+                .apu
+                .begin_dmc_dma()
+                .map(|address| DmcDma { address, clock: 0 });
+        }
+        if self.dmc_dma.is_some() {
+            return self.perform_dmc_dma_cycle(pending);
+        }
         let operation = pending.operations.pop_front().ok_or_else(|| {
             self.failure("cycle scheduler prepared an instruction without bus operations")
         })?;
@@ -577,6 +621,7 @@ impl Machine {
             cycle: self.cycles,
             pc: pending.report.pc,
             dummy: operation.is_dummy(),
+            source: operation.source(),
         });
         let performed = self.perform_micro_operation(operation, &mut pending);
         self.bus_access_context = None;
@@ -601,6 +646,57 @@ impl Machine {
                 step: None,
             })
         }
+    }
+
+    fn perform_dmc_dma_cycle(
+        &mut self,
+        mut pending: PendingStep,
+    ) -> Result<CycleReport, EmulatorError> {
+        let mut dma = self
+            .dmc_dma
+            .take()
+            .ok_or_else(|| self.failure("DMC DMA clock has no active transfer"))?;
+        let dummy = dma.clock < 3;
+        self.advance_cycles(1);
+        self.bus_access_context = Some(BusAccessContext {
+            cycle: self.cycles,
+            pc: pending.report.pc,
+            dummy,
+            source: BusAccessSource::DmcDma,
+        });
+        let before = self.last_bus_accesses.len();
+        let address = if dummy {
+            pending.report.pc
+        } else {
+            dma.address
+        };
+        let value = self.cpu_read(address);
+        self.bus_access_context = None;
+        let value = value?;
+        if self.last_bus_accesses.len() != before + 1 {
+            return Err(self.failure("one DMC DMA clock performed an invalid bus-access count"));
+        }
+        let access = self.last_bus_accesses.last().copied();
+        pending.report.cycles = pending.report.cycles.saturating_add(1);
+        if dummy {
+            dma.clock += 1;
+            self.dmc_dma = Some(dma);
+        } else {
+            self.apu.complete_dmc_dma(value);
+            self.record(
+                EventKind::Dma,
+                Some(dma.address),
+                Some(value),
+                access.and_then(|access| access.physical_bank),
+            );
+        }
+        self.pending_step = Some(pending);
+        Ok(CycleReport {
+            cycle: self.cycles,
+            instruction_complete: false,
+            access,
+            step: None,
+        })
     }
 
     fn prepare_step(&mut self) -> Result<Option<StepReport>, EmulatorError> {
@@ -1592,6 +1688,7 @@ impl Machine {
             cycle: self.cycles,
             pc: self.cpu.pc,
             dummy: false,
+            source: BusAccessSource::Cpu,
         });
         self.last_bus_accesses.push(BusAccess {
             cycle: context.cycle,
@@ -1601,6 +1698,7 @@ impl Machine {
             value,
             kind,
             dummy: context.dummy,
+            source: context.source,
         });
     }
 
@@ -3138,5 +3236,94 @@ mod hardware_tests {
         let report = machine.step().expect("APU frame IRQ entry");
         assert_eq!(report.interrupt, Some(InterruptKind::Irq));
         assert_eq!(machine.snapshot().apu, machine.apu_state());
+    }
+
+    #[test]
+    fn stalls_cpu_for_traced_dmc_fetch_and_delivers_irq() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.reset().expect("reset");
+        machine.cpu.set_flag(FLAG_INTERRUPT_DISABLE, false);
+        machine.apu.write_register(0x4010, 0x80);
+        machine.apu.write_register(0x4012, 0);
+        machine.apu.write_register(0x4013, 0);
+        machine.apu.write_register(0x4015, 0x10);
+
+        let mut accesses = Vec::new();
+        let report = loop {
+            let cycle = machine.step_cycle().expect("DMC and NOP clock");
+            accesses.push(cycle.access.expect("one access per clock"));
+            if let Some(report) = cycle.step {
+                break report;
+            }
+        };
+        assert_eq!(report.cycles, 6);
+        assert_eq!(
+            accesses[..4]
+                .iter()
+                .map(|access| (access.address, access.dummy, access.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x8000, true, BusAccessSource::DmcDma),
+                (0x8000, true, BusAccessSource::DmcDma),
+                (0x8000, true, BusAccessSource::DmcDma),
+                (0xc000, false, BusAccessSource::DmcDma),
+            ]
+        );
+        assert_eq!(accesses[3].value, 0xea);
+        assert!(machine.apu_state().dmc_irq_pending);
+        assert_eq!(machine.peek(0x4015).expect("DMC status") & 0x90, 0x80);
+        assert!(machine.events.iter().any(|event| {
+            event.kind == EventKind::Dma
+                && event.address == Some(0xc000)
+                && event.value == Some(0xea)
+        }));
+
+        let interrupt = machine.step().expect("DMC IRQ entry");
+        assert_eq!(interrupt.interrupt, Some(InterruptKind::Irq));
+        assert_ne!(machine.cpu_read(0x4015).expect("status read") & 0x80, 0);
+        assert!(machine.apu_state().dmc_irq_pending);
+        machine.cpu_write(0x4015, 0).expect("disable DMC");
+        assert!(!machine.apu_state().dmc_irq_pending);
+    }
+
+    #[test]
+    fn dmc_fetch_preempts_and_extends_oam_dma() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.prg_rom[..7].copy_from_slice(&[0xea, 0x8d, 0x14, 0x40, 0x8d, 0x14, 0x40]);
+        for (index, byte) in machine.ram.iter_mut().enumerate().take(256) {
+            *byte = index as u8;
+        }
+        machine.reset().expect("reset");
+        machine.apu.write_register(0x4010, 0x4f);
+        machine.apu.write_register(0x4012, 0);
+        machine.apu.write_register(0x4013, 1);
+        machine.apu.write_register(0x4015, 0x10);
+        machine.step().expect("NOP with initial DMC fetch");
+        machine.step().expect("first OAM DMA primes DMC output");
+
+        let mut accesses = Vec::new();
+        let report = loop {
+            let cycle = machine.step_cycle().expect("combined DMA clock");
+            accesses.push(cycle.access.expect("one access per DMA clock"));
+            if let Some(report) = cycle.step {
+                break report;
+            }
+        };
+        let dmc = accesses
+            .iter()
+            .filter(|access| access.source == BusAccessSource::DmcDma)
+            .collect::<Vec<_>>();
+        assert_eq!(dmc.len(), 4, "APU state: {:?}", machine.apu_state());
+        assert_eq!(dmc[3].address, 0xc001);
+        assert!(!dmc[3].dummy);
+        assert_eq!(
+            accesses
+                .iter()
+                .filter(|access| access.source == BusAccessSource::OamDma)
+                .count(),
+            512
+        );
+        assert!(matches!(report.cycles, 521 | 522));
+        assert_eq!(&machine.oam()[..], &machine.ram()[..256]);
     }
 }
