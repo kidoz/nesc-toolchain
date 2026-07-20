@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nesc_disasm::{AddressingMode, opcode};
 use nesc_emulator::{
-    BusAccess, BusAccessKind, CycleReport, EmulatorConfig, Machine, StepReport, Termination,
-    TimingProfile,
+    BusAccess, BusAccessKind, BusAccessSource, CycleReport, EmulatorConfig, Machine, StepReport,
+    Termination, TimingProfile,
 };
 
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -982,7 +982,7 @@ impl DebugSession {
             "clear"
         };
         let mut text = format!(
-            "Timing: {:?}\nFrame counter: cycle {}, {mode}, IRQ {irq}\nStatus=${:02X} lengths={:?}\nOutput: pulse={:?} triangle={} noise={} mixed={} checksum=${:016X}\nRegisters:\n",
+            "Timing: {:?}\nFrame counter: cycle {}, {mode}, IRQ {irq}\nStatus=${:02X} lengths={:?}\nOutput: pulse={:?} triangle={} noise={} DMC={} mixed={} checksum=${:016X}\nDMC: active={} IRQ={} address=${:04X} bytes={} buffer={:?} bits={} silence={} rate={} timer={}\nRegisters:\n",
             self.machine.timing_profile(),
             state.frame_counter_cycle,
             state.channel_status,
@@ -990,8 +990,18 @@ impl DebugSession {
             state.pulse_outputs,
             state.triangle_output,
             state.noise_output,
+            state.dmc_output,
             state.mixed_output,
             state.output_checksum,
+            state.dmc_active,
+            state.dmc_irq_pending,
+            state.dmc_current_address,
+            state.dmc_bytes_remaining,
+            state.dmc_sample_buffer,
+            state.dmc_bits_remaining,
+            state.dmc_silence,
+            state.dmc_rate_index,
+            state.dmc_timer_counter,
         );
         for (offset, value) in self.machine.apu_io().iter().enumerate() {
             text.push_str(&format!("${:04X} = ${value:02X}\n", 0x4000 + offset));
@@ -1067,6 +1077,9 @@ impl DebugSession {
                 ));
                 if let Some(bank) = access.physical_bank {
                     text.push_str(&format!(" bank={bank:03}"));
+                }
+                if access.source != BusAccessSource::Cpu {
+                    text.push_str(&format!(" source={:?}", access.source));
                 }
                 text.push('\n');
             }
@@ -1388,6 +1401,39 @@ mod tests {
         .expect("UxROM")
     }
 
+    fn dmc_nrom() -> Vec<u8> {
+        let mut prg = vec![0xea; 32 * 1024];
+        prg[..27].copy_from_slice(&[
+            0xa9, 0x8f, 0x8d, 0x10, 0x40, // IRQ-enabled fastest DMC rate
+            0xa9, 0x00, 0x8d, 0x12, 0x40, // sample at $c000
+            0xa9, 0x00, 0x8d, 0x13, 0x40, // one-byte sample
+            0xa9, 0x10, 0x8d, 0x15, 0x40, // enable DMC
+            0xea, // NOP receives the DMC stall
+            0x4c, 0x15, 0x80, // stable loop
+            0xea, 0xea, 0xea, // padding retained in the test image
+        ]);
+        let vectors = prg.len() - 6;
+        for offset in [0, 2, 4] {
+            prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0x8000_u16.to_le_bytes());
+        }
+        build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 0,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 0,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: Vec::new(),
+        })
+        .expect("DMC NROM")
+    }
+
     fn nrom_session() -> DebugSession {
         DebugSession::from_rom_bytes(
             &nrom(),
@@ -1473,6 +1519,32 @@ mod tests {
     }
 
     #[test]
+    fn traces_dmc_dma_and_reports_sample_reader_state() {
+        let mut session = DebugSession::from_rom_bytes(
+            &dmc_nrom(),
+            "",
+            None,
+            "",
+            None,
+            DebugSessionConfig::default(),
+        )
+        .expect("DMC debugger session");
+        session.execute_command("trace on").expect("trace");
+        for _ in 0..9 {
+            session.execute_command("step").expect("DMC setup step");
+        }
+        let trace = session
+            .execute_command("trace show")
+            .expect("DMC trace")
+            .text;
+        assert!(trace.contains("R $C000=$EA"), "{trace}");
+        assert!(trace.contains("source=DmcDma"), "{trace}");
+        let apu = session.execute_command("apu").expect("APU state").text;
+        assert!(apu.contains("DMC: active=false IRQ=true"), "{apu}");
+        assert!(apu.contains("address=$C001 bytes=0"), "{apu}");
+    }
+
+    #[test]
     fn steps_cycles_and_source_locations_and_honors_pause_requests() {
         let mut session = nrom_session();
         let first = session
@@ -1496,6 +1568,7 @@ mod tests {
         let apu = session.execute_command("apu").expect("APU state").text;
         assert!(apu.contains("Frame counter: cycle 9, four-step"), "{apu}");
         assert!(apu.contains("Output: pulse=[0, 0]"), "{apu}");
+        assert!(apu.contains("DMC: active=false IRQ=false"), "{apu}");
         assert!(apu.contains("Registers:\n$4000 = $00"), "{apu}");
 
         let mut session = nrom_session();
