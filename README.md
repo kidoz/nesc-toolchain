@@ -44,6 +44,9 @@ ROM. The toolkit is written in stable Rust 2024.
 - CPU-clock-driven APU frame sequencing with pulse, triangle, and noise channel
   timers, envelopes, length and linear counters, pulse sweeps, frame IRQs, and
   deterministic output checksums
+- DMC sample playback with regional rates, bounded DAC updates, address
+  wrapping, looping, IRQs, four-clock traced CPU stalls, and OAM DMA
+  arbitration
 - `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2
   `nesc disassemble`, Mapper 0/2 `nesc decompile --emit=nesc`, and
   Mapper 0/2 `nesc decompile --emit=rust` workflows
@@ -98,8 +101,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | Per-clock official CPU bus operations, dummy accesses, interrupts, and OAM DMA | Available |
 | PPU background/sprite rendering and palette-index framebuffer | Available |
 | APU pulse, triangle, noise, frame-counter, and IRQ timing | Available |
+| DMC sample fetching, output, CPU stalls, looping, and IRQ timing | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Remaining PPU hardware edge behavior and DMC execution | Planned |
+| Remaining PPU hardware edge behavior | Planned |
 
 ## Quick start
 
@@ -338,7 +342,9 @@ and operand fetches, indexed-address penalties, branch dummy reads,
 read-modify-write double writes, stack and control-flow traffic, interrupt
 entry, and parity-correct 513/514-clock OAM DMA. Bus and MMIO effects occur on
 their scheduled clocks; architectural register state commits on the final
-instruction clock. The PPU beam now runs dot by dot, renders scrolled
+instruction clock. DMC sample fetches preempt readable CPU or OAM DMA clocks,
+retain their bus source in debugger traces, and extend the interrupted
+instruction by four clocks. The PPU beam now runs dot by dot, renders scrolled
 background tiles and evaluated sprites through cartridge CHR mapping, updates
 sprite-zero-hit and overflow status, and retains a 256x240 palette-index
 framebuffer in machine checkpoints. The debugger's `ppu` command reports the
@@ -349,8 +355,9 @@ The APU runs once per CPU clock with region-specific four-step and five-step
 frame sequencing. Pulse, triangle, and noise channel state is retained in
 machine checkpoints, `$4015` exposes and clears frame IRQ state, and IRQs enter
 the normal CPU interrupt path. The debugger's `apu` command reports channel
-lengths, instantaneous outputs, and a stable output checksum. DMC sample
-fetching and its CPU stalls remain future work.
+lengths, instantaneous outputs, and a stable output checksum. Its DMC view also
+reports sample-reader address, remaining bytes, sample buffering, timer state,
+silence, and IRQ state.
 
 ## Verification artifact inspection
 
@@ -461,11 +468,10 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Add DMC sample fetching, CPU stalls, looping, and IRQ timing
-2. Complete remaining PPU hardware edge behavior
-3. Add Mapper 3 compilation and recovery
-4. Add emulator-backed `NES_TEST` discovery and execution
-5. Expand optimization quality and generated-code cost modeling
+1. Complete remaining PPU hardware edge behavior
+2. Add Mapper 3 compilation and recovery
+3. Add emulator-backed `NES_TEST` discovery and execution
+4. Expand optimization quality and generated-code cost modeling
 
 ## License
 
