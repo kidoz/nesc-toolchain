@@ -13,8 +13,8 @@ ROM. The toolkit is written in stable Rust 2024.
 > [!IMPORTANT]
 > The compiler currently generates Mapper 0 (NROM) and Mapper 2 (UxROM) ROMs.
 > Mapper-aware ROM models for UxROM and CNROM exist. Recursive disassembly and
-> exact assembly round trips accept Mapper 0 and Mapper 2 ROMs; high-level
-> lifting currently accepts Mapper 0 ROMs;
+> exact assembly round trips and bank-qualified semantic CFG lifting accept
+> Mapper 0 and Mapper 2 ROMs; high-level NesC and Rust emission remains Mapper 0;
 > SSA/value, call-graph, calling-convention, conservative type, and reducible
 > control-flow recovery support hybrid NesC and stable Rust 2024 translation
 > with bounded fallback. Differential verification is available for Rust output.
@@ -69,7 +69,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | ROM construction and inspection | Available |
 | Official 6502 decoding and recursive Mapper 0/2 disassembly | Available |
 | Lossless Mapper 0/2 assembly recovery and exact ROM round trips | Available |
-| Bank-qualified NROM CFG and semantic 6502 IR | Available as a library |
+| Bank-qualified Mapper 0/2 CFG and semantic 6502 IR | Available as a library |
 | SSA/value, ABI/type, and reducible control-flow recovery | Available as a library |
 | Stable Rust host-side translation with bounded fallback | Available |
 | Hybrid NesC translation with bounded dispatcher fallback | Available |
@@ -316,8 +316,8 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete PPU/APU timing and debugger integration
 2. Add Mapper 3 compilation and recovery
-3. Extend Mapper 2 recovery into high-level NesC/Rust lifting and differential
-   verification
+3. Extend Mapper 2 semantic recovery into high-level NesC/Rust emission and
+   differential verification
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
