@@ -970,7 +970,29 @@ impl DebugSession {
     }
 
     fn render_apu(&self) -> String {
-        let mut text = String::new();
+        let state = self.machine.apu_state();
+        let mode = if state.five_step_mode {
+            "five-step"
+        } else {
+            "four-step"
+        };
+        let irq = if state.frame_irq_pending {
+            "pending"
+        } else {
+            "clear"
+        };
+        let mut text = format!(
+            "Timing: {:?}\nFrame counter: cycle {}, {mode}, IRQ {irq}\nStatus=${:02X} lengths={:?}\nOutput: pulse={:?} triangle={} noise={} mixed={} checksum=${:016X}\nRegisters:\n",
+            self.machine.timing_profile(),
+            state.frame_counter_cycle,
+            state.channel_status,
+            state.length_counters,
+            state.pulse_outputs,
+            state.triangle_output,
+            state.noise_output,
+            state.mixed_output,
+            state.output_checksum,
+        );
         for (offset, value) in self.machine.apu_io().iter().enumerate() {
             text.push_str(&format!("${:04X} = ${value:02X}\n", 0x4000 + offset));
         }
@@ -1471,6 +1493,10 @@ mod tests {
             ppu.contains("Framebuffer: 256x240 palette indices"),
             "{ppu}"
         );
+        let apu = session.execute_command("apu").expect("APU state").text;
+        assert!(apu.contains("Frame counter: cycle 9, four-step"), "{apu}");
+        assert!(apu.contains("Output: pulse=[0, 0]"), "{apu}");
+        assert!(apu.contains("Registers:\n$4000 = $00"), "{apu}");
 
         let mut session = nrom_session();
         let source = session
