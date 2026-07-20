@@ -46,8 +46,8 @@ ROM. The toolkit is written in stable Rust 2024.
   first structured divergence
 - Interactive and scripted Mapper 0/2 ROM debugging with instruction, cycle,
   frame, source, and call stepping; cooperative pause; bank-qualified
-  breakpoints; CPU-bus watchpoints; source and symbol lookup; hardware state;
-  disassembly; stack inspection; and bounded execution
+  breakpoints; exact-clock CPU-bus watchpoints and traces; source and symbol
+  lookup; hardware state; disassembly; stack inspection; and bounded execution
 - Bounded SSA construction with constant and flag propagation, precise RAM
   facts, explicit hardware barriers, branch predicates, and function summaries
 - Bank-qualified call graphs, recursive-component detection, evidence-scored
@@ -89,8 +89,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | Structured verification artifact inspection with `nesc debug` | Available |
 | Interactive and scripted Mapper 0/2 ROM debugger | Available |
 | CPU-cycle stepping and NTSC/PAL/Dendy PPU beam position | Available |
+| Per-clock official CPU bus operations, dummy accesses, interrupts, and OAM DMA | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Mid-instruction bus micro-operations and complete PPU/APU timing | Planned |
+| Complete PPU rendering and APU channel timing | Planned |
 
 ## Quick start
 
@@ -300,9 +301,12 @@ reset                quit
 Breakpoint addresses may include a physical PRG bank, which prevents repeated
 Mapper 2 CPU-window addresses from being confused. Memory inspection uses
 observational reads, so reading PPU, controller, or mapper state through the
-debugger does not trigger emulated side effects. Watchpoints inspect the exact
-CPU-bus accesses made by the most recent instruction, including mirrored RAM,
-PPU/APU registers, DMA reads, stack traffic, and mapper writes.
+debugger does not trigger emulated side effects. Watchpoints stop on the exact
+CPU clock that performs a matching access, including mirrored RAM, PPU/APU
+registers, dummy reads and writes, alternating OAM DMA transfers, stack
+traffic, and mapper writes. `trace show` includes a bounded bus-clock trace
+with cycle, PC, direction, address, value, dummy-access status, and physical
+PRG bank.
 
 For automation, repeat `--command` to run a bounded command sequence without
 the shell:
@@ -321,10 +325,12 @@ and dot. Long resume commands check a thread-safe cooperative pause signal on
 every clock; the interactive shell's `pause` command confirms that execution
 is already stopped at its command boundary.
 
-Instruction-visible CPU and bus effects are currently applied when an
-instruction's first clock begins. Its remaining clocks, DMA stalls, interrupt
-entry time, vblank changes, and frame transitions then advance one clock per
-call. Distributing individual bus micro-operations across those clocks remains
+Every official instruction schedules one bus operation per CPU clock: opcode
+and operand fetches, indexed-address penalties, branch dummy reads,
+read-modify-write double writes, stack and control-flow traffic, interrupt
+entry, and parity-correct 513/514-clock OAM DMA. Bus and MMIO effects occur on
+their scheduled clocks; architectural register state commits on the final
+instruction clock. Complete PPU rendering and APU channel execution remain
 future timing work.
 
 ## Verification artifact inspection
@@ -436,7 +442,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Distribute instruction bus micro-operations across clocks and complete PPU/APU timing
+1. Add complete PPU rendering and APU channel timing
 2. Add Mapper 3 compilation and recovery
 3. Add emulator-backed `NES_TEST` discovery and execution
 4. Expand optimization quality and generated-code cost modeling
