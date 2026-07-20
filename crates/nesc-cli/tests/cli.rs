@@ -8,6 +8,48 @@ fn nesc() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nesc"))
 }
 
+fn uxrom_with_banked_call(known_bank: bool) -> Vec<u8> {
+    let mut prg = vec![0xff; 4 * 16 * 1024];
+    prg[16 * 1024..16 * 1024 + 3].copy_from_slice(&[0xa9, 0x2a, 0x60]);
+    let fixed = 3 * 16 * 1024;
+    let program: &[u8] = if known_bank {
+        &[
+            0xa9, 0x01, // lda #1
+            0x8d, 0x00, 0x80, // sta $8000
+            0x20, 0x00, 0x80, // jsr $8000
+            0x60, // rts
+        ]
+    } else {
+        &[
+            0xad, 0x00, 0x00, // lda $0000
+            0x8d, 0x00, 0x80, // sta $8000
+            0x20, 0x00, 0x80, // jsr $8000
+            0x60, // rts
+        ]
+    };
+    prg[fixed..fixed + program.len()].copy_from_slice(program);
+    let vectors = prg.len() - 6;
+    for offset in [0, 2, 4] {
+        prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+    }
+    nesc_rom::build(&Rom {
+        metadata: Metadata {
+            format: Format::Nes2,
+            mapper: 2,
+            submapper: 0,
+            mirroring: Mirroring::Horizontal,
+            battery: false,
+            region: Region::Ntsc,
+            prg_rom_len: prg.len(),
+            chr_rom_len: 0,
+        },
+        trainer: None,
+        prg_rom: prg,
+        chr_rom: Vec::new(),
+    })
+    .expect("UxROM")
+}
+
 #[test]
 fn new_then_check_generated_project() {
     let temporary = tempdir().expect("temporary directory");
@@ -536,6 +578,117 @@ fn decompiles_mapper_zero_to_a_stable_rust_project() {
         .expect("repeat nesc decompile");
     assert!(!repeated.status.success());
     assert!(String::from_utf8_lossy(&repeated.stderr).contains("error[E4207]"));
+}
+
+#[test]
+fn decompiles_mapper_two_to_verified_stable_rust() {
+    let temporary = tempdir().expect("temporary directory");
+    fs::write(
+        temporary.path().join("banked.nes"),
+        uxrom_with_banked_call(true),
+    )
+    .expect("write UxROM");
+
+    let output = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "banked.nes",
+            "--emit",
+            "rust",
+            "--output",
+            "translated",
+            "--high-level-only",
+            "--verify",
+        ])
+        .output()
+        .expect("decompile UxROM");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let source =
+        fs::read_to_string(temporary.path().join("translated/src/lib.rs")).expect("Rust source");
+    assert!(source.contains("pub const MAPPER: u16 = 2;"));
+    assert!(source.contains("fn_prg0001_8000"));
+    let verification = fs::read_to_string(
+        temporary
+            .path()
+            .join("translated/tests/decompilation_verification.rs"),
+    )
+    .expect("verification source");
+    assert!(verification.contains("selected_prg_bank"));
+    assert!(verification.contains("SWITCHABLE_PRG_BANKS"));
+    let report = fs::read_to_string(temporary.path().join("translated/verification.json"))
+        .expect("verification report");
+    assert!(report.contains("\"mapper\": 2"));
+    assert!(report.contains("\"prg_banks\": 4"));
+    assert!(report.contains("\"switchable_bank_contexts\": 3"));
+
+    let nesc_output = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "banked.nes",
+            "--emit",
+            "nesc",
+            "--output",
+            "unsupported-nesc",
+        ])
+        .output()
+        .expect("reject Mapper 2 NesC");
+    assert!(!nesc_output.status.success());
+    assert!(String::from_utf8_lossy(&nesc_output.stderr).contains("error[E4211]"));
+}
+
+#[test]
+fn keeps_unknown_mapper_two_bank_state_in_rust_fallback() {
+    let temporary = tempdir().expect("temporary directory");
+    fs::write(
+        temporary.path().join("unknown-bank.nes"),
+        uxrom_with_banked_call(false),
+    )
+    .expect("write UxROM");
+
+    let output = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "unknown-bank.nes",
+            "--emit",
+            "rust",
+            "--output",
+            "fallback",
+        ])
+        .output()
+        .expect("decompile unknown bank state");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let source =
+        fs::read_to_string(temporary.path().join("fallback/src/lib.rs")).expect("Rust source");
+    assert!(source.contains("Interpreter fallback: unresolved control flow"));
+    assert!(source.contains("runtime::interpret_function"));
+
+    let rejected = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "unknown-bank.nes",
+            "--emit",
+            "rust",
+            "--output",
+            "high-level-only",
+            "--high-level-only",
+        ])
+        .output()
+        .expect("reject unknown bank state");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("error[E4206]"));
+    assert!(!temporary.path().join("high-level-only").exists());
 }
 
 #[test]

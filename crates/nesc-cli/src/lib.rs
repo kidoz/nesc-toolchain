@@ -81,7 +81,7 @@ enum Command {
         #[arg(long, default_value_t = 100_000)]
         max_work_items: usize,
     },
-    /// Translate a Mapper 0 ROM into hybrid NesC or host-side stable Rust.
+    /// Translate Mapper 0/2 to host Rust, or Mapper 0 to hybrid NesC.
     Decompile {
         /// ROM file to translate.
         #[arg(value_name = "ROM")]
@@ -488,15 +488,6 @@ fn decompile_rom_file(
     })?;
     let disassembly = disassemble(&bytes, limits)
         .map_err(|error| vec![Diagnostic::error("E4201", error.to_string())])?;
-    if disassembly.rom.metadata.mapper != 0 {
-        return Err(vec![Diagnostic::error(
-            "E4201",
-            format!(
-                "high-level decompilation currently supports Mapper 0, not Mapper {}",
-                disassembly.rom.metadata.mapper
-            ),
-        )]);
-    }
     let program = analyze(&disassembly, DecompilerLimits::default())
         .map_err(|errors| decompiler_diagnostics("E4202", "semantic analysis", errors))?;
     let values = analyze_values(&program, ValueAnalysisLimits::default())
@@ -570,6 +561,8 @@ fn decompile_rom_file(
                     &destination,
                     program.functions.len(),
                     limits.max_instructions as u64,
+                    program.mapper,
+                    disassembly.rom.prg_rom.len() / (16 * 1024),
                 )?;
             }
             Ok(format!(
@@ -780,6 +773,8 @@ fn run_rust_verification(
     destination: &Path,
     function_count: usize,
     instruction_limit: u64,
+    mapper: u16,
+    prg_bank_count: usize,
 ) -> Result<(), Vec<Diagnostic>> {
     let output = ProcessCommand::new("cargo")
         .arg("test")
@@ -788,6 +783,7 @@ fn run_rust_verification(
         .arg("--manifest-path")
         .arg(destination.join("Cargo.toml"))
         .env("CARGO_TARGET_DIR", destination.join("target/verification"))
+        .env("RUSTFLAGS", "-D warnings")
         .output()
         .map_err(|error| {
             vec![Diagnostic::error(
@@ -809,8 +805,13 @@ fn run_rust_verification(
             format!("generated Rust failed differential verification: {details}"),
         )]);
     }
+    let switchable_bank_contexts = if mapper == 2 {
+        prg_bank_count.saturating_sub(1)
+    } else {
+        1
+    };
     let report = format!(
-        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-rust\",\n  \"status\": \"passed\",\n  \"functions\": {function_count},\n  \"initial_states_per_function\": 4,\n  \"instruction_limit_per_execution\": {instruction_limit}\n}}\n"
+        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-rust\",\n  \"status\": \"passed\",\n  \"mapper\": {mapper},\n  \"prg_banks\": {prg_bank_count},\n  \"functions\": {function_count},\n  \"input_patterns_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {switchable_bank_contexts},\n  \"instruction_limit_per_execution\": {instruction_limit}\n}}\n"
     );
     let path = destination.join("verification.json");
     fs::write(&path, report).map_err(|error| {

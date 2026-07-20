@@ -104,9 +104,9 @@ pub fn emit_rust_project(
     values.verify(program)?;
     recovery.verify(program, values)?;
     control.verify(program, values, recovery)?;
-    if program.mapper != 0 {
+    if !matches!(program.mapper, 0 | 2) {
         return Err(vec![AnalysisError::new(format!(
-            "stable-Rust emission currently supports Mapper 0, not Mapper {}",
+            "stable-Rust emission supports Mapper 0 and Mapper 2, not Mapper {}",
             program.mapper
         ))]);
     }
@@ -181,7 +181,8 @@ fn rust_function_name(function: super::FunctionId, entry: BlockId) -> String {
 }
 
 /// Emits a generated integration test that differentially executes every
-/// recovered function from four deterministic RAM states.
+/// recovered function from four deterministic RAM patterns in every applicable
+/// mapper-bank context.
 ///
 /// # Errors
 ///
@@ -194,18 +195,13 @@ pub fn emit_rust_verification(
     limits: RustVerificationLimits,
 ) -> Result<String, Vec<AnalysisError>> {
     program.verify()?;
-    if program.mapper != 0 {
+    if !matches!(program.mapper, 0 | 2) {
         return Err(vec![AnalysisError::new(format!(
-            "Rust verification currently supports Mapper 0, not Mapper {}",
+            "Rust verification supports Mapper 0 and Mapper 2, not Mapper {}",
             program.mapper
         ))]);
     }
-    if !matches!(prg_rom.len(), 0x4000 | 0x8000) {
-        return Err(vec![AnalysisError::new(format!(
-            "Mapper 0 verification requires 16 or 32 KiB PRG-ROM, not {} bytes",
-            prg_rom.len()
-        ))]);
-    }
+    validate_verification_prg_layout(program.mapper, prg_rom.len())?;
     if limits.instruction_limit == 0 || limits.max_source_bytes == 0 {
         return Err(vec![AnalysisError::new(
             "Rust verification limits must permit instructions and source bytes",
@@ -242,6 +238,10 @@ pub fn emit_rust_verification(
     source.push_str(
         "];
 
+const PRG_BANK_BYTES: usize = 0x4000;
+const PRG_BANK_COUNT: u16 = (PRG_ROM.len() / PRG_BANK_BYTES) as u16;
+const SWITCHABLE_PRG_BANKS: u16 = if PRG_BANK_COUNT > 1 { PRG_BANK_COUNT - 1 } else { 1 };
+
 const ORIGINAL_CODE: &[CodeSegment] = &[
 ",
     );
@@ -271,11 +271,12 @@ struct TestBus {
     ram: Box<[u8; 0x800]>,
     io: Box<[u8; 0x4000]>,
     prg_ram: Box<[u8; 0x2000]>,
+    selected_prg_bank: u16,
     events: Vec<ObservableEvent>,
 }
 
 impl TestBus {
-    fn with_pattern(pattern: u8) -> Self {
+    fn with_pattern(pattern: u8, selected_prg_bank: u16) -> Self {
         let mut ram = Box::new([0; 0x800]);
         let mut prg_ram = Box::new([0; 0x2000]);
         for (index, byte) in ram.iter_mut().enumerate() {
@@ -288,6 +289,7 @@ impl TestBus {
             ram,
             io: Box::new([0; 0x4000]),
             prg_ram,
+            selected_prg_bank: selected_prg_bank % SWITCHABLE_PRG_BANKS,
             events: Vec::new(),
         }
     }
@@ -300,11 +302,17 @@ impl Bus for TestBus {
             0x2000..=0x5fff => Ok(self.io[usize::from(address - 0x2000)]),
             0x6000..=0x7fff => Ok(self.prg_ram[usize::from(address - 0x6000)]),
             0x8000..=0xffff => {
-                let offset = if PRG_ROM.len() == 0x4000 {
-                    usize::from(address & 0x3fff)
-                } else {
-                    usize::from(address - 0x8000)
+                let bank = match recovered::MAPPER {
+                    0 if PRG_BANK_COUNT == 1 => 0,
+                    0 if address < 0xc000 => 0,
+                    0 => PRG_BANK_COUNT - 1,
+                    2 if address < 0xc000 => self.selected_prg_bank,
+                    2 => PRG_BANK_COUNT - 1,
+                    mapper => return Err(RuntimeError::bus(state, format!("unsupported Mapper {mapper}"))),
                 };
+                let window_start = if address < 0xc000 { 0x8000 } else { 0xc000 };
+                let offset = usize::from(bank) * PRG_BANK_BYTES
+                    + usize::from(address - window_start);
                 PRG_ROM.get(offset).copied().ok_or_else(|| RuntimeError::bus(state, "unmapped PRG read"))
             }
         }
@@ -315,6 +323,9 @@ impl Bus for TestBus {
             0x0000..=0x1fff => self.ram[usize::from(address & 0x07ff)] = value,
             0x2000..=0x5fff => self.io[usize::from(address - 0x2000)] = value,
             0x6000..=0x7fff => self.prg_ram[usize::from(address - 0x6000)] = value,
+            0x8000..=0xffff if recovered::MAPPER == 2 => {
+                self.selected_prg_bank = u16::from(value) % SWITCHABLE_PRG_BANKS;
+            }
             0x8000..=0xffff => {}
         }
         Ok(())
@@ -326,18 +337,31 @@ impl Bus for TestBus {
     }
 
     fn mapped_prg_bank(&self, address: u16) -> Option<u16> {
-        if PRG_ROM.len() == 0x4000 || address < 0xc000 { Some(0) } else { Some(1) }
+        match (recovered::MAPPER, address) {
+            (_, 0x0000..=0x7fff) => None,
+            (0, 0x8000..=0xbfff) => Some(0),
+            (0, 0xc000..=0xffff) => Some(PRG_BANK_COUNT - 1),
+            (2, 0x8000..=0xbfff) => Some(self.selected_prg_bank),
+            (2, 0xc000..=0xffff) => Some(PRG_BANK_COUNT - 1),
+            _ => None,
+        }
     }
 }
 
 type Translation = fn(&mut CpuState, &mut TestBus, &mut ExecutionBudget) -> Result<(), RuntimeError>;
 
-fn compare_translation(entry_bank: u16, entry: u16, translated: Translation, pattern: u8) {
+fn compare_translation(
+    entry_bank: u16,
+    entry: u16,
+    initial_prg_bank: u16,
+    translated: Translation,
+    pattern: u8,
+) {
     let mut original_state = CpuState::default();
     let mut translated_state = CpuState::default();
     original_state.status = nesc_decompile_runtime::ProcessorStatus::from_bits(pattern);
     translated_state.status = original_state.status;
-    let mut original_bus = TestBus::with_pattern(pattern);
+    let mut original_bus = TestBus::with_pattern(pattern, initial_prg_bank);
     let mut translated_bus = original_bus.clone();
 "#,
     );
@@ -370,21 +394,22 @@ fn compare_translation(entry_bank: u16, entry: u16, translated: Translation, pat
         (Ok(()), Ok(())) => {}
         (Err(original), Err(translated)) => assert_eq!(
             translated.message, original.message,
-            "different failures for pattern {pattern:#04x} at entry {entry:#06x}",
+            "different failures for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}",
         ),
         _ => panic!(
-            "termination differs for pattern {pattern:#04x} at entry {entry:#06x}: original={original_result:?}, translated={translated_result:?}",
+            "termination differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}: original={original_result:?}, translated={translated_result:?}",
         ),
     }
-    assert_eq!(translated_state, original_state, "CPU state differs for pattern {pattern:#04x} at entry {entry:#06x}");
-    assert_eq!(translated_bus.ram, original_bus.ram, "RAM differs for pattern {pattern:#04x} at entry {entry:#06x}");
-    assert_eq!(translated_bus.io, original_bus.io, "I/O state differs for pattern {pattern:#04x} at entry {entry:#06x}");
-    assert_eq!(translated_bus.prg_ram, original_bus.prg_ram, "PRG RAM differs for pattern {pattern:#04x} at entry {entry:#06x}");
+    assert_eq!(translated_state, original_state, "CPU state differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
+    assert_eq!(translated_bus.ram, original_bus.ram, "RAM differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
+    assert_eq!(translated_bus.io, original_bus.io, "I/O state differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
+    assert_eq!(translated_bus.prg_ram, original_bus.prg_ram, "PRG RAM differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
+    assert_eq!(translated_bus.selected_prg_bank, original_bus.selected_prg_bank, "mapper state differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
     if translated_bus.events != original_bus.events {
         let first = translated_bus.events.iter().zip(&original_bus.events).position(|(translated, original)| translated != original).unwrap_or_else(|| translated_bus.events.len().min(original_bus.events.len()));
-        panic!("first divergent observable event {first} for pattern {pattern:#04x} at entry {entry:#06x}: original={:?}, translated={:?}", original_bus.events.get(first), translated_bus.events.get(first));
+        panic!("first divergent observable event {first} for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}: original={:?}, translated={:?}", original_bus.events.get(first), translated_bus.events.get(first));
     }
-    assert_eq!(translated_budget.consumed(), original_budget.consumed(), "instruction use differs for pattern {pattern:#04x} at entry {entry:#06x}");
+    assert_eq!(translated_budget.consumed(), original_budget.consumed(), "instruction use differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
 }
 "#,
     );
@@ -392,7 +417,7 @@ fn compare_translation(entry_bank: u16, entry: u16, translated: Translation, pat
         let name = rust_function_name(function.id, function.entry);
         let _ = writeln!(
             source,
-            "\n#[test]\nfn verify_{name}() {{\n    for pattern in [0x00_u8, 0x01, 0x7f, 0xff] {{\n        compare_translation({}, 0x{:04x}, recovered::{name}, pattern);\n    }}\n}}",
+            "\n#[test]\nfn verify_{name}() {{\n    let entry_bank = {};\n    let entry = 0x{:04x};\n    let bank_contexts = if recovered::MAPPER == 2 && entry >= 0xc000 {{ SWITCHABLE_PRG_BANKS }} else {{ 1 }};\n    for bank_context in 0..bank_contexts {{\n        let initial_prg_bank = if recovered::MAPPER == 2 && entry < 0xc000 {{ entry_bank }} else {{ bank_context }};\n        for pattern in [0x00_u8, 0x01, 0x7f, 0xff] {{\n            compare_translation(entry_bank, entry, initial_prg_bank, recovered::{name}, pattern);\n        }}\n    }}\n}}",
             function.entry.bank, function.entry.cpu_address
         );
     }
@@ -403,6 +428,24 @@ fn compare_translation(entry_bank: u16, entry: u16, translated: Translation, pat
         ))]);
     }
     Ok(source)
+}
+
+fn validate_verification_prg_layout(
+    mapper: u16,
+    prg_rom_len: usize,
+) -> Result<(), Vec<AnalysisError>> {
+    let valid = match mapper {
+        0 => matches!(prg_rom_len, 0x4000 | 0x8000),
+        2 => prg_rom_len >= 0x8000 && prg_rom_len % 0x4000 == 0,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(vec![AnalysisError::new(format!(
+            "Mapper {mapper} verification cannot map {prg_rom_len} PRG-ROM bytes"
+        ))])
+    }
 }
 
 fn validate_limits(limits: RustEmissionLimits) -> Result<(), Vec<AnalysisError>> {
