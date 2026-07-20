@@ -855,9 +855,18 @@ impl<'a> Builder<'a> {
                 arguments,
             } => {
                 let function_id = self.hir.function_names.get(function).copied()?;
+                let parameter_types = self.hir.function(function_id)?.signature.parameters.clone();
                 let mut values = Vec::with_capacity(arguments.len());
-                for argument in arguments {
-                    values.push(self.lower_expression(argument)?);
+                for (index, argument) in arguments.iter().enumerate() {
+                    let value = self.lower_expression(argument)?;
+                    let value = if let (Some(source), Some(target)) =
+                        (argument.ty.as_ref(), parameter_types.get(index))
+                    {
+                        self.cast_if_needed(value, source, target, argument.span)
+                    } else {
+                        value
+                    };
+                    values.push(value);
                 }
                 if ty.kind == TypeKind::Void && ty.pointer_depth == 0 {
                     self.emit(
@@ -1718,13 +1727,31 @@ fn verify_instruction(
                 verification_error(errors, function.id, Some(block), "callee is out of range");
                 return;
             };
-            if arguments.len() != callee.parameters.len() && !callee.blocks.is_empty() {
+            if arguments.len() != callee.parameters.len() {
                 verification_error(
                     errors,
                     function.id,
                     Some(block),
                     "call argument count does not match callee",
                 );
+            } else {
+                for (argument, parameter) in arguments.iter().zip(&callee.parameters) {
+                    let argument_type = function.value_types.get(argument.0 as usize);
+                    let parameter_type = callee
+                        .locals
+                        .get(parameter.0 as usize)
+                        .map(|local| &local.ty);
+                    if argument_type.zip(parameter_type).is_some_and(
+                        |(argument_type, parameter_type)| argument_type != parameter_type,
+                    ) {
+                        verification_error(
+                            errors,
+                            function.id,
+                            Some(block),
+                            "call argument type does not match callee parameter",
+                        );
+                    }
+                }
             }
         }
         InstructionKind::InlineAssembly(assembly) => {
@@ -2018,6 +2045,37 @@ mod tests {
         let mir = lower(&hir).expect("MIR lowering");
         verify(&mir).expect("valid MIR");
         assert!(mir.functions[0].blocks.len() >= 4);
+    }
+
+    #[test]
+    fn converts_call_arguments_to_parameter_types() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("main.c");
+        fs::write(
+            &source,
+            "static void set(u8 mask, u8 value) { return; } NES_MAIN int main(void) { set(0x80, 1); return 0; }",
+        )
+        .expect("source");
+        let checked = check(&FrontendConfig::new(source)).expect("frontend");
+        let hir = nesc_hir::lower(checked);
+        let mir = lower(&hir).expect("MIR lowering");
+        verify(&mir).expect("valid MIR");
+        let arguments = mir.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| match &instruction.kind {
+                InstructionKind::Call { arguments, .. } => Some(arguments),
+                _ => None,
+            })
+            .expect("call instruction");
+        assert_eq!(arguments.len(), 2);
+        for argument in arguments {
+            assert_eq!(
+                mir.functions[1].value_types[argument.0 as usize],
+                super::Type::scalar(super::TypeKind::Integer(super::IntegerType::U8))
+            );
+        }
     }
 
     #[test]
