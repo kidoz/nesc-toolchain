@@ -54,7 +54,8 @@ ROM. The toolkit is written in stable Rust 2024.
 - Original-6502-versus-Rust differential checks across deterministic CPU and
   memory states, with the generated tests and pass report retained as artifacts
 - Original-6502-versus-NesC emulator checks across recovered functions,
-  deterministic inputs, and Mapper 2 bank contexts
+  deterministic inputs, Mapper 2 bank contexts, scheduled NMI/IRQ entry, and
+  equivalent first-frame checkpoints
 - Rustc-style diagnostics with source spans and suggested corrections
 
 ## Current status
@@ -77,7 +78,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | Mapper 0/2 stable Rust translation with bounded fallback | Available |
 | Mapper 0/2 hybrid NesC translation with bounded dispatcher fallback | Available |
 | Mapper 0/2 original-versus-Rust differential verification | Available |
-| Mapper 0/2 original-versus-NesC differential verification | Available |
+| Mapper 0/2 original-versus-NesC differential verification with interrupt and frame checkpoints | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
 | Complete PPU/APU timing and debugger integration | Planned |
 
@@ -239,7 +240,12 @@ physical PRG bank. For either output, `--verify` compares bounded executions
 across recovered functions, deterministic input profiles, and every applicable
 switchable-bank context. NesC verification compares CPU state, RAM, PRG RAM,
 mapper state, ordered semantic bus events, and termination through the
-deterministic emulator. Unknown bank selections remain unresolved rather than
+deterministic emulator. Recognized `RTI`-terminated NMI and IRQ handlers run
+from emulated interrupt stack frames before reset semantic instruction zero.
+When reset execution crosses a frame within its instruction bound, the
+verifier locates that original instruction boundary and compares generated
+state at the equivalent semantic checkpoint. Coverage counts are retained in
+`verification.json`. Unknown bank selections remain unresolved rather than
 selecting a guessed target, and verification reports an actionable failure
 when the conservative fallback cannot reproduce an exercised execution.
 Target-side NesC verification reserves `$7000-$7FFF` for its isolated RAM
@@ -335,8 +341,7 @@ CI runs the same commands on pushes and pull requests.
 
 1. Complete PPU/APU timing and debugger integration
 2. Add Mapper 3 compilation and recovery
-3. Extend decompilation verification with scheduled interrupt and frame-boundary
-   cases
+3. Compare PPU/APU state at multi-frame decompilation checkpoints
 4. Expand optimization quality and generated-code cost modeling
 
 ## License
