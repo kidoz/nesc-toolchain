@@ -41,6 +41,9 @@ ROM. The toolkit is written in stable Rust 2024.
 - Dot-driven NTSC/PAL/Dendy PPU timing with scrolling-register latches,
   background and sprite composition, sprite status flags, mapper-aware CHR
   reads, nametable mirroring, and a checkpointed palette-index framebuffer
+- CPU-clock-driven APU frame sequencing with pulse, triangle, and noise channel
+  timers, envelopes, length and linear counters, pulse sweeps, frame IRQs, and
+  deterministic output checksums
 - `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2
   `nesc disassemble`, Mapper 0/2 `nesc decompile --emit=nesc`, and
   Mapper 0/2 `nesc decompile --emit=rust` workflows
@@ -94,8 +97,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | CPU-cycle stepping and NTSC/PAL/Dendy PPU beam position | Available |
 | Per-clock official CPU bus operations, dummy accesses, interrupts, and OAM DMA | Available |
 | PPU background/sprite rendering and palette-index framebuffer | Available |
+| APU pulse, triangle, noise, frame-counter, and IRQ timing | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Remaining PPU hardware edge behavior and APU channel timing | Planned |
+| Remaining PPU hardware edge behavior and DMC execution | Planned |
 
 ## Quick start
 
@@ -339,7 +343,14 @@ background tiles and evaluated sprites through cartridge CHR mapping, updates
 sprite-zero-hit and overflow status, and retains a 256x240 palette-index
 framebuffer in machine checkpoints. The debugger's `ppu` command reports the
 rendering registers and a stable framebuffer checksum. Remaining low-level PPU
-edge behavior and APU channel execution are future timing work.
+edge behavior is future timing work.
+
+The APU runs once per CPU clock with region-specific four-step and five-step
+frame sequencing. Pulse, triangle, and noise channel state is retained in
+machine checkpoints, `$4015` exposes and clears frame IRQ state, and IRQs enter
+the normal CPU interrupt path. The debugger's `apu` command reports channel
+lengths, instantaneous outputs, and a stable output checksum. DMC sample
+fetching and its CPU stalls remain future work.
 
 ## Verification artifact inspection
 
@@ -450,10 +461,11 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Complete remaining PPU hardware edge behavior and add APU channel timing
-2. Add Mapper 3 compilation and recovery
-3. Add emulator-backed `NES_TEST` discovery and execution
-4. Expand optimization quality and generated-code cost modeling
+1. Add DMC sample fetching, CPU stalls, looping, and IRQ timing
+2. Complete remaining PPU hardware edge behavior
+3. Add Mapper 3 compilation and recovery
+4. Add emulator-backed `NES_TEST` discovery and execution
+5. Expand optimization quality and generated-code cost modeling
 
 ## License
 
