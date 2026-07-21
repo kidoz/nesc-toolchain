@@ -11,11 +11,10 @@ to Ricoh 2A03/2A07 machine code and packages the result as an iNES or NES 2.0
 ROM. The toolkit is written in stable Rust 2024.
 
 > [!IMPORTANT]
-> The compiler currently generates Mapper 0 (NROM) and Mapper 2 (UxROM) ROMs.
-> Mapper-aware ROM models for UxROM and CNROM exist. Recursive disassembly and
-> exact assembly round trips and bank-qualified semantic CFG lifting accept
-> Mapper 0 and Mapper 2 ROMs. Stable Rust emission and differential verification
-> accept both mappers; hybrid NesC emission accepts both mappers.
+> The compiler currently generates Mapper 0 (NROM), Mapper 2 (UxROM), and
+> Mapper 3 (CNROM) ROMs. Recursive disassembly, exact assembly round trips,
+> bank-qualified semantic CFG lifting, stable Rust emission, hybrid NesC
+> emission, and differential verification accept all three mappers.
 > SSA/value, call-graph, calling-convention, conservative type, and reducible
 > control-flow recovery support hybrid NesC and stable Rust 2024 translation
 > with bounded fallback. Differential verification is available for both outputs.
@@ -32,9 +31,9 @@ ROM. The toolkit is written in stable Rust 2024.
   call relocations, mapper-bank effects, and hardware-stack accounting
 - Relocatable standalone `.s` modules with typed NesC imports and exports,
   symbolic cross-module relocations, source maps, and stack contracts
-- Mapper 0 and Mapper 2 linking, fixed/switchable bank placement, safe
-  cross-bank call trampolines, bank-qualified symbols, and deterministic
-  emulator boot verification
+- Mapper 0, Mapper 2, and Mapper 3 linking with fixed PRG, switchable PRG or
+  CHR placement, safe cross-bank call trampolines, bank-qualified symbols, and
+  deterministic emulator boot verification
 - Public bounded emulator execution for all 151 official CPU opcodes, reset,
   interrupts, controller I/O, DMA, mapper writes, region timing, checkpoints,
   and first-divergence event traces
@@ -50,13 +49,13 @@ ROM. The toolkit is written in stable Rust 2024.
 - DMC sample playback with regional rates, bounded DAC updates, address
   wrapping, looping, IRQs, four-clock traced CPU stalls, and OAM DMA
   arbitration
-- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2
-  `nesc disassemble`, Mapper 0/2 `nesc decompile --emit=nesc`, and
-  Mapper 0/2 `nesc decompile --emit=rust` workflows
+- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2/3
+  `nesc disassemble`, `nesc decompile --emit=nesc`, and
+  `nesc decompile --emit=rust` workflows
 - `nesc debug` inspection of verification summaries, interrupt and frame
   checkpoints, sparse PPU/APU state, cartridge banks, event traces, and the
   first structured divergence
-- Interactive and scripted Mapper 0/2 ROM debugging with instruction, cycle,
+- Interactive and scripted Mapper 0/2/3 ROM debugging with instruction, cycle,
   frame, source, and call stepping; cooperative pause; bank-qualified
   breakpoints; exact-clock CPU-bus watchpoints and traces; source and symbol
   lookup; hardware state; disassembly; stack inspection; and bounded execution
@@ -73,8 +72,8 @@ ROM. The toolkit is written in stable Rust 2024.
 - Original-6502-versus-Rust differential checks across deterministic CPU and
   memory states, with the generated tests and pass report retained as artifacts
 - Original-6502-versus-NesC emulator checks across recovered functions,
-  deterministic inputs, Mapper 2 bank contexts, scheduled NMI/IRQ entry, and
-  equivalent multi-frame PPU/APU checkpoints
+  deterministic inputs, Mapper 2 PRG and Mapper 3 CHR bank contexts, scheduled
+  NMI/IRQ entry, and equivalent multi-frame PPU/APU checkpoints
 - Rustc-style diagnostics with source spans and suggested corrections
 
 ## Current status
@@ -88,18 +87,18 @@ ROM. The toolkit is written in stable Rust 2024.
 | HIR, MIR, verification, and optimization | Available |
 | Target-specific inline 6502 assembly | Available |
 | Standalone relocatable 6502 assembly modules | Available |
-| 6502 code generation and Mapper 0/2 linking | Available |
+| 6502 code generation and Mapper 0/2/3 linking | Available |
 | ROM construction and inspection | Available |
-| Official 6502 decoding and recursive Mapper 0/2 disassembly | Available |
-| Lossless Mapper 0/2 assembly recovery and exact ROM round trips | Available |
-| Bank-qualified Mapper 0/2 CFG and semantic 6502 IR | Available as a library |
+| Official 6502 decoding and recursive Mapper 0/2/3 disassembly | Available |
+| Lossless Mapper 0/2/3 assembly recovery and exact ROM round trips | Available |
+| Bank-qualified Mapper 0/2/3 CFG and semantic 6502 IR | Available as a library |
 | SSA/value, ABI/type, and reducible control-flow recovery | Available as a library |
-| Mapper 0/2 stable Rust translation with bounded fallback | Available |
-| Mapper 0/2 hybrid NesC translation with bounded dispatcher fallback | Available |
-| Mapper 0/2 original-versus-Rust differential verification | Available |
-| Mapper 0/2 original-versus-NesC differential verification with interrupt and multi-frame hardware checkpoints | Available |
+| Mapper 0/2/3 stable Rust translation with bounded fallback | Available |
+| Mapper 0/2/3 hybrid NesC translation with bounded dispatcher fallback | Available |
+| Mapper 0/2/3 original-versus-Rust differential verification | Available |
+| Mapper 0/2/3 original-versus-NesC differential verification with interrupt and multi-frame hardware checkpoints | Available |
 | Structured verification artifact inspection with `nesc debug` | Available |
-| Interactive and scripted Mapper 0/2 ROM debugger | Available |
+| Interactive and scripted Mapper 0/2/3 ROM debugger | Available |
 | CPU-cycle stepping and NTSC/PAL/Dendy PPU beam position | Available |
 | Per-clock official CPU bus operations, dummy accesses, interrupts, and OAM DMA | Available |
 | PPU background/sprite rendering and palette-index framebuffer | Available |
@@ -288,6 +287,21 @@ when the conservative fallback cannot reproduce an exercised execution.
 Target-side NesC verification reserves `$7000-$7FFF` for its isolated RAM
 shadow, event log, and result record; an exercised source access to that
 workspace is rejected instead of being compared unsafely.
+
+## Mapper 3 projects
+
+CNROM projects use 16 or 32 KiB of fixed PRG-ROM and between 1 and 256 complete
+8 KiB CHR-ROM banks. A volatile write anywhere in `$8000-$FFFF` selects the
+PPU-visible CHR bank. The linker rejects PRG-bank placement annotations because
+CNROM does not switch CPU code, and its map report lists the fixed PRG window
+and every available CHR bank.
+
+`nesc disassemble` keeps CNROM control flow in the fixed physical PRG mapping
+while recording each proven or unknown CHR-bank write. Exact recovery preserves
+every CHR byte in `chr.bin`. Rust and hybrid NesC translation retain the mapper
+write as an ordered bus effect, and `--verify` executes every recovered function
+from each initial CHR-bank context. Verification compares the final physical
+CHR bank independently from the PRG mapping.
 
 ## ROM debugger
 
@@ -478,9 +492,8 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Add Mapper 3 compilation and recovery
-2. Add emulator-backed `NES_TEST` discovery and execution
-3. Expand optimization quality and generated-code cost modeling
+1. Add emulator-backed `NES_TEST` discovery and execution
+2. Expand optimization quality and generated-code cost modeling
 
 ## License
 
