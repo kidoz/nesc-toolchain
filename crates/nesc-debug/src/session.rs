@@ -948,7 +948,7 @@ impl DebugSession {
     fn render_ppu(&self) -> Result<String, DebugSessionError> {
         let state = self.machine.ppu_state();
         Ok(format!(
-            "Timing: {:?}\nFrame {}, scanline {}, dot {}\nCTRL=${:02X} MASK=${:02X} STATUS=${:02X}\nI/O bus=${:02X} NMI line={} pending={}\nVRAM=${:04X} TEMP=${:04X} fine X={} write toggle={}\nFramebuffer: 256x240 palette indices, {} nonzero pixels, checksum ${:016X}\nCHR RAM: {} nonzero bytes\nPalette: {} nonzero bytes\nOAM: {} nonzero bytes\nNametable RAM: {} nonzero bytes\n",
+            "Timing: {:?}\nFrame {}, scanline {}, dot {}\nCTRL=${:02X} MASK=${:02X} STATUS=${:02X}\nI/O bus=${:02X} NMI line={} pending={}\nVRAM=${:04X} TEMP=${:04X} fine X={} write toggle={}\nFetch=${:04X} value=${:02X}\nBackground: pattern=[${:04X}, ${:04X}] attribute=[${:04X}, ${:04X}] latches={:02X?}\nSprites: secondary={} evaluation=[{}, {}] OAM bus=${:02X}\nFramebuffer: 256x240 palette indices, {} nonzero pixels, checksum ${:016X}\nCHR RAM: {} nonzero bytes\nPalette: {} nonzero bytes\nOAM: {} nonzero bytes\nNametable RAM: {} nonzero bytes\n",
             self.machine.timing_profile(),
             state.position.frame,
             state.position.scanline,
@@ -963,6 +963,17 @@ impl DebugSession {
             state.temporary_address,
             state.fine_x,
             state.write_toggle,
+            state.fetch_address,
+            state.fetch_value,
+            state.background_pattern_shifts[0],
+            state.background_pattern_shifts[1],
+            state.background_attribute_shifts[0],
+            state.background_attribute_shifts[1],
+            state.background_latches,
+            state.secondary_oam_count,
+            state.sprite_evaluation[0],
+            state.sprite_evaluation[1],
+            state.oam_bus,
             nonzero(self.machine.framebuffer()),
             self.machine.framebuffer_checksum(),
             nonzero(self.machine.chr_ram()),
@@ -1568,6 +1579,11 @@ mod tests {
             "{ppu}"
         );
         assert!(ppu.contains("VRAM=$0000 TEMP=$0000 fine X=0"), "{ppu}");
+        assert!(ppu.contains("Fetch=$0000 value=$00"), "{ppu}");
+        assert!(
+            ppu.contains("Sprites: secondary=0 evaluation=[0, 0] OAM bus=$00"),
+            "{ppu}"
+        );
         assert!(
             ppu.contains("Framebuffer: 256x240 palette indices"),
             "{ppu}"
