@@ -91,6 +91,28 @@ pub struct BuildArtifacts {
     pub symbol_addresses: BTreeMap<String, u16>,
 }
 
+/// One source-backed test discovered from a reserved `NES_TEST` definition.
+#[derive(Clone, Debug)]
+pub struct TestDefinition {
+    /// Human-readable test name.
+    pub name: String,
+    /// Generated linker-visible entry symbol.
+    pub symbol: String,
+    /// Per-test cycle limit declared with `NES_CYCLE_BUDGET`.
+    pub cycle_budget: Option<u64>,
+    /// Owned source used for failure diagnostics.
+    pub source: SourceFile,
+    /// Complete test definition range.
+    pub span: Span,
+}
+
+/// One independently linked test ROM and its discovery metadata.
+#[derive(Clone, Debug)]
+pub struct BuiltTest {
+    pub definition: TestDefinition,
+    pub artifacts: BuildArtifacts,
+}
+
 /// Validates and type-checks a project.
 ///
 /// # Errors
@@ -100,7 +122,16 @@ pub fn check_project(
     project: &Project,
     config: &CompilerConfig,
 ) -> Result<CheckedProject, Vec<Diagnostic>> {
+    check_project_with_mode(project, config, false)
+}
+
+fn check_project_with_mode(
+    project: &Project,
+    config: &CompilerConfig,
+    test_mode: bool,
+) -> Result<CheckedProject, Vec<Diagnostic>> {
     let mut frontend = FrontendConfig::new(project.entry_path());
+    frontend.test_mode = test_mode;
     frontend
         .include_directories
         .extend(config.include_directories.iter().cloned());
@@ -379,6 +410,69 @@ pub fn build_project(
     config: &CompilerConfig,
 ) -> Result<BuildArtifacts, Vec<Diagnostic>> {
     let checked = check_project(project, config)?;
+    build_checked_project(project, &checked, "main", false)
+}
+
+/// Discovers, compiles, and independently links every `NES_TEST` definition.
+///
+/// # Errors
+///
+/// Returns frontend, instruction-selection, relocation, cartridge-layout, or missing-test
+/// diagnostics.
+pub fn build_tests(
+    project: &Project,
+    config: &CompilerConfig,
+) -> Result<Vec<BuiltTest>, Vec<Diagnostic>> {
+    let checked = check_project_with_mode(project, config, true)?;
+    let definitions = checked
+        .hir
+        .functions
+        .iter()
+        .filter_map(|function| {
+            let test = function.test.as_ref()?;
+            let source = checked.hir.sources.get(function.span.source)?;
+            let cycle_budget = function
+                .attributes
+                .iter()
+                .find(|attribute| attribute.name == "cycle_budget")
+                .and_then(|attribute| attribute.arguments.first())
+                .and_then(|argument| match &argument.kind {
+                    nesc_hir::ExpressionKind::Integer(literal) => Some(literal.value),
+                    _ => None,
+                });
+            Some(TestDefinition {
+                name: test.name.clone(),
+                symbol: function.name.clone(),
+                cycle_budget,
+                source: SourceFile::new(source.path(), source.text()),
+                span: Span::new(function.span.start, function.span.len),
+            })
+        })
+        .collect::<Vec<_>>();
+    if definitions.is_empty() {
+        return Err(vec![
+            Diagnostic::error("E2200", "project contains no `NES_TEST` definitions")
+                .with_help("add `NES_TEST(\"name\") { ... }` to the project entry source"),
+        ]);
+    }
+    definitions
+        .into_iter()
+        .map(|definition| {
+            let artifacts = build_checked_project(project, &checked, &definition.symbol, true)?;
+            Ok(BuiltTest {
+                definition,
+                artifacts,
+            })
+        })
+        .collect()
+}
+
+fn build_checked_project(
+    project: &Project,
+    checked: &CheckedProject,
+    entry: &str,
+    test_runtime: bool,
+) -> Result<BuildArtifacts, Vec<Diagnostic>> {
     let external_stack_bytes = assembly_stack_contracts(&checked.assembly)?;
     let backend_config = backend_config(project, external_stack_bytes);
     let generated = nesc_codegen_6502::generate_with_config(&checked.mir, &backend_config)
@@ -403,7 +497,11 @@ pub fn build_project(
         .filter(|symbol| symbol.section.is_none() && symbol.name.starts_with("__nesc_"))
         .map(|symbol| symbol.name.clone())
         .collect::<BTreeSet<_>>();
-    let runtime = nesc_runtime::build_for(&required_helpers);
+    let runtime = if test_runtime {
+        nesc_runtime::build_for_test(&required_helpers, entry)
+    } else {
+        nesc_runtime::build_for(&required_helpers)
+    };
     let link_config = linker_config(project)?;
     let mut objects = Vec::with_capacity(checked.assembly.len() + 2);
     objects.push(runtime.object.clone());
@@ -587,7 +685,7 @@ mod tests {
 
     use nesc_project::{Project, create_project};
 
-    use super::{CompilerConfig, build_project, check_project};
+    use super::{CompilerConfig, build_project, build_tests, check_project};
 
     #[test]
     fn checks_generated_project_through_frontend() {
@@ -1349,5 +1447,51 @@ NES_MAIN int main(void) { return read_value(2); }
         let errors = check_project(&project, &CompilerConfig::bundled_sdk())
             .expect_err("ROM write diagnostic");
         assert!(errors.iter().any(|error| error.code() == "E1344"));
+    }
+
+    #[test]
+    fn builds_and_executes_independent_test_roms() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("test-project");
+        create_project("test-project", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"NES_CYCLE_BUDGET(2000) NES_TEST("addition works") {
+    u8 result = 10u8 + 20u8;
+    NES_ASSERT_EQ(result, 30u8);
+}
+
+NES_TEST("failure values") {
+    NES_ASSERT_EQ(41u8, 42u8);
+}
+"#,
+        )
+        .expect("test source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let tests = build_tests(&project, &CompilerConfig::bundled_sdk()).expect("test builds");
+        assert_eq!(tests.len(), 2);
+        assert_eq!(tests[0].definition.name, "addition works");
+        assert_eq!(tests[0].definition.cycle_budget, Some(2000));
+        assert!(tests[0].artifacts.assembly.contains("jsr __nesc_test_0000"));
+
+        let run = |test: &super::BuiltTest| {
+            nesc_emulator::run_test_rom(
+                &test.artifacts.rom,
+                &test.artifacts.symbol_addresses,
+                nesc_emulator::RunLimits {
+                    instruction_limit: 10_000,
+                    cycle_limit: test.definition.cycle_budget.unwrap_or(100_000),
+                },
+            )
+            .expect("test execution")
+        };
+        assert_eq!(run(&tests[0]).outcome, nesc_emulator::TestOutcome::Passed);
+        assert_eq!(
+            run(&tests[1]).outcome,
+            nesc_emulator::TestOutcome::AssertionFailed {
+                actual: 41,
+                expected: 42,
+            }
+        );
     }
 }
