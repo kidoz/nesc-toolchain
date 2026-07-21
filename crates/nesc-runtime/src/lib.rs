@@ -1,6 +1,7 @@
 //! NES startup and minimal hardware runtime for generated programs.
 
 mod arithmetic;
+mod test_protocol;
 
 use std::collections::BTreeSet;
 
@@ -8,6 +9,19 @@ use nesc_object::{
     Binding, Object, Relocation, RelocationKind, SectionId, SectionKind, SectionPlacement,
     SymbolId, SymbolKind,
 };
+
+/// PRG-RAM byte written by the generated test runtime when execution changes state.
+pub const TEST_STATUS_ADDRESS: u16 = 0x6000;
+/// First byte of the little-endian actual value retained after an assertion failure.
+pub const TEST_ACTUAL_ADDRESS: u16 = 0x6001;
+/// First byte of the little-endian expected value retained after an assertion failure.
+pub const TEST_EXPECTED_ADDRESS: u16 = 0x6005;
+/// Test is still executing.
+pub const TEST_STATUS_RUNNING: u8 = 0;
+/// Test returned without an assertion failure.
+pub const TEST_STATUS_PASSED: u8 = 1;
+/// An equality assertion failed; the mailbox contains both values.
+pub const TEST_STATUS_ASSERTION_FAILED: u8 = 2;
 
 /// Generated startup/runtime object and symbolic assembly.
 #[derive(Clone, Debug)]
@@ -21,18 +35,28 @@ pub struct Runtime {
 /// Builds the Mapper 0 startup and initial SDK runtime.
 #[must_use]
 pub fn build() -> Runtime {
-    build_selected(None)
+    build_selected(None, "main", false)
 }
 
 /// Builds startup and SDK support with only the requested arithmetic helpers.
 #[must_use]
 pub fn build_for(required_helpers: &BTreeSet<String>) -> Runtime {
-    build_selected(Some(required_helpers))
+    build_selected(Some(required_helpers), "main", false)
 }
 
-fn build_selected(required_helpers: Option<&BTreeSet<String>>) -> Runtime {
-    let mut emitter = RuntimeEmitter::new();
-    emitter.reset();
+/// Builds startup and SDK support with a selected emulator-test entry.
+#[must_use]
+pub fn build_for_test(required_helpers: &BTreeSet<String>, entry: &str) -> Runtime {
+    build_selected(Some(required_helpers), entry, true)
+}
+
+fn build_selected(
+    required_helpers: Option<&BTreeSet<String>>,
+    entry: &str,
+    test_protocol: bool,
+) -> Runtime {
+    let mut emitter = RuntimeEmitter::new(entry);
+    emitter.reset(test_protocol);
     emitter.simple_interrupt("__nesc_nmi");
     emitter.simple_interrupt("__nesc_irq");
     emitter.simple_return("nes_init");
@@ -45,6 +69,7 @@ fn build_selected(required_helpers: Option<&BTreeSet<String>>) -> Runtime {
     emitter.simple_return("nes_oam_dma");
     let trap = emitter.trap();
     emitter.arithmetic_helpers(required_helpers, trap);
+    emitter.test_helpers(required_helpers);
     Runtime {
         object: emitter.object,
         assembly: emitter.assembly,
@@ -54,28 +79,28 @@ fn build_selected(required_helpers: Option<&BTreeSet<String>>) -> Runtime {
 struct RuntimeEmitter {
     object: Object,
     code: SectionId,
-    main: SymbolId,
+    entry: SymbolId,
     assembly: String,
 }
 
 impl RuntimeEmitter {
-    fn new() -> Self {
+    fn new(entry: &str) -> Self {
         let mut object = Object::default();
         let code = object
             .add_section_with_placement(".runtime", SectionKind::Code, 1, SectionPlacement::Fixed)
             .expect("runtime section");
-        let main = object
-            .add_symbol("main", None, 0, SymbolKind::Function, Binding::Global)
-            .expect("main import");
+        let entry = object
+            .add_symbol(entry, None, 0, SymbolKind::Function, Binding::Global)
+            .expect("entry import");
         Self {
             object,
             code,
-            main,
+            entry,
             assembly: ".segment \"RUNTIME\"\n".to_owned(),
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, test_protocol: bool) {
         self.define("__nesc_reset");
         self.emit(&[0x78], "sei");
         self.emit(&[0xd8], "cld");
@@ -85,7 +110,17 @@ impl RuntimeEmitter {
         self.emit(&[0x86, 0xfc], "stx $fc ; selected PRG bank shadow");
         self.emit(&[0x8e, 0x00, 0x20], "stx $2000");
         self.emit(&[0x8e, 0x01, 0x20], "stx $2001");
-        self.absolute(0x20, "jsr", self.main);
+        if test_protocol {
+            self.emit(&[0xa9, TEST_STATUS_RUNNING], "lda #$00 ; test running");
+            self.emit(&[0x8d, 0x00, 0x60], "sta $6000 ; test status");
+        }
+        self.absolute(0x20, "jsr", self.entry);
+        if test_protocol {
+            self.emit(&[0xad, 0x00, 0x60], "lda $6000 ; test status");
+            self.emit(&[0xd0, 0x05], "bne __nesc_halt");
+            self.emit(&[0xa9, TEST_STATUS_PASSED], "lda #$01 ; test passed");
+            self.emit(&[0x8d, 0x00, 0x60], "sta $6000 ; test status");
+        }
         let halt = self.define_local("__nesc_halt");
         self.assembly.push_str("__nesc_halt:\n");
         self.absolute(0x4c, "jmp", halt);
@@ -211,7 +246,7 @@ impl RuntimeEmitter {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{build, build_for};
+    use super::{build, build_for, build_for_test};
 
     #[test]
     fn runtime_exports_reset_and_sdk_symbols() {
@@ -266,5 +301,18 @@ mod tests {
                 .any(|symbol| symbol.name == "__nesc_mul_8")
         );
         assert!(!runtime.assembly.contains("__nesc_udiv_16"));
+    }
+
+    #[test]
+    fn emits_selected_test_entry_and_assertion_mailbox_helper() {
+        let required = BTreeSet::from(["__nesc_test_assert_eq".to_owned()]);
+        let runtime = build_for_test(&required, "__nesc_test_0000");
+        runtime
+            .object
+            .validate()
+            .expect("valid test runtime object");
+        assert!(runtime.assembly.contains("jsr __nesc_test_0000"));
+        assert!(runtime.assembly.contains("__nesc_test_assert_eq:"));
+        assert!(runtime.assembly.contains("sta $6000 ; test status"));
     }
 }

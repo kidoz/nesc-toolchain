@@ -59,6 +59,115 @@ pub struct BootReport {
     pub background_color: u8,
 }
 
+/// Final state of one generated `NES_TEST` execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestOutcome {
+    /// The selected test returned without a failed assertion.
+    Passed,
+    /// The first equality assertion failed.
+    AssertionFailed { actual: u32, expected: u32 },
+    /// Compiler-generated trap execution terminated the test.
+    Trap { reason: u8 },
+    /// The instruction bound was exhausted before completion.
+    InstructionLimit,
+    /// The CPU-cycle bound was exhausted before completion.
+    CycleLimit,
+}
+
+/// Bounded execution report for one generated `NES_TEST` ROM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TestReport {
+    pub instructions: u64,
+    pub cycles: u64,
+    pub frames: u64,
+    pub outcome: TestOutcome,
+}
+
+/// Executes one generated test ROM until its runtime mailbox, a trap, or a bound stops it.
+///
+/// # Errors
+///
+/// Rejects malformed ROMs, missing runtime symbols, zero limits, undocumented opcodes, and
+/// required unmapped bus accesses.
+pub fn run_test_rom(
+    rom_bytes: &[u8],
+    symbols: &BTreeMap<String, u16>,
+    limits: RunLimits,
+) -> Result<TestReport, EmulatorError> {
+    if limits.instruction_limit == 0 || limits.cycle_limit == 0 {
+        return Err(EmulatorError {
+            message: "test limits must permit instructions and cycles".to_owned(),
+            pc: 0,
+            cycle: 0,
+            trace: Vec::new(),
+        });
+    }
+    let trap_address = symbols
+        .get("__nesc_trap")
+        .copied()
+        .ok_or_else(|| EmulatorError {
+            message: "symbol table does not contain `__nesc_trap`".to_owned(),
+            pc: 0,
+            cycle: 0,
+            trace: Vec::new(),
+        })?;
+    let mut machine = Machine::from_rom_bytes(
+        rom_bytes,
+        EmulatorConfig {
+            trap_address: Some(trap_address),
+            ..EmulatorConfig::default()
+        },
+    )?;
+    machine.reset()?;
+    let initial_cycles = machine.cycles();
+    let initial_instructions = machine.instructions();
+    loop {
+        let step = machine.step()?;
+        let instructions = machine.instructions().saturating_sub(initial_instructions);
+        let cycles = machine.cycles().saturating_sub(initial_cycles);
+        let report = |outcome| TestReport {
+            instructions,
+            cycles,
+            frames: machine.frames(),
+            outcome,
+        };
+        if let Some(Termination::Trap { reason }) = step.termination {
+            return Ok(report(TestOutcome::Trap { reason }));
+        }
+        match machine.peek(nesc_runtime::TEST_STATUS_ADDRESS)? {
+            nesc_runtime::TEST_STATUS_RUNNING => {}
+            nesc_runtime::TEST_STATUS_PASSED => return Ok(report(TestOutcome::Passed)),
+            nesc_runtime::TEST_STATUS_ASSERTION_FAILED => {
+                let read_u32 = |address| -> Result<u32, EmulatorError> {
+                    let mut bytes = [0; 4];
+                    for (offset, byte) in bytes.iter_mut().enumerate() {
+                        *byte = machine.peek(address + offset as u16)?;
+                    }
+                    Ok(u32::from_le_bytes(bytes))
+                };
+                return Ok(report(TestOutcome::AssertionFailed {
+                    actual: read_u32(nesc_runtime::TEST_ACTUAL_ADDRESS)?,
+                    expected: read_u32(nesc_runtime::TEST_EXPECTED_ADDRESS)?,
+                }));
+            }
+            status => {
+                return Err(EmulatorError {
+                    message: format!("test runtime reported unknown status ${status:02X}"),
+                    pc: machine.cpu().pc,
+                    cycle: machine.cycles(),
+                    trace: machine.events().iter().rev().take(16).cloned().collect(),
+                });
+            }
+        }
+        if instructions >= limits.instruction_limit {
+            return Ok(report(TestOutcome::InstructionLimit));
+        }
+        if cycles >= limits.cycle_limit {
+            return Ok(report(TestOutcome::CycleLimit));
+        }
+    }
+}
+
 /// Runs the first compiler milestone boot oracle.
 ///
 /// # Errors
@@ -144,12 +253,14 @@ pub fn verify_compiler_boot(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use nesc_disasm::opcode;
     use nesc_rom::{Format, Metadata, Mirroring, Region, Rom, build};
 
     use super::{
         BusAccess, BusAccessKind, EmulatorConfig, EventKind, InterruptKind, Machine, RunLimits,
-        StepReport, Termination, TimingProfile, first_divergent_event,
+        StepReport, Termination, TestOutcome, TimingProfile, first_divergent_event, run_test_rom,
     };
 
     fn rom_with_program(program: &[u8], region: Region) -> Vec<u8> {
@@ -422,6 +533,47 @@ mod tests {
         assert_eq!(report.termination, Termination::InstructionLimit);
         assert_eq!(report.instructions, 4);
         assert_eq!(report.frames, 0);
+    }
+
+    #[test]
+    fn observes_test_mailbox_completion_and_bounds() {
+        let passed = rom_with_program(
+            &[
+                0xa9,
+                nesc_runtime::TEST_STATUS_PASSED, // lda #passed
+                0x8d,
+                0x00,
+                0x60, // sta test status
+                0x4c,
+                0x05,
+                0x80, // halt
+            ],
+            Region::Ntsc,
+        );
+        let symbols = BTreeMap::from([("__nesc_trap".to_owned(), 0x9000)]);
+        let report = run_test_rom(
+            &passed,
+            &symbols,
+            RunLimits {
+                instruction_limit: 10,
+                cycle_limit: 100,
+            },
+        )
+        .expect("test execution");
+        assert_eq!(report.outcome, TestOutcome::Passed);
+        assert_eq!(report.instructions, 2);
+
+        let looping = rom_with_program(&[0x4c, 0x00, 0x80], Region::Ntsc);
+        let report = run_test_rom(
+            &looping,
+            &symbols,
+            RunLimits {
+                instruction_limit: 3,
+                cycle_limit: 100,
+            },
+        )
+        .expect("bounded test execution");
+        assert_eq!(report.outcome, TestOutcome::InstructionLimit);
     }
 
     #[test]

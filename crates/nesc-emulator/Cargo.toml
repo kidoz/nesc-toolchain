@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 nesc-disasm = { path = "../nesc-disasm" }
 nesc-rom = { path = "../nesc-rom" }
+nesc-runtime = { path = "../nesc-runtime" }
 
 [lints]
 workspace = true

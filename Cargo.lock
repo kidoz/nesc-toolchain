@@ -295,6 +295,7 @@ version = "0.1.0"
 dependencies = [
  "nesc-disasm",
  "nesc-rom",
+ "nesc-runtime",
 ]
 
 [[package]]
