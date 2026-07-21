@@ -363,8 +363,10 @@ fn validate_layout(mapper: u16, prg_len: usize, chr_len: usize) -> Result<(), Ro
     match mapper {
         0 if (prg_len == PRG_UNIT || prg_len == PRG_UNIT * 2)
             && matches!(chr_len, 0 | CHR_UNIT) => {}
-        2 if prg_len >= PRG_UNIT * 2 && matches!(chr_len, 0 | CHR_UNIT) => {}
-        3 if (prg_len == PRG_UNIT || prg_len == PRG_UNIT * 2) && chr_len >= CHR_UNIT => {}
+        2 if (PRG_UNIT * 2..=PRG_UNIT * 256).contains(&prg_len)
+            && matches!(chr_len, 0 | CHR_UNIT) => {}
+        3 if (prg_len == PRG_UNIT || prg_len == PRG_UNIT * 2)
+            && (CHR_UNIT..=CHR_UNIT * 256).contains(&chr_len) => {}
         0 => {
             return Err(RomError::new(
                 "Mapper 0 requires 16/32 KiB PRG and 0/8 KiB CHR",
@@ -372,12 +374,12 @@ fn validate_layout(mapper: u16, prg_len: usize, chr_len: usize) -> Result<(), Ro
         }
         2 => {
             return Err(RomError::new(
-                "Mapper 2 requires at least 32 KiB PRG and 0/8 KiB CHR",
+                "Mapper 2 requires 2 to 256 complete 16 KiB PRG banks and 0/8 KiB CHR",
             ));
         }
         3 => {
             return Err(RomError::new(
-                "Mapper 3 requires 16/32 KiB PRG and at least 8 KiB CHR",
+                "Mapper 3 requires 16/32 KiB PRG and 1 to 256 complete 8 KiB CHR banks",
             ));
         }
         other => {
@@ -459,6 +461,12 @@ impl Mapper {
         })
     }
 
+    /// Returns the iNES mapper number represented by this model.
+    #[must_use]
+    pub const fn number(self) -> u16 {
+        self.number
+    }
+
     /// Maps a CPU cartridge address to a physical PRG byte.
     #[must_use]
     pub fn map_cpu(self, address: CpuAddress, state: MapperState) -> Option<PrgOffset> {
@@ -502,8 +510,18 @@ impl Mapper {
             return;
         }
         match self.number {
-            2 => state.prg_bank = value,
-            3 => state.chr_bank = value,
+            2 => {
+                let switchable_banks = (self.prg_len / PRG_UNIT).saturating_sub(1).max(1);
+                state.prg_bank = value % switchable_banks as u8;
+            }
+            3 => {
+                let banks = self.chr_len / CHR_UNIT;
+                state.chr_bank = if banks > usize::from(u8::MAX) {
+                    value
+                } else {
+                    value % banks as u8
+                };
+            }
             _ => {}
         }
     }
@@ -593,6 +611,29 @@ mod tests {
         assert_eq!(
             mapper.map_cpu(CpuAddress(0xc000), state).unwrap().0,
             48 * 1024
+        );
+    }
+
+    #[test]
+    fn cnrom_keeps_prg_fixed_and_switches_chr_banks() {
+        let mapper = Mapper::new(3, 32 * 1024, 4 * 8 * 1024).expect("Mapper 3");
+        let mut state = MapperState::default();
+        assert_eq!(mapper.map_cpu(CpuAddress(0x8000), state).unwrap().0, 0);
+        assert_eq!(
+            mapper.map_cpu(CpuAddress(0xc000), state).unwrap().0,
+            16 * 1024
+        );
+        mapper.cpu_write(CpuAddress(0x8000), 2, &mut state);
+        assert_eq!(state.chr_bank, 2);
+        assert_eq!(
+            mapper.map_ppu(super::PpuAddress(0x0123), state).unwrap().0,
+            2 * 8 * 1024 + 0x0123
+        );
+        mapper.cpu_write(CpuAddress(0xffff), 7, &mut state);
+        assert_eq!(state.chr_bank, 3);
+        assert_eq!(
+            mapper.map_ppu(super::PpuAddress(0), state).unwrap().0,
+            3 * 8 * 1024
         );
     }
 }

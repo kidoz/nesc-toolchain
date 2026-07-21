@@ -688,6 +688,62 @@ NES_MAIN int main(void) {
     }
 
     #[test]
+    fn builds_and_executes_a_cnrom_chr_bank_write() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("cnrom-bank");
+        create_project("cnrom-bank", &project_path).expect("project");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path)
+            .expect("manifest source")
+            .replace("\nmapper = 0\n", "\nmapper = 3\n")
+            .replace("chr-rom-kib = 8", "chr-rom-kib = 32");
+        fs::write(&manifest_path, manifest).expect("Mapper 3 manifest");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+NES_MAIN int main(void) {
+    ptr<mapper_register, volatile u8> chr_bank =
+        (ptr<mapper_register, volatile u8>)0x8000u16;
+    *chr_bank = 2u8;
+    nes_wait_vblank();
+    nes_set_background_color(0x2Au8);
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("Mapper 3 source");
+        let project = Project::load(&manifest_path).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        let rom = nesc_rom::parse(&artifacts.rom).expect("parse generated ROM");
+        assert_eq!(rom.metadata.mapper, 3);
+        assert_eq!(rom.chr_rom.len(), 32 * 1024);
+        assert!(artifacts.map.contains("switchable CHR-ROM banks: 0-3"));
+
+        let mut machine = nesc_emulator::Machine::from_rom_bytes(
+            &artifacts.rom,
+            nesc_emulator::EmulatorConfig::default(),
+        )
+        .expect("Mapper 3 machine");
+        machine.reset().expect("reset");
+        for _ in 0..1_024 {
+            if machine.mapper_state().chr_bank == 2 {
+                break;
+            }
+            machine.step().expect("bounded execution");
+        }
+        assert_eq!(machine.mapper_state().chr_bank, 2);
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x2a,
+            200_000,
+        )
+        .expect("Mapper 3 boot oracle");
+        assert_eq!(boot.background_color, 0x2a);
+    }
+
+    #[test]
     fn rejects_switchable_entry_functions() {
         let temporary = tempdir().expect("temporary directory");
         let project_path = temporary.path().join("banked-entry");

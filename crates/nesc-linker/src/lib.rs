@@ -90,9 +90,9 @@ impl Error for LinkError {}
 /// symbols, overflowing sections, branch range, or invalid vectors.
 pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
     match (config.mapper, config.submapper) {
-        (0, 0) => link_nrom(objects, config),
+        (0 | 3, 0) => link_fixed_prg(objects, config),
         (2, 0) => link_uxrom(objects, config),
-        (0, submapper) | (2, submapper) => Err(vec![LinkError(format!(
+        (0, submapper) | (2, submapper) | (3, submapper) => Err(vec![LinkError(format!(
             "Mapper {} requires submapper 0, not {submapper}",
             config.mapper
         ))]),
@@ -102,11 +102,27 @@ pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<L
     }
 }
 
-fn link_nrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
+fn link_fixed_prg(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
     if !matches!(config.prg_rom_len, 0x4000 | 0x8000) {
-        return Err(vec![LinkError(
-            "Mapper 0 PRG-ROM must be 16 or 32 KiB".to_owned(),
-        )]);
+        return Err(vec![LinkError(format!(
+            "Mapper {} PRG-ROM must be 16 or 32 KiB",
+            config.mapper
+        ))]);
+    }
+    match config.mapper {
+        0 if !matches!(config.chr_rom_len, 0 | 0x2000) => {
+            return Err(vec![LinkError(
+                "Mapper 0 CHR-ROM must be 0 or 8 KiB".to_owned(),
+            )]);
+        }
+        3 if !(0x2000..=0x2000 * 256).contains(&config.chr_rom_len)
+            || config.chr_rom_len % 0x2000 != 0 =>
+        {
+            return Err(vec![LinkError(
+                "Mapper 3 CHR-ROM must contain 1 to 256 complete 8 KiB banks".to_owned(),
+            )]);
+        }
+        _ => {}
     }
     let base = if config.prg_rom_len == 0x4000 {
         0xc000_u16
@@ -127,8 +143,8 @@ fn link_nrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<
         for section in &object.sections {
             if let SectionPlacement::Bank(bank) = section.placement {
                 errors.push(LinkError(format!(
-                    "section `{}` requests switchable bank {bank}, but Mapper 0 has no switchable PRG-ROM window",
-                    section.name
+                    "section `{}` requests switchable bank {bank}, but Mapper {} has no switchable PRG-ROM window",
+                    section.name, config.mapper
                 )));
             }
         }
@@ -141,7 +157,17 @@ fn link_nrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<
     let mut placements = HashMap::<(usize, SectionId), usize>::new();
     let mut cursor = 0_usize;
     let vector_start = config.prg_rom_len - 6;
-    let mut map = String::from("Mapper 0 bank layout\n");
+    let mut map = format!(
+        "Mapper {} bank layout\nfixed PRG-ROM: ${base:04X}-$FFFF\n",
+        config.mapper
+    );
+    if config.mapper == 3 {
+        let chr_banks = config.chr_rom_len / 0x2000;
+        map.push_str(&format!(
+            "switchable CHR-ROM banks: 0-{} at PPU $0000-$1FFF\n",
+            chr_banks - 1
+        ));
+    }
     for (object_index, object) in objects.iter().enumerate() {
         for section in &object.sections {
             cursor = align(cursor, usize::from(section.alignment));
@@ -673,21 +699,35 @@ pub fn relink_recovery(input: RecoveryLinkInput<'_>) -> Result<RecoveredImage, L
                 "Mapper 0 recovery requires 16 or 32 KiB PRG-ROM".to_owned(),
             ));
         }
-        2 if cartridge.prg_rom.len() < 0x8000 || cartridge.prg_rom.len() % 0x4000 != 0 => {
+        2 if cartridge.prg_rom.len() < 0x8000
+            || cartridge.prg_rom.len() > 0x4000 * 256
+            || cartridge.prg_rom.len() % 0x4000 != 0 =>
+        {
             return Err(LinkError(
-                "Mapper 2 recovery requires at least two complete 16 KiB PRG-ROM banks".to_owned(),
+                "Mapper 2 recovery requires 2 to 256 complete 16 KiB PRG-ROM banks".to_owned(),
             ));
         }
-        0 | 2 => {}
+        3 if !matches!(cartridge.prg_rom.len(), 0x4000 | 0x8000) => {
+            return Err(LinkError(
+                "Mapper 3 recovery requires 16 or 32 KiB PRG-ROM".to_owned(),
+            ));
+        }
+        0 | 2 | 3 => {}
         mapper => {
             return Err(LinkError(format!(
-                "recovery relinking supports Mapper 0 and Mapper 2, not Mapper {mapper}"
+                "recovery relinking supports Mapper 0, Mapper 2, and Mapper 3, not Mapper {mapper}"
             )));
         }
     }
-    if !matches!(cartridge.chr_rom.len(), 0 | 0x2000) {
+    let valid_chr = if cartridge.metadata.mapper == 3 {
+        (0x2000..=0x2000 * 256).contains(&cartridge.chr_rom.len())
+            && cartridge.chr_rom.len() % 0x2000 == 0
+    } else {
+        matches!(cartridge.chr_rom.len(), 0 | 0x2000)
+    };
+    if !valid_chr {
         return Err(LinkError(format!(
-            "Mapper {} recovery requires 0 or 8 KiB CHR-ROM",
+            "Mapper {} recovery has an invalid CHR-ROM bank layout",
             cartridge.metadata.mapper
         )));
     }
@@ -752,6 +792,43 @@ mod tests {
         let reset = u16::from_le_bytes([linked.prg_rom[0x7ffc], linked.prg_rom[0x7ffd]]);
         assert_eq!(reset, linked.symbols["__nesc_reset"]);
         assert!(linked.symbols["main"] > reset);
+    }
+
+    #[test]
+    fn links_fixed_prg_and_banked_chr_for_cnrom() {
+        let runtime = nesc_runtime::build();
+        let mut program = Object::default();
+        let code = program
+            .add_section(".text", SectionKind::Code, 1)
+            .expect("section");
+        program.section_bytes_mut(code).unwrap().push(0x60);
+        program
+            .add_symbol("main", Some(code), 0, SymbolKind::Function, Binding::Global)
+            .unwrap();
+        let linked = link(
+            &[runtime.object, program],
+            LinkConfig {
+                mapper: 3,
+                submapper: 0,
+                format: Format::Nes2,
+                prg_rom_len: 0x8000,
+                chr_rom_len: 4 * 0x2000,
+                mirroring: Mirroring::Vertical,
+                battery: false,
+                region: Region::Pal,
+            },
+        )
+        .expect("Mapper 3 link");
+        let parsed = nesc_rom::parse(&linked.rom).expect("valid Mapper 3 ROM");
+        assert_eq!(parsed.metadata.mapper, 3);
+        assert_eq!(parsed.chr_rom.len(), 4 * 0x2000);
+        assert_eq!(linked.symbol_banks["main"], 0);
+        assert!(linked.map.contains("Mapper 3 bank layout"));
+        assert!(
+            linked
+                .map
+                .contains("switchable CHR-ROM banks: 0-3 at PPU $0000-$1FFF")
+        );
     }
 
     #[test]
@@ -885,6 +962,39 @@ mod tests {
             trainer: None,
             prg_rom: &cartridge.prg_rom,
             chr_rom: &[],
+            trailing: &original[original.len() - 2..],
+        })
+        .expect("relink");
+        assert_eq!(rebuilt.rom, original);
+        assert_eq!(rebuilt.cartridge, cartridge);
+    }
+
+    #[test]
+    fn relinks_exact_cnrom_recovery_container() {
+        let cartridge = nesc_rom::Rom {
+            metadata: nesc_rom::Metadata {
+                format: Format::Nes2,
+                mapper: 3,
+                submapper: 0,
+                mirroring: Mirroring::Vertical,
+                battery: false,
+                region: Region::Dendy,
+                prg_rom_len: 0x8000,
+                chr_rom_len: 4 * 0x2000,
+            },
+            trainer: None,
+            prg_rom: vec![0xea; 0x8000],
+            chr_rom: (0..4_u8)
+                .flat_map(|bank| std::iter::repeat_n(bank, 0x2000))
+                .collect(),
+        };
+        let mut original = nesc_rom::build(&cartridge).expect("ROM");
+        original.extend_from_slice(&[0xde, 0xad]);
+        let rebuilt = relink_recovery(RecoveryLinkInput {
+            header: &original[..16],
+            trainer: None,
+            prg_rom: &cartridge.prg_rom,
+            chr_rom: &cartridge.chr_rom,
             trailing: &original[original.len() - 2..],
         })
         .expect("relink");
