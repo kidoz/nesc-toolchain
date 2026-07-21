@@ -50,8 +50,11 @@ ROM. The toolkit is written in stable Rust 2024.
   wrapping, looping, IRQs, four-clock traced CPU stalls, and OAM DMA
   arbitration
 - `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2/3
-  `nesc disassemble`, `nesc decompile --emit=nesc`, and
+  `nesc test`, `nesc disassemble`, `nesc decompile --emit=nesc`, and
   `nesc decompile --emit=rust` workflows
+- Emulator-backed `NES_TEST` discovery with independently linked test ROMs,
+  typed single-evaluation `NES_ASSERT_EQ`, source-attached failures, per-test
+  cycle budgets, name filtering, and bounded NTSC/PAL/Dendy execution
 - `nesc debug` inspection of verification summaries, interrupt and frame
   checkpoints, sparse PPU/APU state, cartridge banks, event traces, and the
   first structured divergence
@@ -83,6 +86,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | Cargo workspace and crate boundaries | Available |
 | `nesc new` | Available |
 | `nesc check` for manifests and source semantics | Available |
+| Emulator-backed `nesc test` discovery, assertions, filtering, and execution | Available |
 | NesC preprocessing and parsing | Available |
 | HIR, MIR, verification, and optimization | Available |
 | Target-specific inline 6502 assembly | Available |
@@ -154,6 +158,34 @@ demo/
 └── src/
     └── main.c
 ```
+
+## Emulator-backed tests
+
+`nesc test` discovers reserved test definitions in the project entry source,
+links each test as an independent ROM entry, and executes it in the
+deterministic emulator. A test-only source does not require `NES_MAIN`:
+
+```c
+NES_CYCLE_BUDGET(2000) NES_TEST("addition works") {
+    u8 result = 10u8 + 20u8;
+
+    NES_ASSERT_EQ(result, 30u8);
+}
+```
+
+Run every test or select names containing a substring:
+
+```bash
+cargo run -p nesc-cli -- test
+cargo run -p nesc-cli -- test --filter addition
+```
+
+Each assertion evaluates its actual value before its expected value and
+evaluates both exactly once. Failure diagnostics retain both 32-bit values and
+the test source range. `NES_CYCLE_BUDGET` sets a smaller per-test bound than
+the command-wide `--cycle-limit`; `--instruction-limit` independently bounds
+instruction execution. Mapper 0, Mapper 2, and Mapper 3 projects use their
+manifest-selected NTSC, PAL, or Dendy timing.
 
 ## Inline assembly
 
@@ -492,8 +524,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Add emulator-backed `NES_TEST` discovery and execution
-2. Expand optimization quality and generated-code cost modeling
+1. Expand optimization quality and generated-code cost modeling
 
 ## License
 
