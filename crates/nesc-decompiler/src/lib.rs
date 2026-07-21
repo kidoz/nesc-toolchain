@@ -35,7 +35,7 @@ use std::fmt;
 
 use nesc_disasm::{
     AddressingMode, BankAddress, Disassembly, FlowControl, Instruction as DisassembledInstruction,
-    MapperWrite, Mnemonic, VectorKind,
+    MapperBankKind, MapperWrite, Mnemonic, VectorKind,
 };
 
 /// Resource limits for untrusted decompilation inputs.
@@ -278,8 +278,10 @@ pub enum SemanticOperation {
         register_address: Option<u16>,
         /// Stored byte, when proven by abstract interpretation.
         value: Option<u8>,
-        /// Selected physical PRG bank, when proven by mapper semantics.
-        resulting_prg_bank: Option<u16>,
+        /// Mapper-controlled cartridge region affected by the write.
+        bank_kind: MapperBankKind,
+        /// Selected physical bank, when proven by mapper semantics.
+        resulting_bank: Option<u16>,
     },
     NoOperation,
 }
@@ -461,9 +463,9 @@ pub fn analyze(
     disassembly: &Disassembly,
     limits: AnalysisLimits,
 ) -> Result<Program, Vec<AnalysisError>> {
-    if !matches!(disassembly.rom.metadata.mapper, 0 | 2) {
+    if !matches!(disassembly.rom.metadata.mapper, 0 | 2 | 3) {
         return Err(vec![AnalysisError::new(format!(
-            "semantic lifting supports Mapper 0 and Mapper 2, not Mapper {}",
+            "semantic lifting supports Mapper 0, Mapper 2, and Mapper 3, not Mapper {}",
             disassembly.rom.metadata.mapper
         ))]);
     }
@@ -586,14 +588,14 @@ impl Program {
                         instruction.provenance.prg_offset
                     )));
                 }
-                if self.mapper != 2
+                if !matches!(self.mapper, 2 | 3)
                     && instruction
                         .operations
                         .iter()
                         .any(|operation| matches!(operation, SemanticOperation::MapperWrite { .. }))
                 {
                     errors.push(AnalysisError::new(format!(
-                        "instruction at PRG offset ${:05X} has a Mapper 2 effect in Mapper {}",
+                        "instruction at PRG offset ${:05X} has a mapper-register effect in Mapper {}",
                         instruction.provenance.prg_offset, self.mapper
                     )));
                 }
@@ -1446,7 +1448,8 @@ fn lift_instruction_with_mapper_writes(
             .map(|write| SemanticOperation::MapperWrite {
                 register_address: write.register_address,
                 value: write.value,
-                resulting_prg_bank: write.resulting_bank,
+                bank_kind: write.bank_kind,
+                resulting_bank: write.resulting_bank,
             }),
     );
     lifted
@@ -1695,7 +1698,8 @@ fn flag_effects(mnemonic: Mnemonic) -> FlagEffects {
 #[cfg(test)]
 mod tests {
     use nesc_disasm::{
-        AnalysisLimits as DisassemblyLimits, BankAddress, Instruction, decode, disassemble, opcode,
+        AnalysisLimits as DisassemblyLimits, BankAddress, Instruction, MapperBankKind, decode,
+        disassemble, opcode,
     };
     use nesc_rom::{Format, Metadata, Mirroring, Region, Rom, build};
 
@@ -1754,6 +1758,33 @@ mod tests {
             chr_rom: Vec::new(),
         })
         .expect("UxROM")
+    }
+
+    fn cnrom(program: &[u8]) -> Vec<u8> {
+        let mut prg = vec![0xff; 16 * 1024];
+        prg[..program.len()].copy_from_slice(program);
+        let vectors = prg.len() - 6;
+        for offset in [0, 2, 4] {
+            prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+        }
+        build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 3,
+                submapper: 0,
+                mirroring: Mirroring::Vertical,
+                battery: false,
+                region: Region::Pal,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 4 * 8 * 1024,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: (0..4_u8)
+                .flat_map(|bank| std::iter::repeat_n(bank, 8 * 1024))
+                .collect(),
+        })
+        .expect("CNROM")
     }
 
     fn uxrom_with_switch_window_fallthrough() -> Vec<u8> {
@@ -1885,11 +1916,43 @@ mod tests {
                     &SemanticOperation::MapperWrite {
                         register_address: Some(0x8000),
                         value: Some(1),
-                        resulting_prg_bank: Some(1),
+                        bank_kind: MapperBankKind::Prg,
+                        resulting_bank: Some(1),
                     }
                 ))
         );
         program.verify().expect("verified Mapper 2 program");
+    }
+
+    #[test]
+    fn lifts_cnrom_chr_bank_writes_without_banking_control_flow() {
+        let bytes = cnrom(&[
+            0xa9, 0x03, // lda #3
+            0x8d, 0x00, 0x80, // sta $8000
+            0x60, // rts
+        ]);
+        let disassembly = disassemble(&bytes, DisassemblyLimits::default()).expect("disassembly");
+        let program = analyze(&disassembly, AnalysisLimits::default()).expect("analysis");
+        assert_eq!(program.mapper, 3);
+        assert!(
+            program
+                .blocks
+                .values()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| instruction.operations.contains(
+                    &SemanticOperation::MapperWrite {
+                        register_address: Some(0x8000),
+                        value: Some(3),
+                        bank_kind: MapperBankKind::Chr,
+                        resulting_bank: Some(3),
+                    }
+                ))
+        );
+        assert!(program.edges.iter().all(|edge| {
+            edge.target
+                .is_none_or(|target| target.bank == 0 && target.cpu_address >= 0xc000)
+        }));
+        program.verify().expect("verified Mapper 3 program");
     }
 
     #[test]
@@ -1939,7 +2002,7 @@ mod tests {
                         matches!(
                             operation,
                             SemanticOperation::MapperWrite {
-                                resulting_prg_bank: Some(1),
+                                resulting_bank: Some(1),
                                 ..
                             }
                         )
@@ -1969,6 +2032,7 @@ mod tests {
                 },
                 prg_offset: 0x4000,
                 selected_prg_banks: vec![None],
+                selected_chr_banks: vec![None],
                 rom_file_offset: 0x4010,
                 decoded,
             };

@@ -104,9 +104,9 @@ pub fn emit_rust_project(
     values.verify(program)?;
     recovery.verify(program, values)?;
     control.verify(program, values, recovery)?;
-    if !matches!(program.mapper, 0 | 2) {
+    if !matches!(program.mapper, 0 | 2 | 3) {
         return Err(vec![AnalysisError::new(format!(
-            "stable-Rust emission supports Mapper 0 and Mapper 2, not Mapper {}",
+            "stable-Rust emission supports Mapper 0, Mapper 2, and Mapper 3, not Mapper {}",
             program.mapper
         ))]);
     }
@@ -191,17 +191,18 @@ fn rust_function_name(function: super::FunctionId, entry: BlockId) -> String {
 pub fn emit_rust_verification(
     program: &Program,
     prg_rom: &[u8],
+    chr_rom_len: usize,
     crate_name: &str,
     limits: RustVerificationLimits,
 ) -> Result<String, Vec<AnalysisError>> {
     program.verify()?;
-    if !matches!(program.mapper, 0 | 2) {
+    if !matches!(program.mapper, 0 | 2 | 3) {
         return Err(vec![AnalysisError::new(format!(
-            "Rust verification supports Mapper 0 and Mapper 2, not Mapper {}",
+            "Rust verification supports Mapper 0, Mapper 2, and Mapper 3, not Mapper {}",
             program.mapper
         ))]);
     }
-    validate_verification_prg_layout(program.mapper, prg_rom.len())?;
+    validate_verification_layout(program.mapper, prg_rom.len(), chr_rom_len)?;
     if limits.instruction_limit == 0 || limits.max_source_bytes == 0 {
         return Err(vec![AnalysisError::new(
             "Rust verification limits must permit instructions and source bytes",
@@ -241,10 +242,14 @@ pub fn emit_rust_verification(
 const PRG_BANK_BYTES: usize = 0x4000;
 const PRG_BANK_COUNT: u16 = (PRG_ROM.len() / PRG_BANK_BYTES) as u16;
 const SWITCHABLE_PRG_BANKS: u16 = if PRG_BANK_COUNT > 1 { PRG_BANK_COUNT - 1 } else { 1 };
-
-const ORIGINAL_CODE: &[CodeSegment] = &[
 ",
     );
+    let _ = writeln!(
+        source,
+        "const CHR_BANK_COUNT: u16 = {};",
+        chr_rom_len / 0x2000
+    );
+    source.push_str("\nconst ORIGINAL_CODE: &[CodeSegment] = &[\n");
     for block in program.blocks.values() {
         for instruction in &block.instructions {
             let bytes = instruction
@@ -272,6 +277,7 @@ struct TestBus {
     io: Box<[u8; 0x4000]>,
     prg_ram: Box<[u8; 0x2000]>,
     selected_prg_bank: u16,
+    selected_chr_bank: u16,
     events: Vec<ObservableEvent>,
 }
 
@@ -290,6 +296,7 @@ impl TestBus {
             io: Box::new([0; 0x4000]),
             prg_ram,
             selected_prg_bank: selected_prg_bank % SWITCHABLE_PRG_BANKS,
+            selected_chr_bank: if recovered::MAPPER == 3 { selected_prg_bank % CHR_BANK_COUNT } else { 0 },
             events: Vec::new(),
         }
     }
@@ -308,6 +315,9 @@ impl Bus for TestBus {
                     0 => PRG_BANK_COUNT - 1,
                     2 if address < 0xc000 => self.selected_prg_bank,
                     2 => PRG_BANK_COUNT - 1,
+                    3 if PRG_BANK_COUNT == 1 => 0,
+                    3 if address < 0xc000 => 0,
+                    3 => PRG_BANK_COUNT - 1,
                     mapper => return Err(RuntimeError::bus(state, format!("unsupported Mapper {mapper}"))),
                 };
                 let window_start = if address < 0xc000 { 0x8000 } else { 0xc000 };
@@ -326,6 +336,9 @@ impl Bus for TestBus {
             0x8000..=0xffff if recovered::MAPPER == 2 => {
                 self.selected_prg_bank = u16::from(value) % SWITCHABLE_PRG_BANKS;
             }
+            0x8000..=0xffff if recovered::MAPPER == 3 => {
+                self.selected_chr_bank = u16::from(value) % CHR_BANK_COUNT;
+            }
             0x8000..=0xffff => {}
         }
         Ok(())
@@ -343,6 +356,8 @@ impl Bus for TestBus {
             (0, 0xc000..=0xffff) => Some(PRG_BANK_COUNT - 1),
             (2, 0x8000..=0xbfff) => Some(self.selected_prg_bank),
             (2, 0xc000..=0xffff) => Some(PRG_BANK_COUNT - 1),
+            (3, 0x8000..=0xbfff) => Some(0),
+            (3, 0xc000..=0xffff) => Some(PRG_BANK_COUNT - 1),
             _ => None,
         }
     }
@@ -405,6 +420,7 @@ fn compare_translation(
     assert_eq!(translated_bus.io, original_bus.io, "I/O state differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
     assert_eq!(translated_bus.prg_ram, original_bus.prg_ram, "PRG RAM differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
     assert_eq!(translated_bus.selected_prg_bank, original_bus.selected_prg_bank, "mapper state differs for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}");
+    assert_eq!(translated_bus.selected_chr_bank, original_bus.selected_chr_bank, "CHR mapper state differs for pattern {pattern:#04x}, mapper bank {initial_prg_bank}, entry {entry:#06x}");
     if translated_bus.events != original_bus.events {
         let first = translated_bus.events.iter().zip(&original_bus.events).position(|(translated, original)| translated != original).unwrap_or_else(|| translated_bus.events.len().min(original_bus.events.len()));
         panic!("first divergent observable event {first} for pattern {pattern:#04x}, PRG bank {initial_prg_bank}, entry {entry:#06x}: original={:?}, translated={:?}", original_bus.events.get(first), translated_bus.events.get(first));
@@ -417,7 +433,7 @@ fn compare_translation(
         let name = rust_function_name(function.id, function.entry);
         let _ = writeln!(
             source,
-            "\n#[test]\nfn verify_{name}() {{\n    let entry_bank = {};\n    let entry = 0x{:04x};\n    let bank_contexts = if recovered::MAPPER == 2 && entry >= 0xc000 {{ SWITCHABLE_PRG_BANKS }} else {{ 1 }};\n    for bank_context in 0..bank_contexts {{\n        let initial_prg_bank = if recovered::MAPPER == 2 && entry < 0xc000 {{ entry_bank }} else {{ bank_context }};\n        for pattern in [0x00_u8, 0x01, 0x7f, 0xff] {{\n            compare_translation(entry_bank, entry, initial_prg_bank, recovered::{name}, pattern);\n        }}\n    }}\n}}",
+            "\n#[test]\nfn verify_{name}() {{\n    let entry_bank = {};\n    let entry = 0x{:04x};\n    let bank_contexts = if recovered::MAPPER == 2 && entry >= 0xc000 {{ SWITCHABLE_PRG_BANKS }} else if recovered::MAPPER == 3 {{ CHR_BANK_COUNT }} else {{ 1 }};\n    for bank_context in 0..bank_contexts {{\n        let initial_prg_bank = if recovered::MAPPER == 2 && entry < 0xc000 {{ entry_bank }} else {{ bank_context }};\n        for pattern in [0x00_u8, 0x01, 0x7f, 0xff] {{\n            compare_translation(entry_bank, entry, initial_prg_bank, recovered::{name}, pattern);\n        }}\n    }}\n}}",
             function.entry.bank, function.entry.cpu_address
         );
     }
@@ -430,20 +446,28 @@ fn compare_translation(
     Ok(source)
 }
 
-fn validate_verification_prg_layout(
+fn validate_verification_layout(
     mapper: u16,
     prg_rom_len: usize,
+    chr_rom_len: usize,
 ) -> Result<(), Vec<AnalysisError>> {
     let valid = match mapper {
-        0 => matches!(prg_rom_len, 0x4000 | 0x8000),
-        2 => prg_rom_len >= 0x8000 && prg_rom_len % 0x4000 == 0,
+        0 => matches!(prg_rom_len, 0x4000 | 0x8000) && matches!(chr_rom_len, 0 | 0x2000),
+        2 => {
+            prg_rom_len >= 0x8000 && prg_rom_len % 0x4000 == 0 && matches!(chr_rom_len, 0 | 0x2000)
+        }
+        3 => {
+            matches!(prg_rom_len, 0x4000 | 0x8000)
+                && (0x2000..=0x2000 * 256).contains(&chr_rom_len)
+                && chr_rom_len % 0x2000 == 0
+        }
         _ => false,
     };
     if valid {
         Ok(())
     } else {
         Err(vec![AnalysisError::new(format!(
-            "Mapper {mapper} verification cannot map {prg_rom_len} PRG-ROM bytes"
+            "Mapper {mapper} verification cannot map {prg_rom_len} PRG-ROM bytes and {chr_rom_len} CHR-ROM bytes"
         ))])
     }
 }

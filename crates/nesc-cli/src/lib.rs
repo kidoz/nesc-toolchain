@@ -22,7 +22,7 @@ use nesc_decompiler::{
     emit_rust_project, emit_rust_verification, structure_control_flow,
 };
 use nesc_diagnostics::Diagnostic;
-use nesc_disasm::{AnalysisLimits, ByteClassification, Disassembly, disassemble};
+use nesc_disasm::{AnalysisLimits, ByteClassification, Disassembly, MapperBankKind, disassemble};
 use nesc_linker::{RecoveryLinkInput, relink_recovery};
 use nesc_project::{Project, create_project};
 
@@ -65,7 +65,7 @@ enum Command {
         #[arg(value_name = "ROM")]
         rom: PathBuf,
     },
-    /// Recover a Mapper 0 or Mapper 2 image as deterministic 6502 assembly and cartridge data.
+    /// Recover a Mapper 0, Mapper 2, or Mapper 3 image as deterministic assembly and cartridge data.
     #[command(alias = "disasm")]
     Disassemble {
         /// ROM file to analyze.
@@ -87,7 +87,7 @@ enum Command {
         #[arg(long, default_value_t = 100_000)]
         max_work_items: usize,
     },
-    /// Translate Mapper 0/2 to host Rust or hybrid NesC.
+    /// Translate Mapper 0, Mapper 2, or Mapper 3 to host Rust or hybrid NesC.
     Decompile {
         /// ROM file to translate.
         #[arg(value_name = "ROM")]
@@ -721,7 +721,7 @@ fn render_analysis_report(disassembly: &Disassembly, trailing_bytes: usize) -> S
     );
     for write in &disassembly.mapper_writes {
         report.push_str(&format!(
-            "mapper-write: prg:{:02X}:${:04X} address={} value={} resulting-bank={}\n",
+            "mapper-write: prg:{:02X}:${:04X} address={} value={} resulting-{}-bank={}\n",
             write.source.bank,
             write.source.cpu_address,
             write
@@ -730,6 +730,10 @@ fn render_analysis_report(disassembly: &Disassembly, trailing_bytes: usize) -> S
             write
                 .value
                 .map_or_else(|| "unknown".to_owned(), |value| format!("${value:02X}")),
+            match write.bank_kind {
+                MapperBankKind::Prg => "prg",
+                MapperBankKind::Chr => "chr",
+            },
             write
                 .resulting_bank
                 .map_or_else(|| "unknown".to_owned(), |value| format!("{value:02X}")),
@@ -824,6 +828,7 @@ fn decompile_rom_file(
                     emit_rust_verification(
                         &program,
                         &disassembly.rom.prg_rom,
+                        disassembly.rom.chr_rom.len(),
                         &crate_name,
                         RustVerificationLimits {
                             instruction_limit: limits.max_instructions as u64,
@@ -843,6 +848,7 @@ fn decompile_rom_file(
                     limits.max_instructions as u64,
                     program.mapper,
                     disassembly.rom.prg_rom.len() / (16 * 1024),
+                    disassembly.rom.chr_rom.len() / (8 * 1024),
                 )?;
             }
             Ok(format!(
@@ -1104,6 +1110,7 @@ fn run_rust_verification(
     instruction_limit: u64,
     mapper: u16,
     prg_bank_count: usize,
+    chr_bank_count: usize,
 ) -> Result<(), Vec<Diagnostic>> {
     let output = ProcessCommand::new("cargo")
         .arg("test")
@@ -1134,13 +1141,13 @@ fn run_rust_verification(
             format!("generated Rust failed differential verification: {details}"),
         )]);
     }
-    let switchable_bank_contexts = if mapper == 2 {
-        prg_bank_count.saturating_sub(1)
-    } else {
-        1
+    let switchable_bank_contexts = match mapper {
+        2 => prg_bank_count.saturating_sub(1),
+        3 => chr_bank_count,
+        _ => 1,
     };
     let report = format!(
-        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-rust\",\n  \"status\": \"passed\",\n  \"mapper\": {mapper},\n  \"prg_banks\": {prg_bank_count},\n  \"functions\": {function_count},\n  \"input_patterns_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {switchable_bank_contexts},\n  \"instruction_limit_per_execution\": {instruction_limit}\n}}\n"
+        "{{\n  \"schema_version\": 1,\n  \"mode\": \"original-6502-vs-rust\",\n  \"status\": \"passed\",\n  \"mapper\": {mapper},\n  \"prg_banks\": {prg_bank_count},\n  \"chr_banks\": {chr_bank_count},\n  \"functions\": {function_count},\n  \"input_patterns_per_bank_context\": 4,\n  \"switchable_bank_contexts\": {switchable_bank_contexts},\n  \"instruction_limit_per_execution\": {instruction_limit}\n}}\n"
     );
     let path = destination.join("verification.json");
     fs::write(&path, report).map_err(|error| {

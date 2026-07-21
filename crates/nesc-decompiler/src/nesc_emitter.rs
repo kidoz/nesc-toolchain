@@ -52,7 +52,7 @@ pub struct NesCProject {
     pub report_json: String,
 }
 
-/// Emits a buildable Mapper 0 or Mapper 2 NesC project.
+/// Emits a buildable Mapper 0, Mapper 2, or Mapper 3 NesC project.
 ///
 /// Reducible functions use ordinary NesC control flow. Uncertain functions
 /// call a bounded target-side dispatcher over the recovered machine state.
@@ -80,9 +80,9 @@ pub fn emit_nesc_project(
             "semantic program mapper differs from the source cartridge",
         )]);
     }
-    if !matches!(program.mapper, 0 | 2) {
+    if !matches!(program.mapper, 0 | 2 | 3) {
         return Err(vec![AnalysisError::new(format!(
-            "hybrid NesC emission supports Mapper 0 and Mapper 2, not Mapper {}",
+            "hybrid NesC emission supports Mapper 0, Mapper 2, and Mapper 3, not Mapper {}",
             program.mapper
         ))]);
     }
@@ -167,6 +167,8 @@ pub fn emit_nesc_project(
                 "switchable PRG bank count does not fit in u16",
             )]
         })?,
+        chr_banks: u16::try_from(disassembly.rom.chr_rom.len() / (8 * 1024))
+            .map_err(|_| vec![AnalysisError::new("CHR bank count does not fit in u16")])?,
         names,
         source: String::new(),
     };
@@ -218,6 +220,7 @@ struct Emitter<'a> {
     limits: NesCEmissionLimits,
     fixed_prg_bank: u16,
     switchable_prg_banks: u16,
+    chr_banks: u16,
     names: BTreeMap<super::FunctionId, String>,
     source: String,
 }
@@ -305,6 +308,15 @@ impl Emitter<'_> {
                     "cpu_selected_prg_bank = 0;"
                 },
             )?;
+        } else if self.program.mapper == 3 {
+            self.line(
+                1,
+                if self.config.verification {
+                    "cpu_selected_chr_bank = verification_load(0x7ff7);"
+                } else {
+                    "cpu_selected_chr_bank = 0;"
+                },
+            )?;
         }
         self.line(
             1,
@@ -355,6 +367,8 @@ impl Emitter<'_> {
         ];
         if self.program.mapper == 2 {
             declarations.insert(7, "static u8 cpu_selected_prg_bank;");
+        } else if self.program.mapper == 3 {
+            declarations.insert(7, "static u8 cpu_selected_chr_bank;");
         }
         if has_fallback {
             declarations.extend([
@@ -436,6 +450,13 @@ impl Emitter<'_> {
                     "cpu_selected_prg_bank = (u8)(value % {});",
                     self.switchable_prg_banks
                 ),
+            )?;
+            self.line(1, "}")?;
+        } else if self.program.mapper == 3 {
+            self.line(1, "if (address >= 0x8000) {")?;
+            self.line(
+                2,
+                &format!("cpu_selected_chr_bank = (u8)(value % {});", self.chr_banks),
             )?;
             self.line(1, "}")?;
         }
@@ -632,8 +653,8 @@ impl Emitter<'_> {
         self.line(1, "verification_store(0x7f09, (u8)(cpu_pc >> 8));")?;
         if self.program.mapper == 2 {
             self.line(1, "verification_store(0x7f0a, cpu_selected_prg_bank);")?;
-        } else {
-            self.line(1, "verification_store(0x7f0a, 0);")?;
+        } else if self.program.mapper == 3 {
+            self.line(1, "verification_store(0x7f0e, cpu_selected_chr_bank);")?;
         }
         self.line(1, "verification_store(0x7f02, 0xa5);")?;
         self.line(0, "}")

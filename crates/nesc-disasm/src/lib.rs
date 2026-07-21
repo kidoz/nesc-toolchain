@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
-use nesc_rom::{CpuAddress, Mapper, MapperState, Rom};
+use nesc_rom::{CpuAddress, Mapper, MapperState, PpuAddress, Rom};
 
 pub use decoder::{
     AddressingMode, DecodeError, DecodedInstruction, FlowControl, Mnemonic, Opcode, decode, opcode,
@@ -110,6 +110,8 @@ pub struct Instruction {
     pub prg_offset: usize,
     /// Mapper 2 switchable-bank states observed while this instruction executes.
     pub selected_prg_banks: Vec<Option<u16>>,
+    /// Mapper 3 switchable CHR-bank states observed while this instruction executes.
+    pub selected_chr_banks: Vec<Option<u16>>,
     /// Byte offset within the original ROM container.
     pub rom_file_offset: usize,
     /// Exact official instruction decoding.
@@ -147,8 +149,19 @@ pub struct MapperWrite {
     pub register_address: Option<u16>,
     /// Written value, when statically known.
     pub value: Option<u8>,
-    /// Physical switchable PRG bank selected by the write, when known.
+    /// Kind of physical mapper bank selected by the write.
+    pub bank_kind: MapperBankKind,
+    /// Physical mapper bank selected by the write, when known.
     pub resulting_bank: Option<u16>,
+}
+
+/// Mapper-controlled cartridge region affected by a register write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MapperBankKind {
+    /// Switchable 16 KiB PRG-ROM bank.
+    Prg,
+    /// Switchable 8 KiB CHR-ROM bank.
+    Chr,
 }
 
 /// Complete mapper-aware recursive-analysis result.
@@ -342,7 +355,7 @@ impl fmt::Display for DisassemblyError {
 
 impl Error for DisassemblyError {}
 
-/// Parses and recursively analyzes a supported Mapper 0 or Mapper 2 image.
+/// Parses and recursively analyzes a supported Mapper 0, Mapper 2, or Mapper 3 image.
 ///
 /// # Errors
 ///
@@ -353,16 +366,16 @@ pub fn disassemble(bytes: &[u8], limits: AnalysisLimits) -> Result<Disassembly, 
     disassemble_rom(rom, limits)
 }
 
-/// Recursively analyzes a parsed Mapper 0 or Mapper 2 image.
+/// Recursively analyzes a parsed Mapper 0, Mapper 2, or Mapper 3 image.
 ///
 /// # Errors
 ///
 /// Returns a diagnostic for an unsupported mapper, an impossible layout, or
 /// exhausted analysis limits.
 pub fn disassemble_rom(rom: Rom, limits: AnalysisLimits) -> Result<Disassembly, DisassemblyError> {
-    if !matches!(rom.metadata.mapper, 0 | 2) {
+    if !matches!(rom.metadata.mapper, 0 | 2 | 3) {
         return Err(DisassemblyError::new(format!(
-            "recursive disassembly supports Mapper 0 and Mapper 2, not Mapper {}",
+            "recursive disassembly supports Mapper 0, Mapper 2, and Mapper 3, not Mapper {}",
             rom.metadata.mapper
         )));
     }
@@ -402,6 +415,7 @@ struct WorkItem {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct AbstractState {
     selected_prg_bank: Option<u8>,
+    selected_chr_bank: Option<u8>,
     a: Option<u8>,
     x: Option<u8>,
     y: Option<u8>,
@@ -411,6 +425,7 @@ impl AbstractState {
     const fn reset() -> Self {
         Self {
             selected_prg_bank: Some(0),
+            selected_chr_bank: Some(0),
             a: None,
             x: None,
             y: None,
@@ -601,6 +616,21 @@ impl Analyzer {
                     })
                 })
                 .flatten();
+            let selected_chr_bank = (self.rom.metadata.mapper == 3)
+                .then(|| {
+                    state.selected_chr_bank.and_then(|bank| {
+                        self.mapper
+                            .map_ppu(
+                                PpuAddress(0),
+                                MapperState {
+                                    prg_bank: 0,
+                                    chr_bank: bank,
+                                },
+                            )
+                            .and_then(|offset| u16::try_from(offset.0 / 0x2000).ok())
+                    })
+                })
+                .flatten();
             let rom_file_offset = self.prg_file_start() + prg_offset;
             self.instructions
                 .entry(prg_offset)
@@ -609,11 +639,16 @@ impl Analyzer {
                         instruction.selected_prg_banks.push(selected_prg_bank);
                         instruction.selected_prg_banks.sort_unstable();
                     }
+                    if !instruction.selected_chr_banks.contains(&selected_chr_bank) {
+                        instruction.selected_chr_banks.push(selected_chr_bank);
+                        instruction.selected_chr_banks.sort_unstable();
+                    }
                 })
                 .or_insert(Instruction {
                     address,
                     prg_offset,
                     selected_prg_banks: vec![selected_prg_bank],
+                    selected_chr_banks: vec![selected_chr_bank],
                     rom_file_offset,
                     decoded,
                 });
@@ -631,6 +666,8 @@ impl Analyzer {
                     state = state.forget_call_clobbers();
                     if self.rom.metadata.mapper == 2 {
                         state.selected_prg_bank = None;
+                    } else if self.rom.metadata.mapper == 3 {
+                        state.selected_chr_bank = None;
                     }
                     cpu_address = next;
                 }
@@ -766,7 +803,7 @@ impl Analyzer {
         decoded: DecodedInstruction,
         state: &mut AbstractState,
     ) {
-        if self.rom.metadata.mapper == 2 {
+        if matches!(self.rom.metadata.mapper, 2 | 3) {
             let stored_value = match decoded.opcode.mnemonic {
                 Mnemonic::Sta => state.a,
                 Mnemonic::Stx => state.x,
@@ -800,27 +837,42 @@ impl Analyzer {
                     _ => false,
                 };
             if register_address.is_some() || uncertain_mapper_store {
-                state.selected_prg_bank = if register_address.is_some() {
-                    stored_value
+                let known_bank = register_address.is_some().then_some(stored_value).flatten();
+                let (bank_kind, resulting_bank) = if self.rom.metadata.mapper == 2 {
+                    state.selected_prg_bank = known_bank;
+                    let resulting = state.selected_prg_bank.and_then(|bank| {
+                        self.mapper
+                            .map_cpu(
+                                CpuAddress(0x8000),
+                                MapperState {
+                                    prg_bank: bank,
+                                    chr_bank: 0,
+                                },
+                            )
+                            .map(|offset| physical_bank(offset.0))
+                    });
+                    (MapperBankKind::Prg, resulting)
                 } else {
-                    None
+                    state.selected_chr_bank = known_bank;
+                    let resulting = state.selected_chr_bank.and_then(|bank| {
+                        self.mapper
+                            .map_ppu(
+                                PpuAddress(0),
+                                MapperState {
+                                    prg_bank: 0,
+                                    chr_bank: bank,
+                                },
+                            )
+                            .and_then(|offset| u16::try_from(offset.0 / 0x2000).ok())
+                    });
+                    (MapperBankKind::Chr, resulting)
                 };
-                let resulting_bank = state.selected_prg_bank.and_then(|bank| {
-                    self.mapper
-                        .map_cpu(
-                            CpuAddress(0x8000),
-                            MapperState {
-                                prg_bank: bank,
-                                chr_bank: 0,
-                            },
-                        )
-                        .map(|offset| physical_bank(offset.0))
-                });
                 let write = MapperWrite {
                     source,
                     prg_offset,
                     register_address,
                     value: stored_value,
+                    bank_kind,
                     resulting_bank,
                 };
                 if !self.mapper_writes.contains(&write) {
@@ -965,19 +1017,16 @@ fn render_assembly(disassembly: &Disassembly) -> String {
                 assembly.push(' ');
                 assembly.push_str(&operand);
             }
-            let mapper_state = if mapper == 2 {
-                format!(
-                    " selected:{}",
-                    instruction
-                        .selected_prg_banks
-                        .iter()
-                        .map(|bank| bank
-                            .map_or_else(|| "?".to_owned(), |bank| format!("{bank:02X}")))
-                        .collect::<Vec<_>>()
-                        .join("|")
-                )
-            } else {
-                String::new()
+            let mapper_state = match mapper {
+                2 => format!(
+                    " selected-prg:{}",
+                    render_mapper_banks(&instruction.selected_prg_banks)
+                ),
+                3 => format!(
+                    " selected-chr:{}",
+                    render_mapper_banks(&instruction.selected_chr_banks)
+                ),
+                _ => String::new(),
             };
             assembly.push_str(&format!(
                 " ; prg:{:02X}:${:04X}{mapper_state} file:${:05X}\n",
@@ -1011,7 +1060,7 @@ fn render_assembly(disassembly: &Disassembly) -> String {
         assembly.push_str("\n; Mapper writes\n");
         for write in &disassembly.mapper_writes {
             assembly.push_str(&format!(
-                "; prg:{:02X}:${:04X} address {} value {} resulting-bank {}\n",
+                "; prg:{:02X}:${:04X} address {} value {} resulting-{}-bank {}\n",
                 write.source.bank,
                 write.source.cpu_address,
                 write
@@ -1020,6 +1069,10 @@ fn render_assembly(disassembly: &Disassembly) -> String {
                 write
                     .value
                     .map_or_else(|| "unknown".to_owned(), |value| format!("${value:02X}")),
+                match write.bank_kind {
+                    MapperBankKind::Prg => "prg",
+                    MapperBankKind::Chr => "chr",
+                },
                 write
                     .resulting_bank
                     .map_or_else(|| "unknown".to_owned(), |value| format!("{value:02X}")),
@@ -1039,6 +1092,14 @@ fn render_assembly(disassembly: &Disassembly) -> String {
         }
     }
     assembly
+}
+
+fn render_mapper_banks(banks: &[Option<u16>]) -> String {
+    banks
+        .iter()
+        .map(|bank| bank.map_or_else(|| "?".to_owned(), |bank| format!("{bank:02X}")))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn render_operand(disassembly: &Disassembly, instruction: &Instruction) -> Option<String> {
@@ -1109,7 +1170,9 @@ fn target_label(
 mod tests {
     use nesc_rom::{Format, Metadata, Mirroring, Region, Rom, build};
 
-    use super::{AnalysisLimits, ByteClassification, FlowControl, VectorKind, disassemble};
+    use super::{
+        AnalysisLimits, ByteClassification, FlowControl, MapperBankKind, VectorKind, disassemble,
+    };
 
     fn nrom_with_program(program: &[u8], reset: u16) -> Vec<u8> {
         let mut prg = vec![0xff; 16 * 1024];
@@ -1166,6 +1229,37 @@ mod tests {
             chr_rom: Vec::new(),
         })
         .expect("valid UxROM")
+    }
+
+    fn cnrom_with_chr_switch() -> Vec<u8> {
+        let mut prg = vec![0xff; 16 * 1024];
+        prg[..6].copy_from_slice(&[
+            0xa9, 0x02, // lda #2
+            0x8d, 0x00, 0x80, // sta $8000
+            0x60, // rts
+        ]);
+        let vectors = prg.len() - 6;
+        for offset in [0, 2, 4] {
+            prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+        }
+        build(&Rom {
+            metadata: Metadata {
+                format: Format::Nes2,
+                mapper: 3,
+                submapper: 0,
+                mirroring: Mirroring::Horizontal,
+                battery: false,
+                region: Region::Ntsc,
+                prg_rom_len: prg.len(),
+                chr_rom_len: 4 * 8 * 1024,
+            },
+            trainer: None,
+            prg_rom: prg,
+            chr_rom: (0..4_u8)
+                .flat_map(|bank| std::iter::repeat_n(bank, 8 * 1024))
+                .collect(),
+        })
+        .expect("valid CNROM")
     }
 
     #[test]
@@ -1253,6 +1347,25 @@ mod tests {
     }
 
     #[test]
+    fn follows_cnrom_chr_bank_writes_without_changing_prg_flow() {
+        let rom = cnrom_with_chr_switch();
+        let disassembly = disassemble(&rom, AnalysisLimits::default()).expect("disassembly");
+        disassembly.verify_recovery().expect("lossless recovery");
+        assert_eq!(disassembly.mapper_writes.len(), 1);
+        assert_eq!(disassembly.mapper_writes[0].bank_kind, MapperBankKind::Chr);
+        assert_eq!(disassembly.mapper_writes[0].value, Some(2));
+        assert_eq!(disassembly.mapper_writes[0].resulting_bank, Some(2));
+        assert_eq!(
+            disassembly.instructions[&5].selected_chr_banks,
+            vec![Some(2)]
+        );
+        let assembly = disassembly.assembly();
+        assert!(assembly.contains("Deterministic Mapper 3 recovery"));
+        assert!(assembly.contains("selected-chr:02"));
+        assert!(assembly.contains("resulting-chr-bank 02"));
+    }
+
+    #[test]
     fn enforces_instruction_resource_limit() {
         let rom = nrom_with_program(&[0xea, 0xea, 0x60], 0xc000);
         let error = disassemble(
@@ -1269,9 +1382,9 @@ mod tests {
     #[test]
     fn rejects_unsupported_mapper_recursive_analysis() {
         let mut rom = nrom_with_program(&[0x60], 0xc000);
-        rom[6] = 0x30;
-        let error = disassemble(&rom, AnalysisLimits::default()).expect_err("Mapper 3");
-        assert!(error.message().contains("Mapper 0 and Mapper 2"));
+        rom[6] = 0x40;
+        let error = disassemble(&rom, AnalysisLimits::default()).expect_err("Mapper 4");
+        assert!(error.message().contains("Mapper 0, Mapper 2, and Mapper 3"));
     }
 
     #[test]
