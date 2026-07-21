@@ -26,6 +26,8 @@
 #define NES_EXPORT __nesc_attribute__(export)
 #define NES_IMPORT __nesc_attribute__(import)
 
+/* NES_TEST("name") and NES_ASSERT_EQ(actual, expected) are reserved syntax. */
+
 /*
  * NES_ASM is reserved compiler syntax. Its contract items are
  * NES_ASM_INPUT_A/X/Y(value), NES_ASM_OUTPUT_A/X/Y(variable),

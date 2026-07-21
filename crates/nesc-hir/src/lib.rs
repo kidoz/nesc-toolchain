@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 pub use nesc_frontend::{
     AddressSpace, AssemblyClobbers, AssemblyInput, AssemblyOutput, AssemblyRegister, Attribute,
     BinaryOperator, Block, Expression, ExpressionKind, InlineAssembly, IntegerType, Linkage,
-    Parameter, SourceId, SourceMap, SourceSpan, Statement, Type, TypeKind, UnaryOperator, Variable,
+    Parameter, SourceId, SourceMap, SourceSpan, Statement, TestMetadata, Type, TypeKind,
+    UnaryOperator, Variable,
 };
 use nesc_frontend::{CheckedProgram, Declaration};
 
@@ -33,6 +34,8 @@ pub struct Function {
     pub id: FunctionId,
     /// Linker-visible spelling.
     pub name: String,
+    /// Emulator-backed test metadata retained for tooling.
+    pub test: Option<TestMetadata>,
     /// Resolved signature.
     pub signature: FunctionSignature,
     /// Named parameters.
@@ -115,6 +118,7 @@ pub fn lower(checked: CheckedProgram) -> Module {
                     {
                         existing.body = function.body;
                         existing.attributes = function.attributes;
+                        existing.test = function.test;
                         existing.span = function.span;
                     }
                     continue;
@@ -125,6 +129,7 @@ pub fn lower(checked: CheckedProgram) -> Module {
                 functions.push(Function {
                     id,
                     name: function.name,
+                    test: function.test,
                     signature: FunctionSignature {
                         return_type: function.return_type,
                         parameters: function
@@ -146,6 +151,42 @@ pub fn lower(checked: CheckedProgram) -> Module {
                 globals.push(Global { id, variable });
             }
         }
+    }
+
+    if let Some(span) = functions
+        .iter()
+        .find(|function| function.test.is_some())
+        .map(|function| function.span)
+    {
+        let name = "__nesc_test_assert_eq".to_owned();
+        let id = FunctionId(u32::try_from(functions.len()).expect("function count fits in u32"));
+        let scalar = Type::scalar(TypeKind::Integer(IntegerType::U32));
+        function_names.insert(name.clone(), id);
+        functions.push(Function {
+            id,
+            name,
+            test: None,
+            signature: FunctionSignature {
+                return_type: Type::scalar(TypeKind::Void),
+                parameters: vec![scalar.clone(), scalar.clone()],
+            },
+            parameters: vec![
+                Parameter {
+                    ty: scalar.clone(),
+                    name: Some("actual".to_owned()),
+                    span,
+                },
+                Parameter {
+                    ty: scalar,
+                    name: Some("expected".to_owned()),
+                    span,
+                },
+            ],
+            attributes: Vec::new(),
+            linkage: Linkage::External,
+            body: None,
+            span,
+        });
     }
 
     Module {

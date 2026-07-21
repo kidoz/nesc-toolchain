@@ -12,8 +12,8 @@ mod token;
 pub use ast::{
     AddressSpace, AssemblyClobbers, AssemblyInput, AssemblyOutput, AssemblyRegister, Attribute,
     BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function, InlineAssembly,
-    IntegerType, Linkage, NodeId, Parameter, Program, Statement, StorageClass, Type, TypeKind,
-    UnaryOperator, Variable,
+    IntegerType, Linkage, NodeId, Parameter, Program, Statement, StorageClass, TestMetadata, Type,
+    TypeKind, UnaryOperator, Variable,
 };
 pub use preprocessor::{MacroDefinition, PreprocessedFile, TranslationUnit};
 pub use sema::{CheckedProgram, Symbol, SymbolKind};
@@ -31,6 +31,8 @@ pub struct FrontendConfig {
     pub entry: PathBuf,
     /// User and SDK include search directories in lookup order.
     pub include_directories: Vec<PathBuf>,
+    /// Whether a test-only translation unit may omit `NES_MAIN`.
+    pub test_mode: bool,
 }
 
 impl FrontendConfig {
@@ -40,6 +42,7 @@ impl FrontendConfig {
         Self {
             entry: entry.into(),
             include_directories: Vec::new(),
+            test_mode: false,
         }
     }
 
@@ -47,6 +50,13 @@ impl FrontendConfig {
     #[must_use]
     pub fn with_include_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.include_directories.push(directory.into());
+        self
+    }
+
+    /// Enables test discovery and permits a project containing only `NES_TEST` definitions.
+    #[must_use]
+    pub const fn for_tests(mut self) -> Self {
+        self.test_mode = true;
         self
     }
 }
@@ -97,6 +107,7 @@ pub fn check(config: &FrontendConfig) -> Result<CheckedProgram, Vec<Diagnostic>>
         program,
         unit.sources().clone(),
         unit.macros(),
+        config.test_mode,
         &mut diagnostics,
     )
     .and_then(|checked| {

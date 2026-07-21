@@ -891,6 +891,34 @@ impl<'a> Builder<'a> {
                     ))
                 }
             }
+            ExpressionKind::TestAssertEq { actual, expected } => {
+                let target = Type::scalar(TypeKind::Integer(IntegerType::U32));
+                let actual_type = actual.ty.as_ref()?;
+                let expected_type = expected.ty.as_ref()?;
+                let actual_span = actual.span;
+                let expected_span = expected.span;
+                let actual_value = self.lower_expression(actual)?;
+                let actual_value =
+                    self.cast_if_needed(actual_value, actual_type, &target, actual_span);
+                let expected_value = self.lower_expression(expected)?;
+                let expected_value =
+                    self.cast_if_needed(expected_value, expected_type, &target, expected_span);
+                let function = self
+                    .hir
+                    .function_names
+                    .get("__nesc_test_assert_eq")
+                    .copied()?;
+                self.emit(
+                    None,
+                    InstructionKind::Call {
+                        function,
+                        arguments: vec![actual_value, expected_value],
+                    },
+                    Effect::Volatile,
+                    expression.span,
+                );
+                None
+            }
             ExpressionKind::Cast {
                 ty: target,
                 expression: value,
@@ -1489,10 +1517,11 @@ fn function_placement(function: &nesc_hir::Function) -> Result<BankPlacement, Lo
         });
     }
     if let Some(attribute) = bank
-        && function
+        && (function
             .attributes
             .iter()
             .any(|attribute| matches!(attribute.name.as_str(), "main" | "reset" | "nmi" | "irq"))
+            || function.test.is_some())
     {
         return Err(LoweringError {
             message: format!(

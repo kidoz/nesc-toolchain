@@ -52,6 +52,7 @@ pub(crate) fn check(
     mut program: Program,
     sources: SourceMap,
     macros: &BTreeMap<String, MacroDefinition>,
+    test_mode: bool,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<CheckedProgram, Vec<Diagnostic>> {
     let mut checker = Checker {
@@ -62,7 +63,8 @@ pub(crate) fn check(
     };
     checker.add_macro_constants(macros);
     checker.collect_declarations(&program);
-    checker.validate_entry(&program);
+    checker.validate_entry(&program, !test_mode);
+    checker.validate_tests(&program);
     checker.check_bodies(&mut program);
     checker.reject_recursion();
     if checker.diagnostics.is_empty() {
@@ -91,6 +93,7 @@ struct FunctionChecker<'a, 'b> {
     return_type: Type,
     calls: BTreeSet<String>,
     loop_depth: usize,
+    test_function: bool,
 }
 
 impl Checker<'_> {
@@ -277,7 +280,7 @@ impl Checker<'_> {
         }
     }
 
-    fn validate_entry(&mut self, program: &Program) {
+    fn validate_entry(&mut self, program: &Program, required: bool) {
         let entries = program
             .declarations
             .iter()
@@ -295,10 +298,11 @@ impl Checker<'_> {
             })
             .collect::<Vec<_>>();
         match entries.as_slice() {
-            [] => self.diagnostics.push(
+            [] if required => self.diagnostics.push(
                 Diagnostic::error("E1309", "program has no `NES_MAIN` function")
                     .with_help("mark one defined function with `NES_MAIN`"),
             ),
+            [] => {}
             [function] => {
                 if !function.parameters.is_empty()
                     || function.return_type != Type::scalar(TypeKind::Integer(IntegerType::I16))
@@ -324,6 +328,73 @@ impl Checker<'_> {
         }
     }
 
+    fn validate_tests(&mut self, program: &Program) {
+        let mut names = BTreeSet::new();
+        for function in program
+            .declarations
+            .iter()
+            .filter_map(|declaration| match declaration {
+                Declaration::Function(function) if function.test.is_some() => Some(function),
+                _ => None,
+            })
+        {
+            let test = function.test.as_ref().expect("filtered test function");
+            if test.name.is_empty() {
+                self.error(
+                    "E1314",
+                    "`NES_TEST` name must not be empty",
+                    test.name_span,
+                    "empty test name",
+                );
+            } else if !names.insert(test.name.clone()) {
+                self.error(
+                    "E1315",
+                    format!("test name `{}` is declared more than once", test.name),
+                    test.name_span,
+                    "duplicate test name",
+                );
+            }
+            for attribute in &function.attributes {
+                if matches!(
+                    attribute.name.as_str(),
+                    "main" | "reset" | "nmi" | "irq" | "bank"
+                ) {
+                    self.error(
+                        "E1316",
+                        format!("attribute `{}` is not valid on `NES_TEST`", attribute.name),
+                        attribute.span,
+                        "tests execute from the fixed runtime entry",
+                    );
+                }
+            }
+            let budgets = function
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.name == "cycle_budget")
+                .collect::<Vec<_>>();
+            if budgets.len() > 1 {
+                self.error(
+                    "E1317",
+                    "`NES_TEST` declares `NES_CYCLE_BUDGET` more than once",
+                    budgets[1].span,
+                    "duplicate cycle budget",
+                );
+            }
+            if let Some(argument) = budgets
+                .first()
+                .and_then(|attribute| attribute.arguments.first())
+                && !matches!(&argument.kind, ExpressionKind::Integer(literal) if literal.value > 0)
+            {
+                self.error(
+                    "E1318",
+                    "`NES_CYCLE_BUDGET` requires a positive integer literal",
+                    argument.span,
+                    "invalid cycle budget",
+                );
+            }
+        }
+    }
+
     fn check_bodies(&mut self, program: &mut Program) {
         for declaration in &mut program.declarations {
             match declaration {
@@ -339,6 +410,7 @@ impl Checker<'_> {
                         return_type: function.return_type.clone(),
                         calls: BTreeSet::new(),
                         loop_depth: 0,
+                        test_function: function.test.is_some(),
                     };
                     for parameter in &function.parameters {
                         if let Some(name) = &parameter.name {
@@ -369,6 +441,7 @@ impl Checker<'_> {
                             return_type: Type::scalar(TypeKind::Void),
                             calls: BTreeSet::new(),
                             loop_depth: 0,
+                            test_function: false,
                         };
                         let actual = function_checker.expression(initializer);
                         function_checker.require_conversion(
@@ -752,6 +825,32 @@ impl FunctionChecker<'_, '_> {
                 function,
                 arguments,
             } => self.call_type(function, arguments, expression.span),
+            ExpressionKind::TestAssertEq { actual, expected } => {
+                let actual_type = self.expression(actual);
+                let expected_type = self.expression(expected);
+                if !self.test_function {
+                    self.error(
+                        "E1346",
+                        "`NES_ASSERT_EQ` may only be used inside `NES_TEST`",
+                        expression.span,
+                        "assertion outside a test",
+                    );
+                }
+                for (operand, ty) in [
+                    (actual.as_ref(), actual_type.as_ref()),
+                    (expected.as_ref(), expected_type.as_ref()),
+                ] {
+                    if ty.is_some_and(|ty| !ty.is_integer()) {
+                        self.error(
+                            "E1347",
+                            "`NES_ASSERT_EQ` operands must be integer scalars",
+                            operand.span,
+                            "unsupported assertion operand",
+                        );
+                    }
+                }
+                Some(Type::scalar(TypeKind::Void))
+            }
             ExpressionKind::Cast { ty, expression } => {
                 self.expression(expression);
                 Some(ty.clone())
@@ -1312,12 +1411,48 @@ mod tests {
         let mut diagnostics = Vec::new();
         let tokens = crate::lexer::lex(&file, &sources, &mut diagnostics);
         let program = crate::parser::parse(tokens, &sources, &mut diagnostics).expect("program");
-        let result = super::check(program, sources, &BTreeMap::new(), &mut diagnostics);
+        let result = super::check(program, sources, &BTreeMap::new(), false, &mut diagnostics);
         assert!(result.is_err());
         assert!(
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code() == "E1204")
+        );
+    }
+
+    #[test]
+    fn checks_test_only_programs_and_rejects_assertions_outside_tests() {
+        let check_source = |source: &str, test_mode: bool| {
+            let mut sources = SourceMap::new();
+            let id = sources.add(PathBuf::from("test.c"), source.to_owned());
+            let file = PreprocessedFile::new(id, source.to_owned());
+            let mut diagnostics = Vec::new();
+            let tokens = crate::lexer::lex(&file, &sources, &mut diagnostics);
+            let program =
+                crate::parser::parse(tokens, &sources, &mut diagnostics).expect("program");
+            let result = super::check(
+                program,
+                sources,
+                &BTreeMap::new(),
+                test_mode,
+                &mut diagnostics,
+            );
+            (result, diagnostics)
+        };
+
+        let (result, diagnostics) =
+            check_source("NES_TEST(\"works\") { NES_ASSERT_EQ(1u8, 1u8); }", true);
+        assert!(result.is_ok(), "{diagnostics:?}");
+
+        let (result, diagnostics) = check_source(
+            "NES_MAIN int main(void) { NES_ASSERT_EQ(1u8, 1u8); return 0; }",
+            false,
+        );
+        assert!(result.is_err());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "E1346")
         );
     }
 }

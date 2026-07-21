@@ -64,12 +64,23 @@ pub struct Function {
     pub return_type: Type,
     /// Function name.
     pub name: String,
+    /// Emulator-backed test metadata for reserved `NES_TEST` definitions.
+    pub test: Option<TestMetadata>,
     /// Ordered parameters.
     pub parameters: Vec<Parameter>,
     /// Function body; absent for a declaration.
     pub body: Option<Block>,
     /// Complete declaration range.
     pub span: SourceSpan,
+}
+
+/// Source metadata retained for one reserved `NES_TEST` definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestMetadata {
+    /// Human-readable test name.
+    pub name: String,
+    /// String-literal source range used for diagnostics.
+    pub name_span: SourceSpan,
 }
 
 /// Named function parameter.
@@ -495,6 +506,13 @@ pub enum ExpressionKind {
         function: String,
         /// Arguments in source evaluation order.
         arguments: Vec<Expression>,
+    },
+    /// Typed equality assertion reserved for emulator-backed tests.
+    TestAssertEq {
+        /// Value computed exactly once before the expected expression.
+        actual: Box<Expression>,
+        /// Expected value computed exactly once after the actual expression.
+        expected: Box<Expression>,
     },
     /// Explicit conversion.
     Cast {

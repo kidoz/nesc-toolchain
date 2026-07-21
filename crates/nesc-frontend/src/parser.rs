@@ -4,7 +4,7 @@ use crate::{
     AddressSpace, AssemblyClobbers, AssemblyInput, AssemblyOutput, AssemblyRegister, Attribute,
     BinaryOperator, Block, Declaration, Expression, ExpressionKind, Function, InlineAssembly,
     IntegerType, Linkage, NodeId, Parameter, Program, SourceMap, SourceSpan, Statement,
-    StorageClass, Token, TokenKind, Type, TypeKind, UnaryOperator, Variable,
+    StorageClass, TestMetadata, Token, TokenKind, Type, TypeKind, UnaryOperator, Variable,
 };
 
 pub(crate) fn parse(
@@ -16,6 +16,7 @@ pub(crate) fn parse(
         tokens,
         position: 0,
         next_node: 0,
+        next_test: 0,
         sources,
         diagnostics,
     }
@@ -26,6 +27,7 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     position: usize,
     next_node: u32,
+    next_test: u32,
     sources: &'a SourceMap,
     diagnostics: &'a mut Vec<Diagnostic>,
 }
@@ -60,6 +62,9 @@ impl Parser<'_> {
 
     fn declaration(&mut self) -> Option<Declaration> {
         let attributes = self.attributes()?;
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "NES_TEST") {
+            return self.test_declaration(attributes);
+        }
         let prefix = self.declaration_prefix();
         let mut ty = self.parse_type()?;
         let (name, name_span) = self.declarator(&mut ty, true)?;
@@ -85,6 +90,7 @@ impl Parser<'_> {
                 linkage: prefix.linkage,
                 return_type: ty,
                 name,
+                test: None,
                 parameters,
                 body,
                 span: prefix.start.through(end),
@@ -111,6 +117,56 @@ impl Parser<'_> {
             name,
             initializer,
             span: prefix.start.through(end.span).through(name_span),
+        }))
+    }
+
+    fn test_declaration(&mut self, attributes: Vec<Attribute>) -> Option<Declaration> {
+        let start = self.advance().span;
+        self.expect(
+            &TokenKind::LeftParen,
+            "E1212",
+            "expected `(` after `NES_TEST`",
+        )?;
+        let name_token = self.advance().clone();
+        let TokenKind::String(test_name) = name_token.kind else {
+            self.error_at(
+                "E1212",
+                "`NES_TEST` requires a string literal name",
+                name_token.span,
+                "test name must be a string literal",
+            );
+            return None;
+        };
+        self.expect(
+            &TokenKind::RightParen,
+            "E1212",
+            "expected `)` after the test name",
+        )?;
+        if !self.at(&TokenKind::LeftBrace) {
+            self.error_current(
+                "E1212",
+                "`NES_TEST` requires a function body",
+                "expected `{`",
+            );
+            return None;
+        }
+        let body = self.block()?;
+        let symbol = format!("__nesc_test_{:04}", self.next_test);
+        self.next_test = self.next_test.checked_add(1).expect("test count fits u32");
+        let span = start.through(body.span);
+        Some(Declaration::Function(Function {
+            id: self.node_id(),
+            attributes,
+            linkage: Linkage::Internal,
+            return_type: Type::scalar(TypeKind::Void),
+            name: symbol,
+            test: Some(TestMetadata {
+                name: test_name,
+                name_span: name_token.span,
+            }),
+            parameters: Vec::new(),
+            body: Some(body),
+            span,
         }))
     }
 
@@ -1098,14 +1154,36 @@ impl Parser<'_> {
                     "E1202",
                     "expected `)` after call arguments",
                 )?;
-                expression = Expression {
-                    id: self.node_id(),
-                    kind: ExpressionKind::Call {
+                let span = expression.span.through(end.span);
+                let kind = if function == "NES_ASSERT_EQ" {
+                    if arguments.len() != 2 {
+                        self.error_at(
+                            "E1213",
+                            format!(
+                                "`NES_ASSERT_EQ` expects 2 arguments, but {} were provided",
+                                arguments.len()
+                            ),
+                            span,
+                            "incorrect assertion argument count",
+                        );
+                        return None;
+                    }
+                    let mut arguments = arguments.into_iter();
+                    ExpressionKind::TestAssertEq {
+                        actual: Box::new(arguments.next().expect("checked assertion argument")),
+                        expected: Box::new(arguments.next().expect("checked assertion argument")),
+                    }
+                } else {
+                    ExpressionKind::Call {
                         function,
                         arguments,
-                    },
+                    }
+                };
+                expression = Expression {
+                    id: self.node_id(),
+                    kind,
                     ty: None,
-                    span: expression.span.through(end.span),
+                    span,
                 };
             } else if self.consume(&TokenKind::LeftBracket).is_some() {
                 let index = self.expression()?;
@@ -1207,6 +1285,9 @@ impl Parser<'_> {
     }
 
     fn is_declaration_start(&self) -> bool {
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "NES_TEST") {
+            return true;
+        }
         let mut position = self.position;
         while self.tokens.get(position).is_some_and(|token| {
             matches!(token.kind, TokenKind::Static | TokenKind::Extern)
@@ -1446,7 +1527,9 @@ fn binary_operator(kind: &TokenKind) -> Option<(BinaryOperator, u8)> {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::{AssemblyRegister, Declaration, PreprocessedFile, SourceMap, Statement};
+    use crate::{
+        AssemblyRegister, Declaration, ExpressionKind, PreprocessedFile, SourceMap, Statement,
+    };
 
     use super::parse;
 
@@ -1496,5 +1579,39 @@ mod tests {
         assert_eq!(assembly.inputs[0].register, AssemblyRegister::A);
         assert_eq!(assembly.outputs[0].register, AssemblyRegister::X);
         assert!(assembly.clobbers.flags);
+    }
+
+    #[test]
+    fn parses_reserved_test_and_typed_assertion_syntax() {
+        let source = r#"NES_CYCLE_BUDGET(1000) NES_TEST("addition works") {
+            NES_ASSERT_EQ(10u8 + 20u8, 30u8);
+        }"#;
+        let mut sources = SourceMap::new();
+        let id = sources.add(PathBuf::from("test.c"), source.to_owned());
+        let file = PreprocessedFile::new(id, source.to_owned());
+        let mut diagnostics = Vec::new();
+        let tokens = crate::lexer::lex(&file, &sources, &mut diagnostics);
+        let program = parse(tokens, &sources, &mut diagnostics).expect("program");
+        assert!(diagnostics.is_empty());
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("test function expected");
+        };
+        assert_eq!(function.name, "__nesc_test_0000");
+        assert_eq!(
+            function.test.as_ref().map(|test| test.name.as_str()),
+            Some("addition works")
+        );
+        assert_eq!(function.attributes[0].name, "cycle_budget");
+        let Statement::Expression {
+            expression: Some(expression),
+            ..
+        } = &function.body.as_ref().expect("test body").statements[0]
+        else {
+            panic!("assertion statement expected");
+        };
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::TestAssertEq { .. }
+        ));
     }
 }
