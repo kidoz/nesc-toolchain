@@ -1424,3 +1424,101 @@ fn emits_a_bounded_nesc_dispatcher_for_unresolved_control_flow() {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("error[E4211]"));
     assert!(!temporary.path().join("high-level-only").exists());
 }
+
+#[test]
+fn runs_emulator_backed_tests_for_supported_mappers_and_regions() {
+    for (name, mapper, region, prg_kib, chr_kib) in [
+        ("nrom-tests", 0, "ntsc", 32, 8),
+        ("uxrom-tests", 2, "pal", 32, 0),
+        ("cnrom-tests", 3, "dendy", 32, 16),
+    ] {
+        let temporary = tempdir().expect("temporary directory");
+        let created = nesc()
+            .current_dir(temporary.path())
+            .args(["new", name])
+            .output()
+            .expect("create test project");
+        assert!(created.status.success());
+        let project = temporary.path().join(name);
+        let manifest_path = project.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest");
+        let manifest = manifest
+            .replace("region = \"ntsc\"", &format!("region = \"{region}\""))
+            .replace("\nmapper = 0\n", &format!("\nmapper = {mapper}\n"))
+            .replace("prg-rom-kib = 32", &format!("prg-rom-kib = {prg_kib}"))
+            .replace("chr-rom-kib = 8", &format!("chr-rom-kib = {chr_kib}"));
+        fs::write(&manifest_path, manifest).expect("mapper manifest");
+        fs::write(
+            project.join("src/main.c"),
+            r#"NES_CYCLE_BUDGET(2000) NES_TEST("addition works") {
+    u8 result = 10u8 + 20u8;
+    NES_ASSERT_EQ(result, 30u8);
+}
+NES_TEST("function result") {
+    NES_ASSERT_EQ(6u16 * 7u16, 42u16);
+}
+"#,
+        )
+        .expect("test source");
+
+        let tested = nesc()
+            .current_dir(&project)
+            .arg("test")
+            .output()
+            .expect("run project tests");
+        assert!(
+            tested.status.success(),
+            "{}: {}",
+            name,
+            String::from_utf8_lossy(&tested.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&tested.stdout);
+        assert!(stdout.contains("test addition works ... ok"), "{stdout}");
+        assert!(stdout.contains("test function result ... ok"), "{stdout}");
+        assert!(stdout.contains("test result: ok. 2 passed; 0 failed"));
+    }
+}
+
+#[test]
+fn reports_test_assertion_values_and_cycle_limits() {
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "failing-tests"])
+        .output()
+        .expect("create test project");
+    assert!(created.status.success());
+    let project = temporary.path().join("failing-tests");
+    fs::write(
+        project.join("src/main.c"),
+        r#"NES_TEST("wrong value") {
+    NES_ASSERT_EQ(41u8, 42u8);
+}
+NES_CYCLE_BUDGET(50) NES_TEST("bounded loop") {
+    while (true) { }
+}
+"#,
+    )
+    .expect("failing test source");
+
+    let tested = nesc()
+        .current_dir(&project)
+        .args([
+            "test",
+            "--instruction-limit",
+            "1000",
+            "--cycle-limit",
+            "10000",
+        ])
+        .output()
+        .expect("run failing tests");
+    assert!(!tested.status.success());
+    let stdout = String::from_utf8_lossy(&tested.stdout);
+    let stderr = String::from_utf8_lossy(&tested.stderr);
+    assert!(stdout.contains("test wrong value ... FAILED"), "{stdout}");
+    assert!(stdout.contains("test bounded loop ... FAILED"), "{stdout}");
+    assert!(stdout.contains("test result: FAILED. 0 passed; 2 failed"));
+    assert!(stderr.contains("actual 41 ($00000029), expected 42 ($0000002A)"));
+    assert!(stderr.contains("exceeded its 50-cycle limit"));
+    assert!(stderr.contains("--> "));
+}

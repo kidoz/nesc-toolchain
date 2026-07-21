@@ -10,7 +10,7 @@ use std::process::{Command as ProcessCommand, ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nesc_asm::AssemblyLimits;
-use nesc_compiler::{BuildArtifacts, CompilerConfig, build_project, check_project};
+use nesc_compiler::{BuildArtifacts, CompilerConfig, build_project, build_tests, check_project};
 use nesc_debug::{
     DebugRequest, DebugSession, DebugSessionConfig, VerificationView, load_verification,
     render_verification,
@@ -58,6 +58,21 @@ enum Command {
         /// Artifact directory; defaults to `<project>/target`.
         #[arg(long, value_name = "DIRECTORY")]
         target_dir: Option<PathBuf>,
+    },
+    /// Discover, compile, and execute emulator-backed `NES_TEST` definitions.
+    Test {
+        /// Path to the project manifest.
+        #[arg(long, default_value = "NesC.toml", value_name = "FILE")]
+        manifest_path: PathBuf,
+        /// Run only tests whose names contain this text.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
+        /// Maximum instructions executed by each test.
+        #[arg(long, default_value_t = 1_000_000)]
+        instruction_limit: u64,
+        /// Maximum CPU cycles executed by each test before applying a smaller source budget.
+        #[arg(long, default_value_t = 10_000_000)]
+        cycle_limit: u64,
     },
     /// Inspect an iNES or NES 2.0 ROM header.
     Inspect {
@@ -227,6 +242,21 @@ where
     };
 
     let command = match cli.command {
+        Command::Test {
+            manifest_path,
+            filter,
+            instruction_limit,
+            cycle_limit,
+        } => {
+            return run_project_tests(
+                &manifest_path,
+                filter.as_deref(),
+                instruction_limit,
+                cycle_limit,
+                stdout,
+                stderr,
+            );
+        }
         Command::Debug {
             input: debug_input,
             view,
@@ -343,7 +373,151 @@ fn execute(command: Command) -> Result<String, Vec<Diagnostic>> {
             },
         ),
         Command::Debug { .. } => unreachable!("debug commands are handled before dispatch"),
+        Command::Test { .. } => unreachable!("test commands are handled before dispatch"),
     }
+}
+
+fn run_project_tests(
+    manifest_path: &Path,
+    filter: Option<&str>,
+    instruction_limit: u64,
+    cycle_limit: u64,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    if instruction_limit == 0 || cycle_limit == 0 {
+        return write_debug_error(
+            stderr,
+            "E4400",
+            "test instruction and cycle limits must be greater than zero",
+        );
+    }
+    let project = match Project::load(manifest_path) {
+        Ok(project) => project,
+        Err(diagnostics) => return write_diagnostics(stderr, diagnostics),
+    };
+    let tests = match build_tests(&project, &CompilerConfig::bundled_sdk()) {
+        Ok(tests) => tests,
+        Err(diagnostics) => return write_diagnostics(stderr, diagnostics),
+    };
+    let selected = tests
+        .into_iter()
+        .filter(|test| filter.is_none_or(|filter| test.definition.name.contains(filter)))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        let message = filter.map_or_else(
+            || "project contains no tests".to_owned(),
+            |filter| format!("no test name contains `{filter}`"),
+        );
+        return write_debug_error(stderr, "E4401", &message);
+    }
+
+    let mut passed = 0_usize;
+    let mut diagnostics = Vec::new();
+    for test in selected {
+        let effective_cycle_limit = test
+            .definition
+            .cycle_budget
+            .map_or(cycle_limit, |budget| cycle_limit.min(budget));
+        let result = nesc_emulator::run_test_rom(
+            &test.artifacts.rom,
+            &test.artifacts.symbol_addresses,
+            nesc_emulator::RunLimits {
+                instruction_limit,
+                cycle_limit: effective_cycle_limit,
+            },
+        );
+        match result {
+            Ok(report) if report.outcome == nesc_emulator::TestOutcome::Passed => {
+                passed += 1;
+                if writeln!(
+                    stdout,
+                    "test {} ... ok ({} instructions, {} cycles)",
+                    test.definition.name, report.instructions, report.cycles
+                )
+                .is_err()
+                {
+                    return ExitCode::FAILURE;
+                }
+            }
+            Ok(report) => {
+                if writeln!(stdout, "test {} ... FAILED", test.definition.name).is_err() {
+                    return ExitCode::FAILURE;
+                }
+                let message = match report.outcome {
+                    nesc_emulator::TestOutcome::AssertionFailed { actual, expected } => format!(
+                        "test `{}` assertion failed: actual {actual} (${actual:08X}), expected {expected} (${expected:08X})",
+                        test.definition.name
+                    ),
+                    nesc_emulator::TestOutcome::Trap { reason } => format!(
+                        "test `{}` trapped with reason ${reason:02X}",
+                        test.definition.name
+                    ),
+                    nesc_emulator::TestOutcome::InstructionLimit => format!(
+                        "test `{}` exceeded its {instruction_limit}-instruction limit",
+                        test.definition.name
+                    ),
+                    nesc_emulator::TestOutcome::CycleLimit => format!(
+                        "test `{}` exceeded its {effective_cycle_limit}-cycle limit",
+                        test.definition.name
+                    ),
+                    nesc_emulator::TestOutcome::Passed => unreachable!("handled above"),
+                };
+                diagnostics.push(
+                    Diagnostic::error("E4402", message)
+                        .with_source(
+                            test.definition.source,
+                            test.definition.span,
+                            "test failed here",
+                        )
+                        .with_help(format!(
+                            "execution stopped after {} instructions and {} cycles",
+                            report.instructions, report.cycles
+                        )),
+                );
+            }
+            Err(error) => {
+                if writeln!(stdout, "test {} ... FAILED", test.definition.name).is_err() {
+                    return ExitCode::FAILURE;
+                }
+                diagnostics.push(
+                    Diagnostic::error(
+                        "E4403",
+                        format!("test `{}` could not execute: {error}", test.definition.name),
+                    )
+                    .with_source(
+                        test.definition.source,
+                        test.definition.span,
+                        "test execution failed here",
+                    ),
+                );
+            }
+        }
+    }
+    let failed = diagnostics.len();
+    let summary = if failed == 0 { "ok" } else { "FAILED" };
+    if writeln!(
+        stdout,
+        "\ntest result: {summary}. {passed} passed; {failed} failed"
+    )
+    .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    if diagnostics.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        write_diagnostics(stderr, diagnostics)
+    }
+}
+
+fn write_diagnostics(stderr: &mut dyn Write, diagnostics: Vec<Diagnostic>) -> ExitCode {
+    for diagnostic in diagnostics {
+        if write!(stderr, "{}", diagnostic.render()).is_err() {
+            break;
+        }
+    }
+    ExitCode::FAILURE
 }
 
 #[allow(clippy::too_many_arguments)]
