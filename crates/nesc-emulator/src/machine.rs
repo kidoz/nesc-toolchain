@@ -112,6 +112,14 @@ pub struct PpuState {
     pub io_bus: u8,
     pub nmi_line: bool,
     pub nmi_pending: bool,
+    pub fetch_address: u16,
+    pub fetch_value: u8,
+    pub background_pattern_shifts: [u16; 2],
+    pub background_attribute_shifts: [u16; 2],
+    pub background_latches: [u8; 4],
+    pub secondary_oam_count: u8,
+    pub sprite_evaluation: [u8; 2],
+    pub oam_bus: u8,
 }
 
 /// Machine construction settings.
@@ -417,6 +425,16 @@ pub struct Machine {
     ppu_io_bus: u8,
     ppu_nmi_line: bool,
     ppu_suppress_vblank: bool,
+    ppu_fetch_address: u16,
+    ppu_fetch_value: u8,
+    background_next_tile: u8,
+    background_next_attribute: u8,
+    background_next_pattern_low: u8,
+    background_next_pattern_high: u8,
+    background_pattern_shift_low: u16,
+    background_pattern_shift_high: u16,
+    background_attribute_shift_low: u16,
+    background_attribute_shift_high: u16,
     ppu_frame: u64,
     ppu_scanline: u16,
     ppu_dot: u16,
@@ -424,6 +442,14 @@ pub struct Machine {
     framebuffer: Box<[u8; FRAME_PIXELS]>,
     scanline_sprites: [ScanlineSprite; 8],
     scanline_sprite_count: u8,
+    next_scanline_sprites: [ScanlineSprite; 8],
+    next_scanline_sprite_count: u8,
+    secondary_oam: [u8; 32],
+    secondary_oam_indices: [u8; 8],
+    secondary_oam_count: u8,
+    sprite_evaluation_index: u8,
+    sprite_evaluation_byte: u8,
+    ppu_oam_bus: u8,
     controller_state: [u8; 2],
     controller_shift: [u8; 2],
     controller_strobe: bool,
@@ -523,6 +549,16 @@ impl Machine {
             ppu_io_bus: 0,
             ppu_nmi_line: false,
             ppu_suppress_vblank: false,
+            ppu_fetch_address: 0,
+            ppu_fetch_value: 0,
+            background_next_tile: 0,
+            background_next_attribute: 0,
+            background_next_pattern_low: 0,
+            background_next_pattern_high: 0,
+            background_pattern_shift_low: 0,
+            background_pattern_shift_high: 0,
+            background_attribute_shift_low: 0,
+            background_attribute_shift_high: 0,
             ppu_frame: 0,
             ppu_scanline: 0,
             ppu_dot: 0,
@@ -530,6 +566,14 @@ impl Machine {
             framebuffer: Box::new([0; FRAME_PIXELS]),
             scanline_sprites: [ScanlineSprite::default(); 8],
             scanline_sprite_count: 0,
+            next_scanline_sprites: [ScanlineSprite::default(); 8],
+            next_scanline_sprite_count: 0,
+            secondary_oam: [0xff; 32],
+            secondary_oam_indices: [0xff; 8],
+            secondary_oam_count: 0,
+            sprite_evaluation_index: 0,
+            sprite_evaluation_byte: 0,
+            ppu_oam_bus: 0,
             controller_state: [0; 2],
             controller_shift: [0; 2],
             controller_strobe: false,
@@ -1088,6 +1132,25 @@ impl Machine {
             io_bus: self.ppu_io_bus,
             nmi_line: self.ppu_nmi_line,
             nmi_pending: self.pending_ppu_nmi,
+            fetch_address: self.ppu_fetch_address,
+            fetch_value: self.ppu_fetch_value,
+            background_pattern_shifts: [
+                self.background_pattern_shift_low,
+                self.background_pattern_shift_high,
+            ],
+            background_attribute_shifts: [
+                self.background_attribute_shift_low,
+                self.background_attribute_shift_high,
+            ],
+            background_latches: [
+                self.background_next_tile,
+                self.background_next_attribute,
+                self.background_next_pattern_low,
+                self.background_next_pattern_high,
+            ],
+            secondary_oam_count: self.secondary_oam_count,
+            sprite_evaluation: [self.sprite_evaluation_index, self.sprite_evaluation_byte],
+            oam_bus: self.ppu_oam_bus,
         }
     }
 
@@ -1829,7 +1892,7 @@ impl Machine {
 
     fn peek_oam_data(&self) -> u8 {
         if self.oam_rendering_active() {
-            0xff
+            self.ppu_oam_bus
         } else {
             self.oam[usize::from(self.oam_address)]
         }
@@ -2002,6 +2065,10 @@ impl Machine {
             self.ppu_dot += 1;
         }
 
+        if self.ppu_dot == 0 {
+            self.activate_scanline_sprites();
+        }
+
         if self.ppu_scanline == self.vblank_scanline() && self.ppu_dot == 1 {
             if self.ppu_suppress_vblank {
                 self.ppu_status &= !0x80;
@@ -2024,23 +2091,17 @@ impl Machine {
             self.update_ppu_nmi_line();
         }
 
-        if self.ppu_scanline < FRAME_HEIGHT as u16 {
-            if self.ppu_dot == 1 {
-                self.evaluate_scanline_sprites();
-            }
-            if (1..=FRAME_WIDTH as u16).contains(&self.ppu_dot) {
-                self.render_pixel();
-            }
+        if self.ppu_scanline < FRAME_HEIGHT as u16
+            && (1..=FRAME_WIDTH as u16).contains(&self.ppu_dot)
+        {
+            self.render_pixel();
         }
 
         if self.rendering_enabled()
             && (self.ppu_scanline < FRAME_HEIGHT as u16 || self.ppu_scanline == pre_render)
         {
-            if ((1..=256).contains(&self.ppu_dot) || (321..=336).contains(&self.ppu_dot))
-                && self.ppu_dot % 8 == 0
-            {
-                self.increment_render_x();
-            }
+            self.clock_background_pipeline();
+            self.clock_sprite_pipeline();
             if self.ppu_dot == 256 {
                 self.increment_render_y();
             } else if self.ppu_dot == 257 {
@@ -2102,35 +2163,17 @@ impl Machine {
         self.framebuffer[y * FRAME_WIDTH + x] = color;
     }
 
-    fn background_pixel(&self, x: usize, y: usize) -> (bool, u8) {
+    fn background_pixel(&self, x: usize, _y: usize) -> (bool, u8) {
         let backdrop = self.render_palette_color(0x3f00);
         if self.ppu_mask & 0x08 == 0 || (x < 8 && self.ppu_mask & 0x02 == 0) {
             return (false, backdrop);
         }
 
-        let world_x = usize::from(self.ppu_scroll_x) + x;
-        let world_y = usize::from(self.ppu_scroll_y) + y;
-        let base_table = usize::from(self.ppu_ctrl & 0x03);
-        let table_x = (base_table & 1) ^ ((world_x / FRAME_WIDTH) & 1);
-        let table_y = ((base_table >> 1) & 1) ^ ((world_y / FRAME_HEIGHT) & 1);
-        let table = table_y * 2 + table_x;
-        let local_x = world_x % FRAME_WIDTH;
-        let local_y = world_y % FRAME_HEIGHT;
-        let tile_x = local_x / 8;
-        let tile_y = local_y / 8;
-        let name_address = 0x2000 + (table * 0x400 + tile_y * 32 + tile_x) as u16;
-        let tile = self.render_ppu_read(name_address);
-        let attribute_address = 0x23c0 + (table * 0x400 + (tile_y / 4) * 8 + tile_x / 4) as u16;
-        let attribute = self.render_ppu_read(attribute_address);
-        let attribute_shift = ((tile_y & 2) << 1) | (tile_x & 2);
-        let palette = (attribute >> attribute_shift) & 0x03;
-        let pattern_base = if self.ppu_ctrl & 0x10 == 0 { 0 } else { 0x1000 };
-        let row = (local_y & 7) as u16;
-        let pattern_address = pattern_base + u16::from(tile) * 16 + row;
-        let bit = 7 - (local_x & 7);
-        let low = (self.render_ppu_read(pattern_address) >> bit) & 1;
-        let high = (self.render_ppu_read(pattern_address + 8) >> bit) & 1;
-        let pixel = low | (high << 1);
+        let selector = 0x8000_u16 >> self.ppu_fine_x;
+        let pixel = u8::from(self.background_pattern_shift_low & selector != 0)
+            | (u8::from(self.background_pattern_shift_high & selector != 0) << 1);
+        let palette = u8::from(self.background_attribute_shift_low & selector != 0)
+            | (u8::from(self.background_attribute_shift_high & selector != 0) << 1);
         if pixel == 0 {
             (false, backdrop)
         } else {
@@ -2141,57 +2184,234 @@ impl Machine {
         }
     }
 
-    fn evaluate_scanline_sprites(&mut self) {
-        self.scanline_sprite_count = 0;
-        self.scanline_sprites.fill(ScanlineSprite::default());
-        if self.ppu_mask & 0x10 == 0 {
+    fn clock_background_pipeline(&mut self) {
+        let fetch_dot = (1..=256).contains(&self.ppu_dot) || (321..=336).contains(&self.ppu_dot);
+        if fetch_dot {
+            self.background_pattern_shift_low <<= 1;
+            self.background_pattern_shift_high <<= 1;
+            self.background_attribute_shift_low <<= 1;
+            self.background_attribute_shift_high <<= 1;
+            match self.ppu_dot & 7 {
+                1 => {
+                    let address = 0x2000 | (self.ppu_address & 0x0fff);
+                    self.background_next_tile = self.pipeline_ppu_read(address);
+                }
+                3 => {
+                    let address = 0x23c0
+                        | (self.ppu_address & 0x0c00)
+                        | ((self.ppu_address >> 4) & 0x38)
+                        | ((self.ppu_address >> 2) & 0x07);
+                    let attribute = self.pipeline_ppu_read(address);
+                    let shift = ((self.ppu_address >> 4) & 4) | (self.ppu_address & 2);
+                    self.background_next_attribute = (attribute >> shift) & 3;
+                }
+                5 => {
+                    let address = self.background_pattern_address(false);
+                    self.background_next_pattern_low = self.pipeline_ppu_read(address);
+                }
+                7 => {
+                    let address = self.background_pattern_address(true);
+                    self.background_next_pattern_high = self.pipeline_ppu_read(address);
+                }
+                0 => {
+                    self.load_background_shifters();
+                    self.increment_render_x();
+                }
+                _ => {}
+            }
+        } else if matches!(self.ppu_dot, 337 | 339) {
+            let address = 0x2000 | (self.ppu_address & 0x0fff);
+            self.pipeline_ppu_read(address);
+        }
+    }
+
+    fn background_pattern_address(&self, high_plane: bool) -> u16 {
+        let pattern_base = if self.ppu_ctrl & 0x10 == 0 { 0 } else { 0x1000 };
+        pattern_base
+            + u16::from(self.background_next_tile) * 16
+            + ((self.ppu_address >> 12) & 7)
+            + u16::from(high_plane) * 8
+    }
+
+    fn load_background_shifters(&mut self) {
+        self.background_pattern_shift_low = (self.background_pattern_shift_low & 0xff00)
+            | u16::from(self.background_next_pattern_low);
+        self.background_pattern_shift_high = (self.background_pattern_shift_high & 0xff00)
+            | u16::from(self.background_next_pattern_high);
+        let attribute_low = if self.background_next_attribute & 1 == 0 {
+            0
+        } else {
+            0xff
+        };
+        let attribute_high = if self.background_next_attribute & 2 == 0 {
+            0
+        } else {
+            0xff
+        };
+        self.background_attribute_shift_low =
+            (self.background_attribute_shift_low & 0xff00) | attribute_low;
+        self.background_attribute_shift_high =
+            (self.background_attribute_shift_high & 0xff00) | attribute_high;
+    }
+
+    fn pipeline_ppu_read(&mut self, address: u16) -> u8 {
+        let value = self.render_ppu_read(address);
+        self.ppu_fetch_address = address & 0x3fff;
+        self.ppu_fetch_value = value;
+        value
+    }
+
+    fn clock_sprite_pipeline(&mut self) {
+        match self.ppu_dot {
+            1..=64 => self.clear_secondary_oam_clock(),
+            65..=256 => self.evaluate_sprite_clock(),
+            257..=320 => self.fetch_sprite_clock(),
+            _ => {}
+        }
+    }
+
+    fn clear_secondary_oam_clock(&mut self) {
+        if self.ppu_dot == 1 {
+            self.secondary_oam_count = 0;
+            self.secondary_oam_indices.fill(0xff);
+            self.sprite_evaluation_index = 0;
+            self.sprite_evaluation_byte = 0;
+        }
+        self.ppu_oam_bus = 0xff;
+        if self.ppu_dot & 1 == 0 {
+            self.secondary_oam[usize::from(self.ppu_dot / 2 - 1)] = 0xff;
+        }
+    }
+
+    fn evaluate_sprite_clock(&mut self) {
+        if self.sprite_evaluation_index >= 64 {
+            self.ppu_oam_bus = 0xff;
             return;
         }
-        let height = if self.ppu_ctrl & 0x20 == 0 { 8 } else { 16 };
-        let scanline = self.ppu_scanline as u8;
-        let mut matches = 0_u8;
-        for index in 0..64_u8 {
-            let base = usize::from(index) * 4;
-            let row = scanline.wrapping_sub(self.oam[base].wrapping_add(1));
-            if row >= height {
-                continue;
-            }
-            matches = matches.saturating_add(1);
-            if self.scanline_sprite_count >= 8 {
-                continue;
-            }
-            let tile = self.oam[base + 1];
-            let attributes = self.oam[base + 2];
-            let row = if attributes & 0x80 == 0 {
-                row
-            } else {
-                height - 1 - row
-            };
-            let (pattern_base, tile, row) = if height == 16 {
-                (
-                    u16::from(tile & 1) * 0x1000,
-                    (tile & 0xfe).wrapping_add(row / 8),
-                    row & 7,
-                )
-            } else {
-                (
-                    if self.ppu_ctrl & 0x08 == 0 { 0 } else { 0x1000 },
-                    tile,
-                    row,
-                )
-            };
-            let address = pattern_base + u16::from(tile) * 16 + u16::from(row);
-            self.scanline_sprites[usize::from(self.scanline_sprite_count)] = ScanlineSprite {
-                index,
-                x: self.oam[base + 3],
-                attributes,
-                pattern_low: self.render_ppu_read(address),
-                pattern_high: self.render_ppu_read(address + 8),
-            };
-            self.scanline_sprite_count += 1;
+        if self.ppu_dot & 1 != 0 {
+            let address = usize::from(self.sprite_evaluation_index) * 4
+                + usize::from(self.sprite_evaluation_byte);
+            self.ppu_oam_bus = self.oam[address];
+            return;
         }
-        if matches > 8 {
-            self.ppu_status |= 0x20;
+
+        if self.secondary_oam_count < 8 {
+            self.copy_evaluated_sprite_byte();
+        } else {
+            let target = self.sprite_target_scanline();
+            if self.sprite_row(self.ppu_oam_bus, target).is_some() {
+                self.ppu_status |= 0x20;
+            }
+            self.sprite_evaluation_byte = (self.sprite_evaluation_byte + 1) & 3;
+            self.sprite_evaluation_index = self.sprite_evaluation_index.saturating_add(1);
+        }
+    }
+
+    fn copy_evaluated_sprite_byte(&mut self) {
+        let destination =
+            usize::from(self.secondary_oam_count) * 4 + usize::from(self.sprite_evaluation_byte);
+        if self.sprite_evaluation_byte == 0 {
+            let target = self.sprite_target_scanline();
+            if self.sprite_row(self.ppu_oam_bus, target).is_none() {
+                self.sprite_evaluation_index = self.sprite_evaluation_index.saturating_add(1);
+                return;
+            }
+            self.secondary_oam_indices[usize::from(self.secondary_oam_count)] =
+                self.sprite_evaluation_index;
+        }
+        self.secondary_oam[destination] = self.ppu_oam_bus;
+        if self.sprite_evaluation_byte == 3 {
+            self.secondary_oam_count += 1;
+            self.sprite_evaluation_index = self.sprite_evaluation_index.saturating_add(1);
+            self.sprite_evaluation_byte = 0;
+        } else {
+            self.sprite_evaluation_byte += 1;
+        }
+    }
+
+    fn fetch_sprite_clock(&mut self) {
+        let slot = usize::from((self.ppu_dot - 257) / 8);
+        let fetch_clock = (self.ppu_dot - 257) & 7;
+        if self.ppu_dot == 257 {
+            self.next_scanline_sprites.fill(ScanlineSprite::default());
+            self.next_scanline_sprite_count = 0;
+        }
+        let secondary_base = slot * 4;
+        match fetch_clock {
+            0..=3 => {
+                self.ppu_oam_bus = self.secondary_oam[secondary_base + usize::from(fetch_clock)];
+                if fetch_clock == 0 {
+                    self.next_scanline_sprites[slot].index = self.secondary_oam_indices[slot];
+                } else if fetch_clock == 2 {
+                    self.next_scanline_sprites[slot].attributes = self.ppu_oam_bus;
+                } else if fetch_clock == 3 {
+                    self.next_scanline_sprites[slot].x = self.ppu_oam_bus;
+                }
+            }
+            4 => {
+                let address = self.sprite_pattern_address(slot, false);
+                self.next_scanline_sprites[slot].pattern_low = self.pipeline_ppu_read(address);
+            }
+            6 => {
+                let address = self.sprite_pattern_address(slot, true);
+                self.next_scanline_sprites[slot].pattern_high = self.pipeline_ppu_read(address);
+            }
+            7 if slot < usize::from(self.secondary_oam_count) => {
+                self.next_scanline_sprite_count = (slot + 1) as u8;
+            }
+            _ => {}
+        }
+    }
+
+    fn sprite_pattern_address(&self, slot: usize, high_plane: bool) -> u16 {
+        let base = slot * 4;
+        let y = self.secondary_oam[base];
+        let tile = self.secondary_oam[base + 1];
+        let attributes = self.secondary_oam[base + 2];
+        let height = if self.ppu_ctrl & 0x20 == 0 { 8 } else { 16 };
+        let mut row = self
+            .sprite_row(y, self.sprite_target_scanline())
+            .unwrap_or(0);
+        if attributes & 0x80 != 0 {
+            row = height - 1 - row;
+        }
+        let (pattern_base, tile, row) = if height == 16 {
+            (
+                u16::from(tile & 1) * 0x1000,
+                (tile & 0xfe).wrapping_add(row / 8),
+                row & 7,
+            )
+        } else {
+            (
+                if self.ppu_ctrl & 0x08 == 0 { 0 } else { 0x1000 },
+                tile,
+                row,
+            )
+        };
+        pattern_base + u16::from(tile) * 16 + u16::from(row) + u16::from(high_plane) * 8
+    }
+
+    fn sprite_row(&self, y: u8, target: u16) -> Option<u8> {
+        let height = if self.ppu_ctrl & 0x20 == 0 { 8 } else { 16 };
+        let row = (target as u8).wrapping_sub(y.wrapping_add(1));
+        (row < height).then_some(row)
+    }
+
+    fn sprite_target_scanline(&self) -> u16 {
+        if self.ppu_scanline == self.pre_render_scanline() {
+            0
+        } else {
+            self.ppu_scanline.saturating_add(1)
+        }
+    }
+
+    fn activate_scanline_sprites(&mut self) {
+        if self.ppu_scanline < FRAME_HEIGHT as u16 {
+            self.scanline_sprites = self.next_scanline_sprites;
+            self.scanline_sprite_count = self.next_scanline_sprite_count;
+        } else {
+            self.scanline_sprites.fill(ScanlineSprite::default());
+            self.scanline_sprite_count = 0;
         }
     }
 
@@ -3122,6 +3342,21 @@ mod hardware_tests {
         chr
     }
 
+    fn clock_first_rendered_scanline(machine: &mut Machine, target_dot: u16) {
+        machine.ppu_scanline = machine.pre_render_scanline();
+        machine.ppu_dot = 0;
+        for _ in 0..400 {
+            if machine.ppu_scanline == 0 && machine.ppu_dot == target_dot {
+                return;
+            }
+            machine.clock_ppu_dot();
+        }
+        panic!(
+            "PPU did not reach scanline 0 dot {target_dot}; stopped at {:?}",
+            machine.ppu_position()
+        );
+    }
+
     #[test]
     fn implements_scroll_and_address_write_latches() {
         let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
@@ -3307,6 +3542,7 @@ mod hardware_tests {
         machine.ppu_dot = 100;
         machine.oam_address = 0x20;
         machine.oam[0x20] = 0x55;
+        machine.ppu_oam_bus = 0x5a;
 
         machine
             .write_ppu_register(0x2004, 0xaa)
@@ -3320,9 +3556,9 @@ mod hardware_tests {
             machine
                 .read_ppu_register(0x2004)
                 .expect("rendering OAMDATA read"),
-            0xff
+            0x5a
         );
-        assert_eq!(machine.ppu_io_bus, 0xff);
+        assert_eq!(machine.ppu_io_bus, 0x5a);
 
         machine.ppu_mask = 0;
         machine
@@ -3330,6 +3566,117 @@ mod hardware_tests {
             .expect("blanked OAMDATA write");
         assert_eq!(machine.oam[0x20], 0xcc);
         assert_eq!(machine.oam_address, 0x21);
+    }
+
+    #[test]
+    fn fetches_background_tiles_on_the_hardware_dot_cadence() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.write_ppu(0x2000, 1).expect("tile index");
+        machine.write_ppu(0x23c0, 2).expect("attribute byte");
+        machine.ppu_mask = 0x08;
+        machine.ppu_scanline = machine.pre_render_scanline();
+        machine.ppu_dot = 320;
+
+        machine.clock_ppu_dot();
+        assert_eq!(machine.ppu_dot, 321);
+        assert_eq!(machine.ppu_fetch_address, 0x2000);
+        assert_eq!(machine.background_next_tile, 1);
+        machine.clock_ppu_dot();
+        machine.clock_ppu_dot();
+        assert_eq!(machine.ppu_dot, 323);
+        assert_eq!(machine.ppu_fetch_address, 0x23c0);
+        assert_eq!(machine.background_next_attribute, 2);
+        machine.clock_ppu_dot();
+        machine.clock_ppu_dot();
+        assert_eq!(machine.ppu_dot, 325);
+        assert_eq!(machine.ppu_fetch_address, 0x0010);
+        assert_eq!(machine.background_next_pattern_low, 0xff);
+        machine.clock_ppu_dot();
+        machine.clock_ppu_dot();
+        assert_eq!(machine.ppu_dot, 327);
+        assert_eq!(machine.ppu_fetch_address, 0x0018);
+        assert_eq!(machine.background_next_pattern_high, 0);
+        machine.clock_ppu_dot();
+        assert_eq!(machine.ppu_dot, 328);
+        assert_eq!(machine.background_pattern_shift_low & 0xff, 0xff);
+        assert_eq!(machine.background_attribute_shift_low & 0xff, 0);
+        assert_eq!(machine.background_attribute_shift_high & 0xff, 0xff);
+        assert_eq!(machine.ppu_address & 0x001f, 1);
+    }
+
+    #[test]
+    fn evaluates_fetches_and_activates_sprites_at_exact_windows() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        for index in 0..9 {
+            machine.oam[index * 4] = 0xff;
+            machine.oam[index * 4 + 1] = 2;
+            machine.oam[index * 4 + 3] = (index * 8) as u8;
+        }
+        machine.ppu_mask = 0x10;
+        machine.ppu_scanline = machine.pre_render_scanline();
+        machine.ppu_dot = 0;
+
+        while machine.ppu_dot < 64 {
+            machine.clock_ppu_dot();
+        }
+        assert_eq!(machine.secondary_oam, [0xff; 32]);
+        assert_eq!(machine.ppu_oam_bus, 0xff);
+
+        while machine.ppu_dot < 66 {
+            machine.clock_ppu_dot();
+        }
+        assert_eq!(machine.ppu_oam_bus, 0xff);
+        assert_eq!(
+            machine.read_ppu_register(0x2004).expect("evaluation bus"),
+            0xff
+        );
+
+        while machine.ppu_dot < 130 {
+            machine.clock_ppu_dot();
+        }
+        assert_eq!(machine.secondary_oam_count, 8);
+        assert_ne!(machine.ppu_status & 0x20, 0, "sprite overflow search");
+
+        while machine.ppu_dot < 320 {
+            machine.clock_ppu_dot();
+        }
+        assert_eq!(machine.next_scanline_sprite_count, 8);
+        assert_eq!(machine.next_scanline_sprites[0].index, 0);
+        assert_eq!(machine.next_scanline_sprites[0].pattern_low, 0xff);
+        assert_eq!(machine.next_scanline_sprites[0].x, 0);
+
+        while !(machine.ppu_scanline == 0 && machine.ppu_dot == 0) {
+            machine.clock_ppu_dot();
+        }
+        assert_eq!(machine.scanline_sprite_count, 8);
+        assert_eq!(machine.scanline_sprites[0].index, 0);
+    }
+
+    #[test]
+    fn reproduces_the_sprite_overflow_diagonal_scan_bug() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        for index in 0..8 {
+            machine.oam[index * 4] = 0xff;
+        }
+        machine.oam[8 * 4] = 0;
+        machine.oam[9 * 4] = 0;
+        machine.oam[9 * 4 + 1] = 0xff;
+        machine.ppu_mask = 0x08;
+        machine.ppu_scanline = machine.pre_render_scanline();
+        machine.ppu_dot = 0;
+
+        while machine.ppu_dot < 132 {
+            machine.clock_ppu_dot();
+        }
+
+        assert_eq!(machine.secondary_oam_count, 8);
+        assert_eq!(machine.sprite_evaluation_index, 10);
+        assert_eq!(machine.sprite_evaluation_byte, 2);
+        assert_ne!(
+            machine.ppu_status & 0x20,
+            0,
+            "sprite 10 tile byte is interpreted as a Y coordinate"
+        );
     }
 
     #[test]
@@ -3347,13 +3694,13 @@ mod hardware_tests {
             .write_ppu_register(0x2001, 0x0a)
             .expect("background rendering");
 
-        machine.advance_cycles(1);
+        clock_first_rendered_scanline(&mut machine, 3);
 
         assert_eq!(&machine.framebuffer()[..3], &[0x21; 3]);
         assert_eq!(
             machine.ppu_position(),
             PpuPosition {
-                frame: 0,
+                frame: 1,
                 scanline: 0,
                 dot: 3,
             }
@@ -3375,7 +3722,7 @@ mod hardware_tests {
             .write_ppu_register(0x2001, 0x1e)
             .expect("background and sprite rendering");
 
-        machine.advance_cycles(1);
+        clock_first_rendered_scanline(&mut machine, 3);
 
         assert_eq!(&machine.framebuffer()[..3], &[0x2a; 3]);
         assert_ne!(machine.ppu_status & 0x40, 0, "sprite zero hit");
@@ -3387,7 +3734,7 @@ mod hardware_tests {
             overflow.oam[index * 4 + 3] = (index * 8) as u8;
         }
         overflow.ppu_mask = 0x14;
-        overflow.advance_cycles(1);
+        clock_first_rendered_scanline(&mut overflow, 1);
         assert_ne!(overflow.ppu_status & 0x20, 0, "sprite overflow");
     }
 
@@ -3403,7 +3750,7 @@ mod hardware_tests {
         machine.mapper_state.chr_bank = 1;
         machine.ppu_mask = 0x0a;
 
-        machine.advance_cycles(1);
+        clock_first_rendered_scanline(&mut machine, 1);
 
         assert_eq!(machine.framebuffer()[0], 0x24);
     }
