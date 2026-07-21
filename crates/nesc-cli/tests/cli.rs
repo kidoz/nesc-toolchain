@@ -92,8 +92,40 @@ fn uxrom_with_duplicate_fallback_addresses() -> Vec<u8> {
     .expect("UxROM")
 }
 
+fn cnrom_with_chr_switch() -> Vec<u8> {
+    let mut prg = vec![0xff; 16 * 1024];
+    prg[..6].copy_from_slice(&[
+        0xa9, 0x02, // lda #2
+        0x8d, 0x00, 0x80, // sta $8000
+        0x60, // rts
+    ]);
+    let vectors = prg.len() - 6;
+    for offset in [0, 2, 4] {
+        prg[vectors + offset..vectors + offset + 2].copy_from_slice(&0xc000_u16.to_le_bytes());
+    }
+    nesc_rom::build(&Rom {
+        metadata: Metadata {
+            format: Format::Nes2,
+            mapper: 3,
+            submapper: 0,
+            mirroring: Mirroring::Vertical,
+            battery: false,
+            region: Region::Pal,
+            prg_rom_len: prg.len(),
+            chr_rom_len: 4 * 8 * 1024,
+        },
+        trainer: None,
+        prg_rom: prg,
+        chr_rom: (0..4_u8)
+            .flat_map(|bank| std::iter::repeat_n(bank, 8 * 1024))
+            .collect(),
+    })
+    .expect("CNROM")
+}
+
 fn rom_with_interrupts_and_frame_boundary(mapper: u16) -> Vec<u8> {
     let prg_banks = if mapper == 2 { 2 } else { 1 };
+    let chr_banks = if mapper == 3 { 2 } else { 0 };
     let mut prg = vec![0xff; prg_banks * 16 * 1024];
     let fixed = (prg_banks - 1) * 16 * 1024;
     let program = [
@@ -158,11 +190,11 @@ fn rom_with_interrupts_and_frame_boundary(mapper: u16) -> Vec<u8> {
             battery: false,
             region: Region::Ntsc,
             prg_rom_len: prg.len(),
-            chr_rom_len: 0,
+            chr_rom_len: chr_banks * 8 * 1024,
         },
         trainer: None,
         prg_rom: prg,
-        chr_rom: Vec::new(),
+        chr_rom: vec![0; chr_banks * 8 * 1024],
     })
     .expect("interrupt verification ROM")
 }
@@ -197,7 +229,7 @@ fn new_then_check_generated_project() {
 }
 
 #[test]
-fn check_rejects_unimplemented_mapper() {
+fn check_accepts_mapper_three() {
     let temporary = tempdir().expect("temporary directory");
     let created = nesc()
         .current_dir(temporary.path())
@@ -217,8 +249,12 @@ fn check_rejects_unimplemented_mapper() {
         .arg("check")
         .output()
         .expect("run nesc check");
-    assert!(!checked.status.success());
-    assert!(String::from_utf8_lossy(&checked.stderr).contains("error[E0103]"));
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("Checked `mapper-demo` v0.1.0"));
 }
 
 #[test]
@@ -544,7 +580,50 @@ fn round_trips_exact_uxrom_container_with_banked_code() {
     let analysis =
         fs::read_to_string(temporary.path().join("recovered/analysis.txt")).expect("analysis");
     assert!(analysis.contains("mapper-writes: 1"));
-    assert!(analysis.contains("resulting-bank=01"));
+    assert!(analysis.contains("resulting-prg-bank=01"));
+    assert_eq!(
+        fs::read(temporary.path().join("recovered/trailing.bin")).expect("trailing"),
+        [0xde, 0xad]
+    );
+}
+
+#[test]
+fn round_trips_exact_cnrom_container_with_banked_chr() {
+    let temporary = tempdir().expect("temporary directory");
+    let mut original = cnrom_with_chr_switch();
+    original.extend_from_slice(&[0xde, 0xad]);
+    fs::write(temporary.path().join("cnrom.nes"), &original).expect("write CNROM");
+
+    let disassembled = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "disassemble",
+            "cnrom.nes",
+            "--output",
+            "recovered",
+            "--round-trip-check",
+        ])
+        .output()
+        .expect("run nesc disassemble");
+    assert!(
+        disassembled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disassembled.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&disassembled.stdout).contains("exact ROM round trip verified")
+    );
+    let assembly =
+        fs::read_to_string(temporary.path().join("recovered/prg.asm")).expect("assembly");
+    assert!(assembly.contains("Deterministic Mapper 3 recovery"));
+    assert!(assembly.contains("selected-chr:02"));
+    let analysis =
+        fs::read_to_string(temporary.path().join("recovered/analysis.txt")).expect("analysis");
+    assert!(analysis.contains("resulting-chr-bank=02"));
+    assert_eq!(
+        fs::read(temporary.path().join("recovered/chr.bin")).expect("CHR ROM"),
+        nesc_rom::parse(&original).expect("CNROM parse").chr_rom
+    );
     assert_eq!(
         fs::read(temporary.path().join("recovered/trailing.bin")).expect("trailing"),
         [0xde, 0xad]
@@ -614,7 +693,7 @@ NES_MAIN int main(void) {
     let analysis =
         fs::read_to_string(project.join("target/recovered-uxrom/analysis.txt")).expect("analysis");
     assert!(analysis.contains("mapper-write:"));
-    assert!(analysis.contains("resulting-bank=01"));
+    assert!(analysis.contains("resulting-prg-bank=01"));
 }
 
 #[test]
@@ -900,9 +979,84 @@ fn decompiles_mapper_two_to_stable_rust_and_hybrid_nesc() {
 }
 
 #[test]
+fn decompiles_mapper_three_to_stable_rust_and_hybrid_nesc() {
+    let temporary = tempdir().expect("temporary directory");
+    fs::write(temporary.path().join("cnrom.nes"), cnrom_with_chr_switch()).expect("write CNROM");
+
+    let rust_output = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "cnrom.nes",
+            "--emit",
+            "rust",
+            "--output",
+            "translated",
+            "--high-level-only",
+            "--verify",
+        ])
+        .output()
+        .expect("decompile CNROM to Rust");
+    assert!(
+        rust_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rust_output.stderr)
+    );
+    let source =
+        fs::read_to_string(temporary.path().join("translated/src/lib.rs")).expect("Rust source");
+    assert!(source.contains("pub const MAPPER: u16 = 3;"));
+    let verification = fs::read_to_string(
+        temporary
+            .path()
+            .join("translated/tests/decompilation_verification.rs"),
+    )
+    .expect("verification source");
+    assert!(verification.contains("selected_chr_bank"));
+    assert!(verification.contains("const CHR_BANK_COUNT: u16 = 4;"));
+    let report = fs::read_to_string(temporary.path().join("translated/verification.json"))
+        .expect("verification report");
+    assert!(report.contains("\"mapper\": 3"));
+    assert!(report.contains("\"chr_banks\": 4"));
+    assert!(report.contains("\"switchable_bank_contexts\": 4"));
+
+    let nesc_output = nesc()
+        .current_dir(temporary.path())
+        .args([
+            "decompile",
+            "cnrom.nes",
+            "--emit",
+            "nesc",
+            "--output",
+            "translated-nesc",
+            "--high-level-only",
+            "--verify",
+        ])
+        .output()
+        .expect("decompile CNROM to NesC");
+    assert!(
+        nesc_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&nesc_output.stderr)
+    );
+    let manifest = fs::read_to_string(temporary.path().join("translated-nesc/NesC.toml"))
+        .expect("NesC manifest");
+    assert!(manifest.contains("mapper = 3"));
+    assert!(manifest.contains("chr-rom-kib = 32"));
+    let source = fs::read_to_string(temporary.path().join("translated-nesc/src/main.c"))
+        .expect("NesC source");
+    assert!(source.contains("static u8 cpu_selected_chr_bank;"));
+    assert!(source.contains("cpu_selected_chr_bank = (u8)(value % 4)"));
+    let report = fs::read_to_string(temporary.path().join("translated-nesc/verification.json"))
+        .expect("NesC verification report");
+    assert!(report.contains("\"mapper\": 3"));
+    assert!(report.contains("\"chr_banks\": 4"));
+    assert!(report.contains("\"switchable_bank_contexts\": 4"));
+}
+
+#[test]
 fn verifies_interrupt_schedules_and_frame_boundaries_for_supported_mappers() {
     let temporary = tempdir().expect("temporary directory");
-    for (mapper, expected_contexts) in [(0_u16, 1_usize), (2, 1)] {
+    for (mapper, expected_contexts) in [(0_u16, 1_usize), (2, 1), (3, 2)] {
         let rom_name = format!("interrupts-mapper-{mapper}.nes");
         let output_name = format!("verified-mapper-{mapper}");
         fs::write(
@@ -928,7 +1082,7 @@ fn verifies_interrupt_schedules_and_frame_boundaries_for_supported_mappers() {
             .expect("verify scheduled interrupts and frame boundary");
         assert!(
             verified.status.success(),
-            "{}",
+            "Mapper {mapper}: {}",
             String::from_utf8_lossy(&verified.stderr)
         );
         let report = fs::read_to_string(

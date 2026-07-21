@@ -25,6 +25,7 @@ const RESULT_STATUS: usize = 0x1f07;
 const RESULT_PC_LOW: usize = 0x1f08;
 const RESULT_PC_HIGH: usize = 0x1f09;
 const RESULT_PRG_BANK: usize = 0x1f0a;
+const RESULT_CHR_BANK: usize = 0x1f0e;
 const BUDGET_EXHAUSTED: usize = 0x1f0b;
 const WORKSPACE_CONFLICT: usize = 0x1f0c;
 const CHECKPOINT_REACHED: usize = 0x1f0d;
@@ -32,6 +33,7 @@ const CONFIG_CASE_LOW: usize = 0x1ff0;
 const CONFIG_CASE_HIGH: usize = 0x1ff1;
 const CONFIG_STATUS: usize = 0x1ff2;
 const CONFIG_PRG_BANK: usize = 0x1ff3;
+const CONFIG_CHR_BANK: usize = 0x1ff7;
 const CONFIG_SCHEDULE_KIND: usize = 0x1ff4;
 const CONFIG_SCHEDULE_STEP_LOW: usize = 0x1ff5;
 const CONFIG_SCHEDULE_STEP_HIGH: usize = 0x1ff6;
@@ -139,6 +141,7 @@ struct OriginalResult {
     ram: Box<[u8; 0x800]>,
     prg_ram: Box<[u8; 0x2000]>,
     prg_bank: u8,
+    chr_bank: u8,
     hardware: HardwareState,
     events: Vec<SemanticEvent>,
 }
@@ -150,6 +153,7 @@ struct TranslatedResult {
     ram: Box<[u8; 0x800]>,
     prg_ram: Box<[u8; 0x2000]>,
     prg_bank: Option<u8>,
+    chr_bank: Option<u8>,
     hardware: HardwareState,
     events: Vec<SemanticEvent>,
 }
@@ -218,10 +222,11 @@ pub(crate) fn verify(
         ));
     }
     let prg_bank_count = original.prg_rom.len() / 0x4000;
-    let switchable_banks = if program.mapper == 2 {
-        prg_bank_count.saturating_sub(1)
-    } else {
-        1
+    let chr_bank_count = original.chr_rom.len() / 0x2000;
+    let switchable_banks = match program.mapper {
+        2 => prg_bank_count.saturating_sub(1),
+        3 => chr_bank_count,
+        _ => 1,
     };
     if switchable_banks == 0 || switchable_banks > usize::from(u8::MAX) {
         return Err(configuration_failure(
@@ -243,6 +248,7 @@ pub(crate) fn verify(
         .saturating_mul(PHYSICAL_INSTRUCTION_MULTIPLIER)
         .max(1_024);
     artifact.prg_banks = prg_bank_count;
+    artifact.chr_banks = chr_bank_count;
     artifact.switchable_bank_contexts = switchable_banks;
     artifact.semantic_instruction_limit_per_execution = semantic_limit;
     artifact.generated_instruction_limit_per_execution = translated_limit;
@@ -543,6 +549,7 @@ fn checkpoint(
             pc: result.cpu.pc,
         },
         mapper_prg_bank: result.prg_bank,
+        mapper_chr_bank: result.chr_bank,
         event_count: result.events.len(),
         recent_events: recent_events(&result.events),
         hardware: hardware_checkpoint(&result.hardware),
@@ -614,6 +621,8 @@ fn bank_contexts(program: &Program, function: &Function, switchable_banks: usize
         (0..switchable_banks).map(|bank| bank as u16).collect()
     } else if program.mapper == 2 {
         vec![function.entry.bank]
+    } else if program.mapper == 3 {
+        (0..switchable_banks).map(|bank| bank as u16).collect()
     } else {
         vec![0]
     }
@@ -623,8 +632,16 @@ fn run_original(rom: &[u8], entry: u16, config: ExecutionConfig) -> Result<Origi
     let mut machine = machine(rom)?;
     machine.reset().map_err(|error| error.to_string())?;
     machine.set_mapper_state(MapperState {
-        prg_bank: config.initial_bank as u8,
-        chr_bank: 0,
+        prg_bank: if machine.mapper_number() == 2 {
+            config.initial_bank as u8
+        } else {
+            0
+        },
+        chr_bank: if machine.mapper_number() == 3 {
+            config.initial_bank as u8
+        } else {
+            0
+        },
     });
     machine
         .set_controller(0, config.controller)
@@ -645,6 +662,7 @@ fn run_original(rom: &[u8], entry: u16, config: ExecutionConfig) -> Result<Origi
         ram: Box::new(*machine.ram()),
         prg_ram: Box::new(*machine.prg_ram()),
         prg_bank: machine.mapper_state().prg_bank,
+        chr_bank: machine.mapper_state().chr_bank,
         hardware: HardwareState::capture(&machine),
         events: original_events(machine.events()),
     })
@@ -665,6 +683,7 @@ fn run_translated(
         prg_ram[CONFIG_CASE_HIGH] = (case_index >> 8) as u8;
         prg_ram[CONFIG_STATUS] = config.status;
         prg_ram[CONFIG_PRG_BANK] = config.initial_bank as u8;
+        prg_ram[CONFIG_CHR_BANK] = config.initial_bank as u8;
         let (schedule_kind, schedule_step) = config.schedule.encoded();
         prg_ram[CONFIG_SCHEDULE_KIND] = schedule_kind;
         prg_ram[CONFIG_SCHEDULE_STEP_LOW] = schedule_step as u8;
@@ -672,8 +691,16 @@ fn run_translated(
     }
     machine.reset().map_err(|error| error.to_string())?;
     machine.set_mapper_state(MapperState {
-        prg_bank: config.initial_bank as u8,
-        chr_bank: 0,
+        prg_bank: if machine.mapper_number() == 2 {
+            config.initial_bank as u8
+        } else {
+            0
+        },
+        chr_bank: if machine.mapper_number() == 3 {
+            config.initial_bank as u8
+        } else {
+            0
+        },
     });
     machine
         .set_controller(0, config.controller)
@@ -809,8 +836,16 @@ fn discover_frame_checkpoints(
     let mut machine = machine(rom)?;
     machine.reset().map_err(|error| error.to_string())?;
     machine.set_mapper_state(MapperState {
-        prg_bank: initial_bank as u8,
-        chr_bank: 0,
+        prg_bank: if machine.mapper_number() == 2 {
+            initial_bank as u8
+        } else {
+            0
+        },
+        chr_bank: if machine.mapper_number() == 3 {
+            initial_bank as u8
+        } else {
+            0
+        },
     });
     machine
         .set_controller(0, controller)
@@ -946,6 +981,7 @@ fn decode_translation(
         ram,
         prg_ram: logical_prg_ram,
         prg_bank: completed.then_some(prg_ram[RESULT_PRG_BANK]),
+        chr_bank: completed.then_some(prg_ram[RESULT_CHR_BANK]),
         hardware,
         events: observable,
     })
@@ -994,6 +1030,15 @@ fn compare_results(
                 Some("PRG bank".to_owned()),
                 original.prg_bank.to_string(),
                 format!("{:?}", translated.prg_bank),
+            )));
+        }
+        if translated.chr_bank != Some(original.chr_bank) {
+            return Err(Box::new(divergence(
+                "mapper state",
+                context,
+                Some("CHR bank".to_owned()),
+                original.chr_bank.to_string(),
+                format!("{:?}", translated.chr_bank),
             )));
         }
         compare_memory(

@@ -1241,6 +1241,12 @@ impl Machine {
         self.mapper_state
     }
 
+    /// Returns the cartridge mapper number.
+    #[must_use]
+    pub const fn mapper_number(&self) -> u16 {
+        self.mapper.number()
+    }
+
     pub fn set_mapper_state(&mut self, state: MapperState) {
         self.mapper_state = state;
     }

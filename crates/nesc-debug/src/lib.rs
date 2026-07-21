@@ -94,6 +94,8 @@ pub struct VerificationCheckpoint {
     pub termination: String,
     pub cpu: CpuCheckpoint,
     pub mapper_prg_bank: u8,
+    #[serde(default)]
+    pub mapper_chr_bank: u8,
     pub event_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_events: Vec<VerificationEvent>,
@@ -140,6 +142,7 @@ pub struct VerificationArtifact {
     pub status: VerificationStatus,
     pub mapper: u16,
     pub prg_banks: usize,
+    pub chr_banks: usize,
     pub functions: usize,
     pub input_profiles_per_bank_context: usize,
     pub switchable_bank_contexts: usize,
@@ -320,13 +323,15 @@ pub fn render_verification(
         VerificationView::Cartridge => {
             let checkpoint = select_checkpoint(artifact, request.checkpoint)?;
             Ok(format!(
-                "Mapper {} with {} PRG banks\nCheckpoint {}: entry bank {}, initial bank {}, final PRG bank {}\n",
+                "Mapper {} with {} PRG banks and {} CHR banks\nCheckpoint {}: entry bank {}, initial mapper bank {}, final PRG bank {}, final CHR bank {}\n",
                 artifact.mapper,
                 artifact.prg_banks,
+                artifact.chr_banks,
                 checkpoint.id,
                 checkpoint.entry_bank,
                 checkpoint.initial_bank,
-                checkpoint.mapper_prg_bank
+                checkpoint.mapper_prg_bank,
+                checkpoint.mapper_chr_bank
             ))
         }
         VerificationView::Trace => {
@@ -346,11 +351,12 @@ pub fn render_verification(
 
 fn render_summary(artifact: &VerificationArtifact) -> String {
     let mut output = format!(
-        "Verification {}\nMode: {}\nMapper: {}\nPRG banks: {}\nFunctions: {}\nExecutions: {}\nCheckpoints: {}\nObservable events: {}\n",
+        "Verification {}\nMode: {}\nMapper: {}\nPRG banks: {}\nCHR banks: {}\nFunctions: {}\nExecutions: {}\nCheckpoints: {}\nObservable events: {}\n",
         artifact.status,
         artifact.mode,
         artifact.mapper,
         artifact.prg_banks,
+        artifact.chr_banks,
         artifact.functions,
         artifact.executions,
         artifact.checkpoints.len(),
@@ -488,6 +494,7 @@ mod tests {
                     ..CpuCheckpoint::default()
                 },
                 mapper_prg_bank: 1,
+                mapper_chr_bank: 0,
                 event_count: 1,
                 recent_events: vec![VerificationEvent {
                     kind: "mapper-write".to_owned(),
