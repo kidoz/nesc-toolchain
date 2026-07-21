@@ -40,7 +40,9 @@ ROM. The toolkit is written in stable Rust 2024.
   and first-divergence event traces
 - Dot-driven NTSC/PAL/Dendy PPU timing with scrolling-register latches,
   background and sprite composition, sprite status flags, mapper-aware CHR
-  reads, nametable mirroring, and a checkpointed palette-index framebuffer
+  reads, nametable mirroring, shared I/O bus behavior, vblank-boundary NMI
+  cancellation, rendering-time OAM restrictions, and a checkpointed
+  palette-index framebuffer
 - CPU-clock-driven APU frame sequencing with pulse, triangle, and noise channel
   timers, envelopes, length and linear counters, pulse sweeps, frame IRQs, and
   deterministic output checksums
@@ -100,10 +102,11 @@ ROM. The toolkit is written in stable Rust 2024.
 | CPU-cycle stepping and NTSC/PAL/Dendy PPU beam position | Available |
 | Per-clock official CPU bus operations, dummy accesses, interrupts, and OAM DMA | Available |
 | PPU background/sprite rendering and palette-index framebuffer | Available |
+| PPU I/O latch, vblank/NMI boundary behavior, and rendering-time OAM restrictions | Available |
 | APU pulse, triangle, noise, frame-counter, and IRQ timing | Available |
 | DMC sample fetching, output, CPU stalls, looping, and IRQ timing | Available |
 | Deterministic CPU/bus execution and boot verification | Available as a library |
-| Remaining PPU hardware edge behavior | Planned |
+| Remaining PPU pixel-pipeline and sprite-evaluation edge behavior | Planned |
 
 ## Quick start
 
@@ -348,8 +351,11 @@ instruction by four clocks. The PPU beam now runs dot by dot, renders scrolled
 background tiles and evaluated sprites through cartridge CHR mapping, updates
 sprite-zero-hit and overflow status, and retains a 256x240 palette-index
 framebuffer in machine checkpoints. The debugger's `ppu` command reports the
-rendering registers and a stable framebuffer checksum. Remaining low-level PPU
-edge behavior is future timing work.
+rendering registers, shared I/O bus latch, NMI line and pending edge, and a
+stable framebuffer checksum. PPU status reads now combine the status flags with
+the latched low bits, suppress or cancel vblank NMIs at the boundary, and retain
+observational debugger reads without side effects. Rendering-time OAMDATA
+accesses use deterministic restricted behavior.
 
 The APU runs once per CPU clock with region-specific four-step and five-step
 frame sequencing. Pulse, triangle, and noise channel state is retained in
@@ -468,7 +474,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Complete remaining PPU hardware edge behavior
+1. Complete remaining PPU pixel-pipeline and sprite-evaluation edge behavior
 2. Add Mapper 3 compilation and recovery
 3. Add emulator-backed `NES_TEST` discovery and execution
 4. Expand optimization quality and generated-code cost modeling
