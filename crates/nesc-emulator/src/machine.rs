@@ -109,6 +109,9 @@ pub struct PpuState {
     pub temporary_address: u16,
     pub fine_x: u8,
     pub write_toggle: bool,
+    pub io_bus: u8,
+    pub nmi_line: bool,
+    pub nmi_pending: bool,
 }
 
 /// Machine construction settings.
@@ -411,6 +414,9 @@ pub struct Machine {
     ppu_scroll_x: u8,
     ppu_scroll_y: u8,
     ppu_data_buffer: u8,
+    ppu_io_bus: u8,
+    ppu_nmi_line: bool,
+    ppu_suppress_vblank: bool,
     ppu_frame: u64,
     ppu_scanline: u16,
     ppu_dot: u16,
@@ -425,6 +431,7 @@ pub struct Machine {
     mapper_state: MapperState,
     mirroring: Mirroring,
     pending_nmi: bool,
+    pending_ppu_nmi: bool,
     irq_line: bool,
     stall_cycles: u64,
     events: VecDeque<ObservableEvent>,
@@ -513,6 +520,9 @@ impl Machine {
             ppu_scroll_x: 0,
             ppu_scroll_y: 0,
             ppu_data_buffer: 0,
+            ppu_io_bus: 0,
+            ppu_nmi_line: false,
+            ppu_suppress_vblank: false,
             ppu_frame: 0,
             ppu_scanline: 0,
             ppu_dot: 0,
@@ -527,6 +537,7 @@ impl Machine {
             mapper_state: MapperState::default(),
             mirroring: rom.metadata.mirroring,
             pending_nmi: false,
+            pending_ppu_nmi: false,
             irq_line: false,
             stall_cycles: 0,
             events: VecDeque::new(),
@@ -554,6 +565,9 @@ impl Machine {
         self.apu.reset();
         self.apu_io.fill(0);
         self.pending_nmi = false;
+        self.pending_ppu_nmi = false;
+        self.ppu_nmi_line = false;
+        self.ppu_suppress_vblank = false;
         self.irq_line = false;
         self.pending_step = None;
         self.dmc_dma = None;
@@ -703,6 +717,7 @@ impl Machine {
         let initial_cpu = self.cpu;
         let initial_instructions = self.instructions;
         let initial_pending_nmi = self.pending_nmi;
+        let initial_pending_ppu_nmi = self.pending_ppu_nmi;
         let initial_stall_cycles = self.stall_cycles;
         self.planning = true;
         self.last_bus_accesses.clear();
@@ -714,6 +729,7 @@ impl Machine {
         self.cpu = initial_cpu;
         self.instructions = initial_instructions;
         self.pending_nmi = initial_pending_nmi;
+        self.pending_ppu_nmi = initial_pending_ppu_nmi;
         self.stall_cycles = initial_stall_cycles;
         self.planning = false;
         let mut report = planned_report?;
@@ -741,6 +757,7 @@ impl Machine {
         }
         if report.interrupt == Some(InterruptKind::Nmi) {
             self.pending_nmi = false;
+            self.pending_ppu_nmi = false;
         }
         self.last_bus_accesses.clear();
         self.pending_step = Some(PendingStep {
@@ -833,8 +850,9 @@ impl Machine {
                 termination: Some(Termination::Trap { reason }),
             });
         }
-        if self.pending_nmi {
+        if self.pending_nmi || self.pending_ppu_nmi {
             self.pending_nmi = false;
+            self.pending_ppu_nmi = false;
             return self.handle_external_interrupt(InterruptKind::Nmi, NMI_VECTOR);
         }
         if (self.irq_line || self.apu.irq_pending()) && !self.cpu.flag(FLAG_INTERRUPT_DISABLE) {
@@ -970,15 +988,7 @@ impl Machine {
     pub fn peek(&self, address: u16) -> Result<u8, EmulatorError> {
         match address {
             0x0000..=0x1fff => Ok(self.ram[usize::from(address & 0x07ff)]),
-            0x2000..=0x3fff => match 0x2000 | (address & 7) {
-                0x2000 => Ok(self.ppu_ctrl),
-                0x2001 => Ok(self.ppu_mask),
-                0x2002 => Ok(self.ppu_status),
-                0x2003 => Ok(self.oam_address),
-                0x2004 => Ok(self.oam[usize::from(self.oam_address)]),
-                0x2007 => self.peek_ppu(self.ppu_address),
-                _ => Ok(0),
-            },
+            0x2000..=0x3fff => self.peek_ppu_register(0x2000 | (address & 7)),
             0x4000..=0x4014 => Ok(self.apu_io[usize::from(address - 0x4000)]),
             0x4015 => Ok(self.apu.peek_status()),
             0x4016 | 0x4017 => {
@@ -1075,6 +1085,9 @@ impl Machine {
             temporary_address: self.ppu_temporary_address,
             fine_x: self.ppu_fine_x,
             write_toggle: self.ppu_write_toggle,
+            io_bus: self.ppu_io_bus,
+            nmi_line: self.ppu_nmi_line,
+            nmi_pending: self.pending_ppu_nmi,
         }
     }
 
@@ -1704,54 +1717,60 @@ impl Machine {
 
     fn dma_write(&mut self, value: u8) {
         self.record_bus_access(0x2004, value, BusAccessKind::Write, None);
-        self.oam[usize::from(self.oam_address)] = value;
-        self.oam_address = self.oam_address.wrapping_add(1);
+        self.ppu_io_bus = value;
+        self.write_oam_data(value);
     }
 
     fn read_ppu_register(&mut self, register: u16) -> Result<u8, EmulatorError> {
-        match register {
+        let output = match register {
             0x2002 => {
-                let value = self.ppu_status;
+                let value = (self.ppu_status & 0xe0) | (self.ppu_io_bus & 0x1f);
+                let at_vblank_boundary =
+                    self.ppu_scanline == self.vblank_scanline() && self.ppu_dot <= 2;
+                if at_vblank_boundary && self.ppu_dot == 0 {
+                    self.ppu_suppress_vblank = true;
+                }
                 self.ppu_status &= !0x80;
                 self.ppu_write_toggle = false;
-                Ok(value)
+                if at_vblank_boundary {
+                    self.pending_ppu_nmi = false;
+                }
+                self.update_ppu_nmi_line();
+                value
             }
-            0x2004 => Ok(self.oam[usize::from(self.oam_address)]),
+            0x2004 => self.read_oam_data(),
             0x2007 => {
                 let address = self.ppu_address;
                 let value = self.peek_ppu(address)?;
                 let output = if address & 0x3fff >= 0x3f00 {
                     self.ppu_data_buffer = self.peek_ppu(address.wrapping_sub(0x1000))?;
-                    value
+                    (value & 0x3f) | (self.ppu_io_bus & 0xc0)
                 } else {
                     let buffered = self.ppu_data_buffer;
                     self.ppu_data_buffer = value;
                     buffered
                 };
                 self.increment_ppu_address();
-                Ok(output)
+                output
             }
-            _ => Ok(0),
-        }
+            _ => self.ppu_io_bus,
+        };
+        self.ppu_io_bus = output;
+        Ok(output)
     }
 
     fn write_ppu_register(&mut self, register: u16, value: u8) -> Result<(), EmulatorError> {
+        self.ppu_io_bus = value;
         match register {
             0x2000 => {
-                let nmi_was_enabled = self.ppu_ctrl & 0x80 != 0;
                 self.ppu_ctrl = value;
                 self.ppu_temporary_address =
                     (self.ppu_temporary_address & 0x73ff) | (u16::from(value & 0x03) << 10);
-                if !nmi_was_enabled && value & 0x80 != 0 && self.ppu_status & 0x80 != 0 {
-                    self.pending_nmi = true;
-                }
+                self.update_ppu_nmi_line();
             }
             0x2001 => self.ppu_mask = value,
             0x2003 => self.oam_address = value,
-            0x2004 => {
-                self.oam[usize::from(self.oam_address)] = value;
-                self.oam_address = self.oam_address.wrapping_add(1);
-            }
+            0x2004 => self.write_oam_data(value),
             0x2005 if !self.ppu_write_toggle => {
                 self.ppu_scroll_x = value;
                 self.ppu_temporary_address =
@@ -1785,6 +1804,51 @@ impl Machine {
             _ => {}
         }
         Ok(())
+    }
+
+    fn peek_ppu_register(&self, register: u16) -> Result<u8, EmulatorError> {
+        match register {
+            0x2002 => Ok((self.ppu_status & 0xe0) | (self.ppu_io_bus & 0x1f)),
+            0x2004 => Ok(self.peek_oam_data()),
+            0x2007 => {
+                let address = self.ppu_address & 0x3fff;
+                if address >= 0x3f00 {
+                    self.peek_ppu(address)
+                        .map(|value| (value & 0x3f) | (self.ppu_io_bus & 0xc0))
+                } else {
+                    Ok(self.ppu_data_buffer)
+                }
+            }
+            _ => Ok(self.ppu_io_bus),
+        }
+    }
+
+    fn read_oam_data(&self) -> u8 {
+        self.peek_oam_data()
+    }
+
+    fn peek_oam_data(&self) -> u8 {
+        if self.oam_rendering_active() {
+            0xff
+        } else {
+            self.oam[usize::from(self.oam_address)]
+        }
+    }
+
+    fn write_oam_data(&mut self, value: u8) {
+        if self.oam_rendering_active() {
+            self.oam_address = self.oam_address.wrapping_add(4);
+        } else {
+            self.oam[usize::from(self.oam_address)] = value;
+            self.oam_address = self.oam_address.wrapping_add(1);
+        }
+    }
+
+    fn oam_rendering_active(&self) -> bool {
+        self.rendering_enabled()
+            && (self.ppu_scanline < FRAME_HEIGHT as u16
+                || self.ppu_scanline == self.pre_render_scanline())
+            && (1..=320).contains(&self.ppu_dot)
     }
 
     fn increment_ppu_address(&mut self) {
@@ -1939,7 +2003,13 @@ impl Machine {
         }
 
         if self.ppu_scanline == self.vblank_scanline() && self.ppu_dot == 1 {
-            self.ppu_status |= 0x80;
+            if self.ppu_suppress_vblank {
+                self.ppu_status &= !0x80;
+            } else {
+                self.ppu_status |= 0x80;
+            }
+            self.ppu_suppress_vblank = false;
+            self.update_ppu_nmi_line();
             self.record_at(
                 EventKind::VBlank,
                 Some(0x2002),
@@ -1948,12 +2018,10 @@ impl Machine {
                 self.cycles,
                 self.cpu.pc,
             );
-            if self.ppu_ctrl & 0x80 != 0 {
-                self.pending_nmi = true;
-            }
         }
         if self.ppu_scanline == pre_render && self.ppu_dot == 1 {
             self.ppu_status &= !0xe0;
+            self.update_ppu_nmi_line();
         }
 
         if self.ppu_scanline < FRAME_HEIGHT as u16 {
@@ -2000,6 +2068,14 @@ impl Machine {
 
     const fn rendering_enabled(&self) -> bool {
         self.ppu_mask & 0x18 != 0
+    }
+
+    fn update_ppu_nmi_line(&mut self) {
+        let active = self.ppu_status & 0x80 != 0 && self.ppu_ctrl & 0x80 != 0;
+        if active && !self.ppu_nmi_line {
+            self.pending_ppu_nmi = true;
+        }
+        self.ppu_nmi_line = active;
     }
 
     fn render_pixel(&mut self) {
@@ -3080,9 +3156,180 @@ mod hardware_tests {
         assert!(!machine.ppu_write_toggle);
 
         machine.ppu_status = 0x80;
-        assert_eq!(machine.read_ppu_register(0x2002).expect("PPUSTATUS"), 0x80);
+        assert_eq!(machine.read_ppu_register(0x2002).expect("PPUSTATUS"), 0x94);
         assert_eq!(machine.ppu_status & 0x80, 0);
         assert!(!machine.ppu_write_toggle);
+    }
+
+    #[test]
+    fn models_the_shared_ppu_io_bus_latch() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine
+            .write_ppu_register(0x2000, 0x1b)
+            .expect("PPUCTRL write");
+        machine.ppu_status = 0xa0;
+
+        assert_eq!(machine.read_ppu_register(0x2002).expect("PPUSTATUS"), 0xbb);
+        assert_eq!(machine.ppu_io_bus, 0xbb);
+        assert_eq!(
+            machine
+                .read_ppu_register(0x2005)
+                .expect("write-only register read"),
+            0xbb
+        );
+
+        machine
+            .write_ppu_register(0x2002, 0x47)
+            .expect("read-only register write");
+        assert_eq!(machine.peek(0x2000).expect("observational open bus"), 0x47);
+        assert_eq!(machine.ppu_state().io_bus, 0x47);
+
+        machine.write_ppu(0x3f00, 0xff).expect("palette write");
+        machine
+            .write_ppu_register(0x2000, 0xc0)
+            .expect("refresh high open-bus bits");
+        machine.ppu_address = 0x3f00;
+        assert_eq!(
+            machine.read_ppu_register(0x2007).expect("palette read"),
+            0xff
+        );
+        assert_eq!(machine.palette[0], 0xff);
+    }
+
+    #[test]
+    fn suppresses_boundary_vblank_nmis_for_every_timing_profile() {
+        for timing in [
+            TimingProfile::Ntsc,
+            TimingProfile::Pal,
+            TimingProfile::Dendy,
+        ] {
+            let mut before = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+            before.timing = timing;
+            before.ppu_ctrl = 0x80;
+            before.ppu_scanline = before.vblank_scanline();
+            before.ppu_dot = 0;
+            assert_eq!(
+                before.read_ppu_register(0x2002).expect("early status") & 0x80,
+                0
+            );
+            before.clock_ppu_dot();
+            assert_eq!(before.ppu_status & 0x80, 0, "{timing:?} suppression");
+            assert!(!before.ppu_nmi_line, "{timing:?} NMI line");
+            assert!(!before.pending_ppu_nmi, "{timing:?} pending NMI");
+
+            let mut same = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+            same.timing = timing;
+            same.ppu_ctrl = 0x80;
+            same.ppu_scanline = same.vblank_scanline();
+            same.ppu_dot = 0;
+            same.clock_ppu_dot();
+            assert!(same.ppu_nmi_line, "{timing:?} asserted NMI line");
+            assert!(same.pending_ppu_nmi, "{timing:?} queued NMI");
+            assert_ne!(
+                same.read_ppu_register(0x2002).expect("status at vblank") & 0x80,
+                0
+            );
+            assert!(!same.ppu_nmi_line, "{timing:?} cancelled NMI line");
+            assert!(!same.pending_ppu_nmi, "{timing:?} cancelled pending NMI");
+            same.request_nmi();
+            same.read_ppu_register(0x2002)
+                .expect("status does not cancel an external NMI");
+            assert!(same.pending_nmi, "{timing:?} external NMI retained");
+
+            let mut one_later = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+            one_later.timing = timing;
+            one_later.ppu_ctrl = 0x80;
+            one_later.ppu_scanline = one_later.vblank_scanline();
+            one_later.ppu_dot = 0;
+            one_later.clock_ppu_dot();
+            one_later.clock_ppu_dot();
+            assert_ne!(
+                one_later
+                    .read_ppu_register(0x2002)
+                    .expect("status one dot after vblank")
+                    & 0x80,
+                0
+            );
+            assert!(
+                !one_later.pending_ppu_nmi,
+                "{timing:?} one-dot-late cancellation"
+            );
+
+            let mut late = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+            late.timing = timing;
+            late.ppu_ctrl = 0x80;
+            late.ppu_scanline = late.vblank_scanline();
+            late.ppu_dot = 0;
+            for _ in 0..3 {
+                late.clock_ppu_dot();
+            }
+            assert_ne!(
+                late.read_ppu_register(0x2002)
+                    .expect("status after suppression window")
+                    & 0x80,
+                0
+            );
+            assert!(late.pending_ppu_nmi, "{timing:?} retained NMI edge");
+        }
+    }
+
+    #[test]
+    fn raises_nmi_edges_when_control_is_enabled_during_vblank() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.ppu_status = 0x80;
+        machine
+            .write_ppu_register(0x2000, 0x80)
+            .expect("enable NMI");
+        assert!(machine.ppu_nmi_line);
+        assert!(machine.pending_ppu_nmi);
+
+        machine.pending_ppu_nmi = false;
+        machine.write_ppu_register(0x2000, 0).expect("disable NMI");
+        assert!(!machine.ppu_nmi_line);
+        machine
+            .write_ppu_register(0x2000, 0x80)
+            .expect("re-enable NMI");
+        assert!(machine.ppu_nmi_line);
+        assert!(
+            machine.pending_ppu_nmi,
+            "a new low-to-high edge queues another NMI"
+        );
+        let report = machine.step().expect("PPU NMI entry");
+        assert_eq!(report.interrupt, Some(InterruptKind::Nmi));
+        assert!(!machine.pending_ppu_nmi);
+    }
+
+    #[test]
+    fn restricts_oamdata_access_while_the_ppu_is_rendering() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.ppu_mask = 0x18;
+        machine.ppu_scanline = 32;
+        machine.ppu_dot = 100;
+        machine.oam_address = 0x20;
+        machine.oam[0x20] = 0x55;
+
+        machine
+            .write_ppu_register(0x2004, 0xaa)
+            .expect("rendering OAMDATA write");
+        assert_eq!(machine.oam[0x20], 0x55);
+        assert_eq!(machine.oam_address, 0x24);
+        assert_eq!(machine.ppu_io_bus, 0xaa);
+
+        machine.oam_address = 0x20;
+        assert_eq!(
+            machine
+                .read_ppu_register(0x2004)
+                .expect("rendering OAMDATA read"),
+            0xff
+        );
+        assert_eq!(machine.ppu_io_bus, 0xff);
+
+        machine.ppu_mask = 0;
+        machine
+            .write_ppu_register(0x2004, 0xcc)
+            .expect("blanked OAMDATA write");
+        assert_eq!(machine.oam[0x20], 0xcc);
+        assert_eq!(machine.oam_address, 0x21);
     }
 
     #[test]
