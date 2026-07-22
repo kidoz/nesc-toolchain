@@ -1594,6 +1594,47 @@ fn runs_built_rom_and_emits_hashes_and_png() {
 }
 
 #[test]
+fn header_only_input_edge_detection_computes_transitions() {
+    // Drives the header-only input state directly (nesc test cannot inject live
+    // controller input) to verify the pressed/released/held bit logic.
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "input"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("input");
+    fs::write(
+        project.join("src/main.c"),
+        r#"#include <input.h>
+
+NES_TEST("input edge detection computes pressed, released, and held") {
+    __nes_input_previous_0 = 0x03u8;
+    __nes_input_current_0 = 0x81u8;
+    NES_ASSERT_EQ(nes_input_pressed(0u8), 0x80u8);
+    NES_ASSERT_EQ(nes_input_released(0u8), 0x02u8);
+    NES_ASSERT_EQ(nes_input_held(0u8), 0x81u8);
+}
+"#,
+    )
+    .expect("write input test source");
+
+    let tested = nesc()
+        .current_dir(&project)
+        .arg("test")
+        .output()
+        .expect("run project tests");
+    let stdout = String::from_utf8_lossy(&tested.stdout);
+    let stderr = String::from_utf8_lossy(&tested.stderr);
+    assert!(tested.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("test input edge detection computes pressed, released, and held ... ok"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn sprite_setters_write_shadow_oam_through_nescall() {
     // End-to-end proof of the nescall argument ABI for the runtime sprite
     // writers: if `nes_set_sprite_position(sprite, x, y)` and the tile/attribute
