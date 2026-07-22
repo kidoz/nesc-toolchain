@@ -26,8 +26,8 @@ ROM. The toolkit is written in stable Rust 2024.
   analysis
 - Ricoh 2A03/2A07 code generation with a stable `nescall` ABI, zero-page
   allocation weighted by loop frequency, stack reports, profile-driven
-  arithmetic selection, hot fall-through placement, branch relaxation, and
-  auditable size/cycle estimates
+  arithmetic selection, basic-block-local A/X/Y forwarding, hot fall-through
+  placement, branch relaxation, and auditable size/cycle estimates
 - Fixed arrays, pointer arithmetic, typed CPU-bus address spaces, volatile
   indirect access, and configurable bounds checks
 - Verified `NES_ASM` blocks with register operands, explicit clobbers, symbolic
@@ -97,6 +97,7 @@ ROM. The toolkit is written in stable Rust 2024.
 | HIR, MIR, verification, and optimization | Available |
 | Profile-specific MIR pipelines and 6502 sequence cost reports | Available |
 | Inter-block constant propagation and loop-weighted zero-page allocation | Available |
+| N/Z-safe A/X/Y forwarding with call, clobber, alias, and control-flow barriers | Available |
 | Frequency-guided block placement, branch inversion, and branch relaxation | Available |
 | Target-specific inline 6502 assembly | Available |
 | Standalone relocatable 6502 assembly modules | Available |
@@ -587,7 +588,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Add accumulator forwarding, register reuse, and flag-liveness optimization
+1. Add flag-liveness analysis for redundant compare and condition-materialization removal
 2. Add call-graph-aware storage overlays while preserving interrupt isolation
 
 ## License

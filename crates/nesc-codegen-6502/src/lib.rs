@@ -330,6 +330,82 @@ struct LayoutStats {
     weighted_page_cross_cycles: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuRegister {
+    A,
+    X,
+    Y,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum KnownValue {
+    #[default]
+    Unknown,
+    Immediate(u8),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TrackedRegister {
+    value: KnownValue,
+    memory: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RegisterState {
+    a: TrackedRegister,
+    x: TrackedRegister,
+    y: TrackedRegister,
+    nz_from: Option<CpuRegister>,
+}
+
+impl RegisterState {
+    fn get(self, register: CpuRegister) -> TrackedRegister {
+        match register {
+            CpuRegister::A => self.a,
+            CpuRegister::X => self.x,
+            CpuRegister::Y => self.y,
+        }
+    }
+
+    fn set(&mut self, register: CpuRegister, value: TrackedRegister) {
+        match register {
+            CpuRegister::A => self.a = value,
+            CpuRegister::X => self.x = value,
+            CpuRegister::Y => self.y = value,
+        }
+    }
+
+    fn invalidate_register(&mut self, register: CpuRegister) {
+        self.set(register, TrackedRegister::default());
+        if self.nz_from == Some(register) {
+            self.nz_from = None;
+        }
+    }
+
+    fn invalidate_memory(&mut self, address: u16) {
+        for register in [CpuRegister::A, CpuRegister::X, CpuRegister::Y] {
+            let mut value = self.get(register);
+            if value.memory == Some(address) {
+                value.memory = None;
+                self.set(register, value);
+            }
+        }
+    }
+
+    fn invalidate_all_memory(&mut self) {
+        self.a.memory = None;
+        self.x.memory = None;
+        self.y.memory = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RegisterReuseStats {
+    loads_removed: u32,
+    bytes_saved: u32,
+    cycles_saved: u32,
+}
+
 struct Emitter {
     object: Object,
     code: SectionId,
@@ -348,6 +424,8 @@ struct Emitter {
     branch_sites: Vec<BranchSite>,
     long_branches: BTreeSet<u32>,
     layout_stats: LayoutStats,
+    registers: RegisterState,
+    register_reuse_stats: RegisterReuseStats,
     errors: Vec<CodegenError>,
 }
 
@@ -470,6 +548,8 @@ impl Emitter {
             branch_sites: Vec::new(),
             long_branches,
             layout_stats: LayoutStats::default(),
+            registers: RegisterState::default(),
+            register_reuse_stats: RegisterReuseStats::default(),
             errors: Vec::new(),
         })
     }
@@ -671,6 +751,26 @@ impl Emitter {
         }
         self.assembly.push_str("    ; end NES_ASM\n");
 
+        if !assembly.calls.is_empty() {
+            self.registers = RegisterState::default();
+        } else {
+            if assembly.clobbers.a {
+                self.registers.invalidate_register(CpuRegister::A);
+            }
+            if assembly.clobbers.x {
+                self.registers.invalidate_register(CpuRegister::X);
+            }
+            if assembly.clobbers.y {
+                self.registers.invalidate_register(CpuRegister::Y);
+            }
+            if assembly.clobbers.flags {
+                self.registers.nz_from = None;
+            }
+            if assembly.clobbers.memory {
+                self.registers.invalidate_all_memory();
+            }
+        }
+
         for output in &assembly.outputs {
             let location = match output.target {
                 AssemblyOutputTarget::Local(local) => self.local_location(function, local),
@@ -734,6 +834,8 @@ impl Emitter {
                 &[0xb1, ARGUMENT_SPILL_BASE],
                 &format!("lda (${:02x}),y", ARGUMENT_SPILL_BASE),
             );
+            self.registers.invalidate_register(CpuRegister::A);
+            self.registers.nz_from = Some(CpuRegister::A);
             self.sta_location(destination, offset);
         }
     }
@@ -759,6 +861,7 @@ impl Emitter {
                     &[0x91, ARGUMENT_SPILL_BASE],
                     &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
                 );
+                self.registers.invalidate_all_memory();
             }
         }
     }
@@ -789,6 +892,7 @@ impl Emitter {
             &[0x91, ARGUMENT_SPILL_BASE],
             &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
         );
+        self.registers.invalidate_all_memory();
         self.define(done_symbol);
         self.assembly.push_str(&format!("{done_name}:\n"));
     }
@@ -1386,6 +1490,8 @@ impl Emitter {
                 BinaryOperator::ShiftRight if signed => {
                     self.lda_location(destination, destination.size - 1);
                     self.emit_byte(0x0a, "asl a");
+                    self.registers.invalidate_register(CpuRegister::A);
+                    self.registers.nz_from = Some(CpuRegister::A);
                     for offset in (0..destination.size).rev() {
                         self.memory_operation(0x66, 0x6e, "ror", destination, offset);
                     }
@@ -1678,50 +1784,162 @@ impl Emitter {
     fn define(&mut self, symbol: SymbolId) {
         let offset = self.code_len();
         self.object.symbols[symbol.0 as usize].offset = offset as u32;
+        self.registers = RegisterState::default();
     }
 
     fn lda_immediate(&mut self, value: u8) {
-        self.emit_bytes(&[0xa9, value], &format!("lda #${value:02x}"));
+        self.load_immediate(CpuRegister::A, 0xa9, "lda", value);
     }
 
     fn ldy_immediate(&mut self, value: u8) {
-        self.emit_bytes(&[0xa0, value], &format!("ldy #${value:02x}"));
+        self.load_immediate(CpuRegister::Y, 0xa0, "ldy", value);
     }
 
     fn immediate(&mut self, opcode: u8, mnemonic: &str, value: u8) {
         self.emit_bytes(&[opcode, value], &format!("{mnemonic} #${value:02x}"));
+        match opcode {
+            0xc9 => self.registers.nz_from = None,
+            0x29 | 0x49 | 0x69 | 0xe9 => {
+                self.registers.invalidate_register(CpuRegister::A);
+                self.registers.nz_from = Some(CpuRegister::A);
+            }
+            _ => self.registers = RegisterState::default(),
+        }
+    }
+
+    fn load_immediate(&mut self, register: CpuRegister, opcode: u8, mnemonic: &str, value: u8) {
+        if self.registers.get(register).value == KnownValue::Immediate(value)
+            && self.registers.nz_from == Some(register)
+        {
+            self.record_reused_load(2, 2);
+            return;
+        }
+        self.emit_bytes(&[opcode, value], &format!("{mnemonic} #${value:02x}"));
+        self.registers.set(
+            register,
+            TrackedRegister {
+                value: KnownValue::Immediate(value),
+                memory: None,
+            },
+        );
+        self.registers.nz_from = Some(register);
+    }
+
+    fn load_location(
+        &mut self,
+        register: CpuRegister,
+        zero_page_opcode: u8,
+        absolute_opcode: u8,
+        mnemonic: &str,
+        location: Location,
+        offset: u16,
+    ) {
+        debug_assert!(offset < location.size);
+        self.load_address(
+            register,
+            zero_page_opcode,
+            absolute_opcode,
+            mnemonic,
+            location.address + offset,
+            location.zero_page,
+        );
+    }
+
+    fn load_address(
+        &mut self,
+        register: CpuRegister,
+        zero_page_opcode: u8,
+        absolute_opcode: u8,
+        mnemonic: &str,
+        address: u16,
+        zero_page: bool,
+    ) {
+        if Self::trackable_memory(address)
+            && self.registers.get(register).memory == Some(address)
+            && self.registers.nz_from == Some(register)
+        {
+            self.record_reused_load(if zero_page { 2 } else { 3 }, if zero_page { 3 } else { 4 });
+            return;
+        }
+        self.emit_address(
+            zero_page_opcode,
+            absolute_opcode,
+            mnemonic,
+            address,
+            zero_page,
+        );
+        self.record_memory_load(register, address);
+    }
+
+    fn store_location(
+        &mut self,
+        register: CpuRegister,
+        zero_page_opcode: u8,
+        absolute_opcode: u8,
+        mnemonic: &str,
+        location: Location,
+        offset: u16,
+    ) {
+        debug_assert!(offset < location.size);
+        self.store_address(
+            register,
+            zero_page_opcode,
+            absolute_opcode,
+            mnemonic,
+            location.address + offset,
+            location.zero_page,
+        );
+    }
+
+    fn store_address(
+        &mut self,
+        register: CpuRegister,
+        zero_page_opcode: u8,
+        absolute_opcode: u8,
+        mnemonic: &str,
+        address: u16,
+        zero_page: bool,
+    ) {
+        self.emit_address(
+            zero_page_opcode,
+            absolute_opcode,
+            mnemonic,
+            address,
+            zero_page,
+        );
+        self.record_memory_store(register, address);
     }
 
     fn lda_location(&mut self, location: Location, offset: u16) {
-        self.memory_operation(0xa5, 0xad, "lda", location, offset);
+        self.load_location(CpuRegister::A, 0xa5, 0xad, "lda", location, offset);
     }
 
     fn sta_location(&mut self, location: Location, offset: u16) {
-        self.memory_operation(0x85, 0x8d, "sta", location, offset);
+        self.store_location(CpuRegister::A, 0x85, 0x8d, "sta", location, offset);
     }
 
     fn ldx_location(&mut self, location: Location, offset: u16) {
-        self.memory_operation(0xa6, 0xae, "ldx", location, offset);
+        self.load_location(CpuRegister::X, 0xa6, 0xae, "ldx", location, offset);
     }
 
     fn stx_location(&mut self, location: Location, offset: u16) {
-        self.memory_operation(0x86, 0x8e, "stx", location, offset);
+        self.store_location(CpuRegister::X, 0x86, 0x8e, "stx", location, offset);
     }
 
     fn ldy_location(&mut self, location: Location, offset: u16) {
-        self.memory_operation(0xa4, 0xac, "ldy", location, offset);
+        self.load_location(CpuRegister::Y, 0xa4, 0xac, "ldy", location, offset);
     }
 
     fn sty_location(&mut self, location: Location, offset: u16) {
-        self.memory_operation(0x84, 0x8c, "sty", location, offset);
+        self.store_location(CpuRegister::Y, 0x84, 0x8c, "sty", location, offset);
     }
 
     fn lda_zero_page(&mut self, address: u8) {
-        self.absolute_or_zero_page(0xa5, 0xad, "lda", u16::from(address), true);
+        self.load_address(CpuRegister::A, 0xa5, 0xad, "lda", u16::from(address), true);
     }
 
     fn sta_zero_page(&mut self, address: u8) {
-        self.absolute_or_zero_page(0x85, 0x8d, "sta", u16::from(address), true);
+        self.store_address(CpuRegister::A, 0x85, 0x8d, "sta", u16::from(address), true);
     }
 
     fn memory_operation(
@@ -1750,6 +1968,31 @@ impl Emitter {
         address: u16,
         zero_page: bool,
     ) {
+        self.emit_address(
+            zero_page_opcode,
+            absolute_opcode,
+            mnemonic,
+            address,
+            zero_page,
+        );
+        self.record_memory_operation(
+            if zero_page {
+                zero_page_opcode
+            } else {
+                absolute_opcode
+            },
+            address,
+        );
+    }
+
+    fn emit_address(
+        &mut self,
+        zero_page_opcode: u8,
+        absolute_opcode: u8,
+        mnemonic: &str,
+        address: u16,
+        zero_page: bool,
+    ) {
         if zero_page {
             self.emit_bytes(
                 &[zero_page_opcode, address as u8],
@@ -1765,6 +2008,63 @@ impl Emitter {
             &[opcode, address as u8, (address >> 8) as u8],
             &format!("{mnemonic} ${address:04x}"),
         );
+        self.record_memory_operation(opcode, address);
+    }
+
+    fn record_memory_operation(&mut self, opcode: u8, address: u16) {
+        match opcode {
+            0xa5 | 0xad => self.record_memory_load(CpuRegister::A, address),
+            0xa6 | 0xae => self.record_memory_load(CpuRegister::X, address),
+            0xa4 | 0xac => self.record_memory_load(CpuRegister::Y, address),
+            0x85 | 0x8d => self.record_memory_store(CpuRegister::A, address),
+            0x86 | 0x8e => self.record_memory_store(CpuRegister::X, address),
+            0x84 | 0x8c => self.record_memory_store(CpuRegister::Y, address),
+            0x05 | 0x0d | 0x25 | 0x2d | 0x45 | 0x4d | 0x65 | 0x6d | 0xe5 | 0xed => {
+                self.registers.invalidate_register(CpuRegister::A);
+                self.registers.nz_from = Some(CpuRegister::A);
+            }
+            0xc5 | 0xcd => self.registers.nz_from = None,
+            0x06 | 0x0e | 0x26 | 0x2e | 0x46 | 0x4e | 0x66 | 0x6e => {
+                self.registers.invalidate_memory(address);
+                self.registers.nz_from = None;
+            }
+            _ => self.registers = RegisterState::default(),
+        }
+    }
+
+    fn record_memory_load(&mut self, register: CpuRegister, address: u16) {
+        self.registers.set(
+            register,
+            TrackedRegister {
+                value: KnownValue::Unknown,
+                memory: Self::trackable_memory(address).then_some(address),
+            },
+        );
+        self.registers.nz_from = Some(register);
+    }
+
+    fn record_memory_store(&mut self, register: CpuRegister, address: u16) {
+        self.registers.invalidate_memory(address);
+        if Self::trackable_memory(address) {
+            let mut value = self.registers.get(register);
+            value.memory = Some(address);
+            self.registers.set(register, value);
+        }
+    }
+
+    fn record_reused_load(&mut self, bytes: u32, cycles: u32) {
+        self.register_reuse_stats.loads_removed =
+            self.register_reuse_stats.loads_removed.saturating_add(1);
+        self.register_reuse_stats.bytes_saved =
+            self.register_reuse_stats.bytes_saved.saturating_add(bytes);
+        self.register_reuse_stats.cycles_saved = self
+            .register_reuse_stats
+            .cycles_saved
+            .saturating_add(cycles);
+    }
+
+    const fn trackable_memory(address: u16) -> bool {
+        address < 0x0800
     }
 
     fn absolute_symbol(&mut self, opcode: u8, mnemonic: &str, symbol: SymbolId) {
@@ -1781,6 +2081,9 @@ impl Emitter {
             symbol,
             addend: 0,
         });
+        if opcode == 0x20 {
+            self.registers = RegisterState::default();
+        }
     }
 
     fn relative_symbol(&mut self, opcode: u8, mnemonic: &str, symbol: SymbolId) {
@@ -1864,7 +2167,7 @@ impl Emitter {
             .unwrap_or(u32::MAX)
             .saturating_mul(3);
         self.optimization_report.push_str(&format!(
-            "Control-flow blocks placed: {}\nFall-through jumps removed: {}\nConditional fall-throughs: {}\nBranches inverted: {}\nBranches relaxed: {}\nLayout bytes saved before relaxation: {}\nRelaxation bytes added: {}\nWeighted branch base cycles: {}\nWeighted taken-branch cycles: {}\nWeighted page-cross risk cycles: {}\n",
+            "Control-flow blocks placed: {}\nFall-through jumps removed: {}\nConditional fall-throughs: {}\nBranches inverted: {}\nBranches relaxed: {}\nLayout bytes saved before relaxation: {}\nRelaxation bytes added: {}\nWeighted branch base cycles: {}\nWeighted taken-branch cycles: {}\nWeighted page-cross risk cycles: {}\nRegister loads removed: {}\nRegister-forwarding bytes saved: {}\nRegister-forwarding cycles saved: {}\n",
             self.layout_stats.blocks_placed,
             self.layout_stats.fallthrough_jumps,
             self.layout_stats.conditional_fallthroughs,
@@ -1875,6 +2178,9 @@ impl Emitter {
             self.layout_stats.weighted_branch_base_cycles,
             self.layout_stats.weighted_branch_taken_cycles,
             self.layout_stats.weighted_page_cross_cycles,
+            self.register_reuse_stats.loads_removed,
+            self.register_reuse_stats.bytes_saved,
+            self.register_reuse_stats.cycles_saved,
         ));
     }
 
@@ -1976,6 +2282,146 @@ mod tests {
                 .iter()
                 .any(|symbol| symbol.name == "main")
         );
+        assert_eq!(
+            generated
+                .assembly
+                .lines()
+                .filter(|line| line.trim_start().starts_with("lda "))
+                .count(),
+            1,
+            "the return should reuse the accumulator value:\n{}",
+            generated.assembly
+        );
+        assert!(
+            generated
+                .optimization_report
+                .contains("Register loads removed: 1")
+        );
+        assert!(
+            generated
+                .optimization_report
+                .contains("Register-forwarding bytes saved: 2")
+        );
+        assert!(
+            generated
+                .optimization_report
+                .contains("Register-forwarding cycles saved: 3")
+        );
+    }
+
+    #[test]
+    fn reloads_register_values_after_calls() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let void = Type::scalar(TypeKind::Void);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![
+                Function {
+                    id: FunctionId(0),
+                    name: "main".to_owned(),
+                    placement: BankPlacement::Fixed,
+                    return_type: byte.clone(),
+                    parameters: Vec::new(),
+                    locals: Vec::new(),
+                    entry: Some(BlockId(0)),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction {
+                                result: Some(ValueId(0)),
+                                kind: InstructionKind::Constant(7),
+                                effect: Effect::Pure,
+                                span,
+                            },
+                            Instruction {
+                                result: None,
+                                kind: InstructionKind::Call {
+                                    function: FunctionId(1),
+                                    arguments: Vec::new(),
+                                },
+                                effect: Effect::Call,
+                                span,
+                            },
+                        ],
+                        terminator: Some(Terminator::Return(Some(ValueId(0)))),
+                    }],
+                    value_types: vec![byte],
+                },
+                Function {
+                    id: FunctionId(1),
+                    name: "helper".to_owned(),
+                    placement: BankPlacement::Fixed,
+                    return_type: void,
+                    parameters: Vec::new(),
+                    locals: Vec::new(),
+                    entry: None,
+                    blocks: Vec::new(),
+                    value_types: Vec::new(),
+                },
+            ],
+        };
+
+        let generated = generate(&module).expect("code generation");
+        assert!(generated.assembly.contains("jsr helper"));
+        assert_eq!(
+            generated
+                .assembly
+                .lines()
+                .filter(|line| line.trim_start().starts_with("lda "))
+                .count(),
+            2,
+            "a call must invalidate caller-saved registers:\n{}",
+            generated.assembly
+        );
+    }
+
+    #[test]
+    fn reloads_register_values_at_basic_block_boundaries() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "main".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: byte.clone(),
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                entry: Some(BlockId(0)),
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::Constant(9),
+                            effect: Effect::Pure,
+                            span,
+                        }],
+                        terminator: Some(Terminator::Jump(BlockId(1))),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(Some(ValueId(0)))),
+                    },
+                ],
+                value_types: vec![byte],
+            }],
+        };
+
+        let generated = generate(&module).expect("code generation");
+        assert_eq!(
+            generated
+                .assembly
+                .lines()
+                .filter(|line| line.trim_start().starts_with("lda "))
+                .count(),
+            2,
+            "register facts must not cross control-flow joins:\n{}",
+            generated.assembly
+        );
     }
 
     #[test]
@@ -2065,6 +2511,93 @@ mod tests {
             relocation.symbol.0 as usize == helper
                 && relocation.kind == nesc_object::RelocationKind::Absolute16
         }));
+    }
+
+    #[test]
+    fn reuses_index_register_inputs_until_inline_assembly_clobbers_flags() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let void = Type::scalar(TypeKind::Void);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let input_assembly = || Instruction {
+            result: None,
+            kind: InstructionKind::InlineAssembly(InlineAssembly {
+                template: "nop".to_owned(),
+                inputs: vec![AssemblyInput {
+                    register: AssemblyRegister::X,
+                    value: ValueId(0),
+                }],
+                outputs: Vec::new(),
+                clobbers: AssemblyClobbers::default(),
+                bank_effect: false,
+                calls: Vec::new(),
+                stack_bytes: 0,
+            }),
+            effect: Effect::Volatile,
+            span,
+        };
+        let flags_clobber = Instruction {
+            result: None,
+            kind: InstructionKind::InlineAssembly(InlineAssembly {
+                template: "nop".to_owned(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                clobbers: AssemblyClobbers {
+                    flags: true,
+                    ..AssemblyClobbers::default()
+                },
+                bank_effect: false,
+                calls: Vec::new(),
+                stack_bytes: 0,
+            }),
+            effect: Effect::Volatile,
+            span,
+        };
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "main".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: void,
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::Constant(13),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        input_assembly(),
+                        input_assembly(),
+                        flags_clobber,
+                        input_assembly(),
+                    ],
+                    terminator: Some(Terminator::Return(None)),
+                }],
+                value_types: vec![byte],
+            }],
+        };
+
+        let generated = generate(&module).expect("code generation");
+        assert_eq!(
+            generated
+                .assembly
+                .lines()
+                .filter(|line| line.trim_start().starts_with("ldx "))
+                .count(),
+            2,
+            "the second input should reuse X, then the flag clobber should force a reload:\n{}",
+            generated.assembly
+        );
+        assert!(
+            generated
+                .optimization_report
+                .contains("Register loads removed: 1")
+        );
     }
 
     #[test]
