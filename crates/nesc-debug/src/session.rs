@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nesc_disasm::{AddressingMode, opcode};
 use nesc_emulator::{
-    BusAccess, BusAccessKind, BusAccessSource, CycleReport, EmulatorConfig, Machine, StepReport,
-    Termination, TimingProfile,
+    BusAccess, BusAccessKind, BusAccessSource, CycleReport, EmulatorConfig, Machine,
+    NES_PALETTE_RGB, StepReport, Termination, TimingProfile,
 };
 
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -413,6 +413,19 @@ impl DebugSession {
             "cartridge" => {
                 require_count(name, &arguments, 0)?;
                 self.render_cartridge()
+            }
+            "framebuffer" => self.write_framebuffer(&arguments)?,
+            "oam" => {
+                require_count(name, &arguments, 0)?;
+                self.render_oam()
+            }
+            "nametable" => {
+                require_count(name, &arguments, 0)?;
+                self.render_nametable()
+            }
+            "palette" => {
+                require_count(name, &arguments, 0)?;
+                self.render_palette()
             }
             "trace" => self.trace_command(&arguments)?,
             "reset" => {
@@ -1035,6 +1048,84 @@ impl DebugSession {
         )
     }
 
+    fn write_framebuffer(&self, arguments: &[&str]) -> Result<String, DebugSessionError> {
+        require_count("framebuffer", arguments, 1)?;
+        let path = Path::new(arguments[0]);
+        let is_ppm = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("ppm"));
+        let (bytes, format) = if is_ppm {
+            (self.machine.framebuffer_ppm(), "PPM")
+        } else {
+            (self.machine.framebuffer_png(), "PNG")
+        };
+        fs::write(path, &bytes).map_err(|source| DebugSessionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(format!(
+            "Wrote {} bytes ({format}) to {}, framebuffer checksum ${:016X}\n",
+            bytes.len(),
+            path.display(),
+            self.machine.framebuffer_checksum()
+        ))
+    }
+
+    fn render_oam(&self) -> String {
+        let oam = self.machine.oam();
+        let mut visible = Vec::new();
+        for index in 0..64 {
+            let entry = &oam[index * 4..index * 4 + 4];
+            let (y, tile, attributes, x) = (entry[0], entry[1], entry[2], entry[3]);
+            // Sprites with Y >= 0xEF never appear on the 240-line screen.
+            if y >= 0xEF {
+                continue;
+            }
+            visible.push((index, x, y, tile, attributes));
+        }
+        let mut text = format!("OAM: {} of 64 sprites on-screen\n", visible.len());
+        for (index, x, y, tile, attributes) in visible {
+            let palette = 4 + (attributes & 0x03);
+            let priority = if attributes & 0x20 == 0 {
+                "front"
+            } else {
+                "behind"
+            };
+            let flip_h = if attributes & 0x40 == 0 { '.' } else { 'H' };
+            let flip_v = if attributes & 0x80 == 0 { '.' } else { 'V' };
+            text.push_str(&format!(
+                "  #{index:02} X={x:3} Y={y:3} tile=${tile:02X} attr=${attributes:02X} palette={palette} {priority} flip={flip_h}{flip_v}\n"
+            ));
+        }
+        text
+    }
+
+    fn render_nametable(&self) -> String {
+        let nametable = self.machine.nametable_ram();
+        let mut text = String::from("Nametable 0 tile indices (32x30):\n");
+        for row in 0..30 {
+            text.push_str(&format!("{row:02}: "));
+            for column in 0..32 {
+                text.push_str(&format!("{:02X} ", nametable[row * 32 + column]));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn render_palette(&self) -> String {
+        let palette = self.machine.palette();
+        let mut text = String::from("Palette entries (index address value R G B):\n");
+        for (index, value) in palette.iter().enumerate() {
+            let [red, green, blue] = NES_PALETTE_RGB[usize::from(value & 0x3F)];
+            text.push_str(&format!(
+                "  {index:02} ${:04X} ${value:02X} {red:3} {green:3} {blue:3}\n",
+                0x3F00 + index
+            ));
+        }
+        text
+    }
+
     fn trace_command(&mut self, arguments: &[&str]) -> Result<String, DebugSessionError> {
         require_count("trace", arguments, 1)?;
         match arguments[0] {
@@ -1337,7 +1428,7 @@ fn nonzero(values: &[u8]) -> usize {
 }
 
 fn help_text() -> &'static str {
-    "run | continue | pause\nstep | step-cycle | step-frame | step-source | next | finish\nbreak <address-or-symbol> | delete <id>\nwatch <address> | watch-read <address> | watch-write <address>\nregisters | memory <address> <length> | disassemble <address> <count> | stack\nsource | symbols | ppu | apu | cartridge\ntrace on | trace off | trace show\nreset | quit\n"
+    "run | continue | pause\nstep | step-cycle | step-frame | step-source | next | finish\nbreak <address-or-symbol> | delete <id>\nwatch <address> | watch-read <address> | watch-write <address>\nregisters | memory <address> <length> | disassemble <address> <count> | stack\nsource | symbols | ppu | apu | cartridge\nframebuffer <path> | oam | nametable | palette\ntrace on | trace off | trace show\nreset | quit\n"
 }
 
 #[cfg(test)]
@@ -1608,6 +1699,66 @@ mod tests {
         let stopped = session.execute_command("continue").expect("pause").text;
         assert!(stopped.contains("pause requested"), "{stopped}");
         assert_eq!(session.current_address().address, 0x8000);
+    }
+
+    #[test]
+    fn writes_framebuffer_png_and_dumps_visual_state() {
+        let mut session = nrom_session();
+
+        let directory = std::env::temp_dir().join(format!(
+            "nesc-debug-framebuffer-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).expect("temp directory");
+        let png_path = directory.join("frame.png");
+        let confirmation = session
+            .execute_command(&format!("framebuffer {}", png_path.display()))
+            .expect("framebuffer")
+            .text;
+        assert!(confirmation.contains("(PNG)"), "{confirmation}");
+        assert!(
+            confirmation.contains("framebuffer checksum $"),
+            "{confirmation}"
+        );
+        let png = fs::read(&png_path).expect("png file");
+        assert!(
+            png.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "missing PNG signature"
+        );
+
+        let ppm_path = directory.join("frame.ppm");
+        let ppm_confirmation = session
+            .execute_command(&format!("framebuffer {}", ppm_path.display()))
+            .expect("framebuffer ppm")
+            .text;
+        assert!(ppm_confirmation.contains("(PPM)"), "{ppm_confirmation}");
+        let ppm = fs::read(&ppm_path).expect("ppm file");
+        assert!(ppm.starts_with(b"P6"), "missing PPM signature");
+
+        fs::remove_dir_all(&directory).ok();
+
+        let palette = session.execute_command("palette").expect("palette").text;
+        assert!(palette.contains("Palette entries"), "{palette}");
+        assert!(palette.contains("$3F00 $00"), "{palette}");
+        assert_eq!(palette.lines().count(), 33, "{palette}");
+
+        let oam = session.execute_command("oam").expect("oam").text;
+        assert!(oam.starts_with("OAM: "), "{oam}");
+        assert!(oam.contains("of 64 sprites on-screen"), "{oam}");
+
+        let nametable = session
+            .execute_command("nametable")
+            .expect("nametable")
+            .text;
+        assert!(
+            nametable.contains("Nametable 0 tile indices"),
+            "{nametable}"
+        );
+        assert_eq!(nametable.lines().count(), 31, "{nametable}");
+
+        let help = session.execute_command("help").expect("help").text;
+        assert!(help.contains("framebuffer <path>"), "{help}");
     }
 
     #[test]

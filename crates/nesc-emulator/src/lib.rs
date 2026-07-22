@@ -1,19 +1,25 @@
 //! Deterministic NES execution, observable traces, and compiler verification.
 
 mod apu;
+mod audio;
 mod cpu;
+mod image;
 mod machine;
+mod palette;
 
 use std::collections::BTreeMap;
 
 pub use apu::ApuState;
+pub use audio::encode_wav;
 pub use cpu::CpuState;
+pub use image::{encode_png, encode_ppm};
 pub use machine::{
     BusAccess, BusAccessKind, BusAccessSource, CycleReport, EmulatorConfig, EmulatorError,
     EventKind, FRAME_HEIGHT, FRAME_PIXELS, FRAME_WIDTH, InterruptKind, Machine, MachineSnapshot,
     ObservableEvent, PpuPosition, PpuState, RunLimits, RunReport, StepReport, Termination,
     TimingProfile,
 };
+pub use palette::NES_PALETTE_RGB;
 
 /// First difference between two ordered observable-event traces.
 #[derive(Clone, Debug, Eq, PartialEq)]

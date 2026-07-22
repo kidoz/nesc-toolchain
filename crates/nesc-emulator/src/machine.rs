@@ -230,7 +230,11 @@ pub struct ObservableEvent {
 pub enum Termination {
     InstructionLimit,
     CycleLimit,
-    Trap { reason: u8 },
+    Trap {
+        reason: u8,
+    },
+    /// A whole frame completed, advancing the frame counter.
+    Frame,
 }
 
 /// Result of one CPU step.
@@ -990,6 +994,122 @@ impl Machine {
         }
     }
 
+    /// Advances execution until the frame counter increments once, or until a
+    /// trap or bound stops it first, whichever comes first.
+    ///
+    /// Reuses [`Machine::step`] and honors the same instruction- and cycle-bound
+    /// semantics as [`Machine::run`]: both limits are checked before each step.
+    /// A completed frame reports [`Termination::Frame`]; a trap or an exhausted
+    /// bound reports the matching termination and does not guarantee a frame
+    /// advance. The report is otherwise identical to [`Machine::run`]'s
+    /// (instructions and cycles are deltas, `frames` is the absolute count).
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero limits and propagates execution failures, exactly like
+    /// [`Machine::run`].
+    pub fn run_until_vblank(&mut self, limits: RunLimits) -> Result<RunReport, EmulatorError> {
+        if limits.instruction_limit == 0 || limits.cycle_limit == 0 {
+            return Err(self.failure("run limits must permit instructions and cycles"));
+        }
+        let initial_instructions = self.instructions;
+        let initial_cycles = self.cycles;
+        let initial_dropped_events = self.dropped_events;
+        let initial_frames = self.frames;
+        loop {
+            if self.instructions - initial_instructions >= limits.instruction_limit {
+                return Ok(self.run_report(
+                    initial_instructions,
+                    initial_cycles,
+                    initial_dropped_events,
+                    Termination::InstructionLimit,
+                ));
+            }
+            if self.cycles - initial_cycles >= limits.cycle_limit {
+                return Ok(self.run_report(
+                    initial_instructions,
+                    initial_cycles,
+                    initial_dropped_events,
+                    Termination::CycleLimit,
+                ));
+            }
+            let report = self.step()?;
+            if let Some(termination) = report.termination {
+                return Ok(self.run_report(
+                    initial_instructions,
+                    initial_cycles,
+                    initial_dropped_events,
+                    termination,
+                ));
+            }
+            if self.frames > initial_frames {
+                return Ok(self.run_report(
+                    initial_instructions,
+                    initial_cycles,
+                    initial_dropped_events,
+                    Termination::Frame,
+                ));
+            }
+        }
+    }
+
+    /// Advances `frame_count` whole frames, stopping early on a trap or bound.
+    ///
+    /// Repeats the single-frame logic of [`Machine::run_until_vblank`], sharing
+    /// one instruction and cycle budget across every frame. The aggregated
+    /// report sums instructions, cycles, and dropped events across the executed
+    /// segments, carries the final absolute `frames` count, and reports the
+    /// termination of the last segment: [`Termination::Frame`] once every
+    /// requested frame completes, or the trap or bound that stopped it sooner. A
+    /// `frame_count` of `0` performs no work and returns a report whose
+    /// termination is [`Termination::Frame`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero limits and propagates execution failures, exactly like
+    /// [`Machine::run`].
+    pub fn run_frames(
+        &mut self,
+        frame_count: u64,
+        limits: RunLimits,
+    ) -> Result<RunReport, EmulatorError> {
+        if limits.instruction_limit == 0 || limits.cycle_limit == 0 {
+            return Err(self.failure("run limits must permit instructions and cycles"));
+        }
+        let initial_instructions = self.instructions;
+        let initial_cycles = self.cycles;
+        let initial_dropped_events = self.dropped_events;
+        let mut termination = Termination::Frame;
+        for _ in 0..frame_count {
+            let remaining = RunLimits {
+                instruction_limit: limits
+                    .instruction_limit
+                    .saturating_sub(self.instructions - initial_instructions),
+                cycle_limit: limits
+                    .cycle_limit
+                    .saturating_sub(self.cycles - initial_cycles),
+            };
+            if remaining.instruction_limit == 0 {
+                termination = Termination::InstructionLimit;
+                break;
+            }
+            if remaining.cycle_limit == 0 {
+                termination = Termination::CycleLimit;
+                break;
+            }
+            termination = self.run_until_vblank(remaining)?.termination;
+            if termination != Termination::Frame {
+                break;
+            }
+        }
+        Ok(self.run_report(
+            initial_instructions,
+            initial_cycles,
+            initial_dropped_events,
+            termination,
+        ))
+    }
+
     fn run_report(
         &self,
         initial_instructions: u64,
@@ -1199,6 +1319,41 @@ impl Machine {
         &self.framebuffer
     }
 
+    /// Framebuffer pixels resolved to `[R, G, B]` via [`NES_PALETTE_RGB`].
+    ///
+    /// Each stored palette index is masked with `& 0x3f` before the lookup so
+    /// any high or out-of-range bits cannot index past the 64-entry master
+    /// palette.
+    ///
+    /// [`NES_PALETTE_RGB`]: crate::NES_PALETTE_RGB
+    #[must_use]
+    pub fn framebuffer_rgb(&self) -> Box<[[u8; 3]; FRAME_PIXELS]> {
+        let mut rgb = Box::new([[0_u8; 3]; FRAME_PIXELS]);
+        for (pixel, index) in rgb.iter_mut().zip(self.framebuffer.iter()) {
+            *pixel = crate::palette::NES_PALETTE_RGB[usize::from(*index & 0x3f)];
+        }
+        rgb
+    }
+
+    /// Encodes the current frame as a standards-valid 8-bit truecolor PNG.
+    ///
+    /// Resolves [`framebuffer_rgb`](Self::framebuffer_rgb) through the master
+    /// palette and encodes it with [`crate::encode_png`]. The result opens in
+    /// any conforming image viewer.
+    #[must_use]
+    pub fn framebuffer_png(&self) -> Vec<u8> {
+        crate::image::encode_png(self.framebuffer_rgb().as_slice(), FRAME_WIDTH, FRAME_HEIGHT)
+    }
+
+    /// Encodes the current frame as a binary (P6) PPM image.
+    ///
+    /// Resolves [`framebuffer_rgb`](Self::framebuffer_rgb) through the master
+    /// palette and encodes it with [`crate::encode_ppm`].
+    #[must_use]
+    pub fn framebuffer_ppm(&self) -> Vec<u8> {
+        crate::image::encode_ppm(self.framebuffer_rgb().as_slice(), FRAME_WIDTH, FRAME_HEIGHT)
+    }
+
     /// Stable checksum of the palette-index framebuffer for compact reports.
     #[must_use]
     pub fn framebuffer_checksum(&self) -> u64 {
@@ -1219,6 +1374,38 @@ impl Machine {
     #[must_use]
     pub fn apu_state(&self) -> ApuState {
         self.apu.state()
+    }
+
+    /// Enables or disables deterministic per-clock APU PCM capture.
+    ///
+    /// Capture is off by default and adds no overhead until enabled. When
+    /// enabled, one signed 16-bit sample is recorded per APU clock (one CPU
+    /// cycle) into an internal buffer drained by [`Machine::drain_audio_samples`].
+    pub fn set_audio_capture(&mut self, on: bool) {
+        self.apu.set_capture(on);
+    }
+
+    /// Drains and returns the captured PCM samples, clearing the buffer.
+    ///
+    /// Returns an empty vector when capture is disabled or nothing has been
+    /// captured since the last drain. Samples are mono, in APU emission order,
+    /// at [`Machine::audio_sample_rate`].
+    pub fn drain_audio_samples(&mut self) -> Vec<i16> {
+        self.apu.take_samples()
+    }
+
+    /// Sample rate, in hertz, of captured APU PCM.
+    ///
+    /// One sample is captured per CPU cycle / APU clock, so this equals the CPU
+    /// frequency of the active timing profile: NTSC 1,789,773 Hz, PAL
+    /// 1,662,607 Hz, and Dendy 1,773,448 Hz.
+    #[must_use]
+    pub const fn audio_sample_rate(&self) -> u32 {
+        match self.timing {
+            TimingProfile::Ntsc => 1_789_773,
+            TimingProfile::Pal => 1_662_607,
+            TimingProfile::Dendy => 1_773_448,
+        }
     }
 
     #[must_use]
@@ -3839,6 +4026,41 @@ mod hardware_tests {
     }
 
     #[test]
+    fn captures_deterministic_audio_only_when_enabled() {
+        let limits = RunLimits {
+            instruction_limit: u64::MAX,
+            cycle_limit: u64::MAX,
+        };
+
+        // Disabled by default: a run captures nothing.
+        let mut silent = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        silent.reset().expect("reset");
+        silent.run_frames(1, limits).expect("silent frame");
+        assert!(silent.drain_audio_samples().is_empty());
+
+        // Enabled: a single frame yields a non-empty, deterministic buffer.
+        let mut capture = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        capture.reset().expect("reset");
+        capture.set_audio_capture(true);
+        let start = capture.cycles();
+        capture.run_frames(1, limits).expect("captured frame");
+        let samples = capture.drain_audio_samples();
+        assert!(!samples.is_empty());
+        // One sample per CPU cycle / APU clock advanced while capturing.
+        assert_eq!(samples.len() as u64, capture.cycles() - start);
+        // Draining clears the buffer.
+        assert!(capture.drain_audio_samples().is_empty());
+        assert_eq!(capture.audio_sample_rate(), 1_789_773);
+
+        // A replayed machine produces an identical buffer.
+        let mut replay = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        replay.reset().expect("reset");
+        replay.set_audio_capture(true);
+        replay.run_frames(1, limits).expect("replayed frame");
+        assert_eq!(replay.drain_audio_samples(), samples);
+    }
+
+    #[test]
     fn stalls_cpu_for_traced_dmc_fetch_and_delivers_irq() {
         let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
         machine.reset().expect("reset");
@@ -3925,5 +4147,76 @@ mod hardware_tests {
         );
         assert!(matches!(report.cycles, 521 | 522));
         assert_eq!(&machine.oam()[..], &machine.ram()[..256]);
+    }
+
+    #[test]
+    fn resolves_framebuffer_pixels_through_the_masked_master_palette() {
+        assert_eq!(crate::NES_PALETTE_RGB.len(), 64);
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.reset().expect("reset");
+        let rgb = machine.framebuffer_rgb();
+        assert_eq!(rgb[0], crate::NES_PALETTE_RGB[0]);
+
+        // High and out-of-range bits are masked with `& 0x3f` before lookup.
+        machine.framebuffer[0] = 0xc0; // 0xc0 & 0x3f == 0x00
+        machine.framebuffer[1] = 0x7f; // 0x7f & 0x3f == 0x3f
+        let rgb = machine.framebuffer_rgb();
+        assert_eq!(rgb[0], crate::NES_PALETTE_RGB[0]);
+        assert_eq!(rgb[1], crate::NES_PALETTE_RGB[0x3f]);
+    }
+
+    #[test]
+    fn encodes_the_framebuffer_as_a_signed_png_and_sized_ppm() {
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.reset().expect("reset");
+
+        let png = machine.framebuffer_png();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+
+        let ppm = machine.framebuffer_ppm();
+        let header = b"P6\n256 240\n255\n";
+        assert_eq!(&ppm[..header.len()], header);
+        assert_eq!(ppm.len() - header.len(), FRAME_PIXELS * 3);
+    }
+
+    #[test]
+    fn steps_whole_frames_deterministically() {
+        let limits = RunLimits {
+            instruction_limit: 1_000_000,
+            cycle_limit: 1_000_000,
+        };
+        let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        machine.reset().expect("reset");
+        let start = machine.frames();
+
+        let report = machine.run_until_vblank(limits).expect("single frame");
+        assert_eq!(report.termination, Termination::Frame);
+        assert_eq!(machine.frames(), start + 1);
+
+        let before_three = machine.frames();
+        let report = machine.run_frames(3, limits).expect("three frames");
+        assert_eq!(report.termination, Termination::Frame);
+        assert_eq!(machine.frames(), before_three + 3);
+        assert_eq!(report.frames, machine.frames());
+
+        // `frame_count == 0` is a no-op report.
+        let idle = machine.run_frames(0, limits).expect("no-op");
+        assert_eq!(idle.termination, Termination::Frame);
+        assert_eq!(idle.instructions, 0);
+        assert_eq!(idle.cycles, 0);
+        assert_eq!(machine.frames(), before_three + 3);
+
+        // Determinism: a fresh machine reproduces the same advance and pixels.
+        let mut replay = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        replay.reset().expect("reset");
+        assert_eq!(replay.frames(), start);
+        replay.run_until_vblank(limits).expect("single frame");
+        assert_eq!(replay.frames(), start + 1);
+        replay.run_frames(3, limits).expect("three frames");
+        assert_eq!(replay.frames(), machine.frames());
+        assert_eq!(
+            replay.framebuffer_checksum(),
+            machine.framebuffer_checksum()
+        );
     }
 }

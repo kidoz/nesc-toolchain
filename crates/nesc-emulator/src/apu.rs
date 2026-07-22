@@ -1,5 +1,17 @@
 //! Deterministic Ricoh APU channel and sample-reader timing.
 
+/// Silence midpoint used when converting a mixed [`Apu::mixed_output`] level to a
+/// centered signed sample.
+///
+/// The mixed output is the linear sum of the two pulse channels (each `0..=15`),
+/// the triangle (`0..=15`), the noise channel (`0..=15`), and the DMC output
+/// level (`0..=127`), so it always fits in the unsigned 8-bit domain `0..=187`.
+/// Treating that as unsigned 8-bit audio, silence sits at `128`; a captured
+/// sample is therefore `mixed as i32 - 128`, clamped into [`i16`]. The clamp
+/// never actually triggers for the reachable range but keeps the conversion
+/// total.
+const SAMPLE_MIDPOINT: i32 = 128;
+
 const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
     192, 24, 72, 26, 16, 28, 32, 30,
@@ -570,6 +582,8 @@ pub(crate) struct Apu {
     noise: Noise,
     dmc: Dmc,
     output_checksum: u64,
+    capture: bool,
+    samples: Vec<i16>,
 }
 
 impl Apu {
@@ -587,7 +601,22 @@ impl Apu {
             noise: Noise::default(),
             dmc: Dmc::default(),
             output_checksum: 0,
+            capture: false,
+            samples: Vec::new(),
         }
+    }
+
+    /// Enables or disables per-clock PCM capture.
+    ///
+    /// Capture is off by default so existing runs allocate nothing. Toggling it
+    /// leaves any already-captured samples untouched.
+    pub(crate) fn set_capture(&mut self, on: bool) {
+        self.capture = on;
+    }
+
+    /// Drains and returns the captured samples, leaving the buffer empty.
+    pub(crate) fn take_samples(&mut self) -> Vec<i16> {
+        std::mem::take(&mut self.samples)
     }
 
     pub(crate) fn reset(&mut self) {
@@ -624,6 +653,12 @@ impl Apu {
         let mixed = self.mixed_output();
         self.output_checksum =
             self.output_checksum.wrapping_mul(1_099_511_628_211) ^ u64::from(mixed);
+
+        if self.capture {
+            let centered = (i32::from(mixed) - SAMPLE_MIDPOINT)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+            self.samples.push(centered as i16);
+        }
     }
 
     fn clock_frame_counter(&mut self) {
