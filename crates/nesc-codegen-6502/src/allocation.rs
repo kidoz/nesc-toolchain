@@ -9,6 +9,13 @@ use crate::{CodegenError, CodegenGoal};
 pub const RUNTIME_SCRATCH_START: u16 = 0x0700;
 /// First byte after the arithmetic runtime scratch block.
 pub const RUNTIME_SCRATCH_END: u16 = 0x0714;
+/// First internal-RAM byte of the page-aligned shadow-OAM region reserved for
+/// the runtime (mirrors `nesc_runtime::SHADOW_OAM_ADDRESS`). The DMA runtime
+/// copies this 256-byte page to sprite memory, so the allocator must never
+/// hand any of it to a global.
+pub const SHADOW_OAM_ADDRESS: u16 = 0x0200;
+/// First internal-RAM byte after the reserved 256-byte shadow-OAM page.
+pub const SHADOW_OAM_END: u16 = SHADOW_OAM_ADDRESS + 0x0100;
 
 /// Inclusive zero-page address range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,7 +209,9 @@ pub(crate) fn allocate(
     }
     available[0xf0..=0xff].fill(false);
     let total_available = available.iter().filter(|slot| **slot).count();
-    let mut internal_cursor = 0x0200_u16;
+    // Internal-RAM globals bump-allocate above the reserved shadow-OAM page so
+    // the DMA source page is never overwritten by compiler storage.
+    let mut internal_cursor = SHADOW_OAM_END;
     let mut globals = vec![
         Location {
             address: 0,
@@ -215,13 +224,32 @@ pub(crate) fn allocate(
     let mut values = HashMap::new();
     let mut entries = Vec::new();
     let mut zero_page_used = 0;
+    // Free bytes below the runtime arithmetic scratch that a wider request had
+    // to skip over. Reclaimed for later requests small enough to fit so the
+    // fixed scratch hole does not waste internal RAM.
+    let mut scratch_gap: Option<(u16, u16)> = None;
 
     for request in requests {
         let location = find_zero_page(&available, request.size).map_or_else(
             || {
+                if let Some((gap_start, gap_end)) = scratch_gap {
+                    if request.size <= gap_end - gap_start {
+                        let address = gap_start;
+                        let next = gap_start + request.size;
+                        scratch_gap = (next < gap_end).then_some((next, gap_end));
+                        return Location {
+                            address,
+                            size: request.size,
+                            zero_page: false,
+                        };
+                    }
+                }
                 if internal_cursor < RUNTIME_SCRATCH_END
                     && internal_cursor.saturating_add(request.size) > RUNTIME_SCRATCH_START
                 {
+                    if internal_cursor < RUNTIME_SCRATCH_START {
+                        scratch_gap = Some((internal_cursor, RUNTIME_SCRATCH_START));
+                    }
                     internal_cursor = RUNTIME_SCRATCH_END;
                 }
                 let location = Location {
@@ -427,9 +455,196 @@ pub(crate) fn render_report(allocation: &Allocation) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nesc_mir::{Module, Type, TypeKind};
+    use nesc_mir::{
+        BankPlacement, BasicBlock, BlockId, Effect, Function, FunctionId, Instruction,
+        InstructionKind, Local, LocalId, Module, SourceId, SourceSpan, Terminator, Type, TypeKind,
+        ValueId,
+    };
 
-    use super::{BackendConfig, RUNTIME_SCRATCH_END, ZeroPageRange, allocate};
+    use super::{
+        BackendConfig, RUNTIME_SCRATCH_END, RUNTIME_SCRATCH_START, SHADOW_OAM_END, ZeroPageRange,
+        access_counts, allocate,
+    };
+
+    #[test]
+    fn weights_loop_body_accesses_above_cold_accesses() {
+        let ty = Type::scalar(TypeKind::Bool);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "weighted".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: Type::scalar(TypeKind::Void),
+                parameters: Vec::new(),
+                locals: vec![
+                    Local {
+                        id: LocalId(0),
+                        name: "cold".to_owned(),
+                        ty: ty.clone(),
+                        parameter: false,
+                    },
+                    Local {
+                        id: LocalId(1),
+                        name: "hot".to_owned(),
+                        ty: ty.clone(),
+                        parameter: false,
+                    },
+                ],
+                entry: Some(BlockId(0)),
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction {
+                                result: Some(ValueId(0)),
+                                kind: InstructionKind::Constant(1),
+                                effect: Effect::Pure,
+                                span,
+                            },
+                            Instruction {
+                                result: None,
+                                kind: InstructionKind::StoreLocal {
+                                    local: LocalId(0),
+                                    value: ValueId(0),
+                                },
+                                effect: Effect::Write,
+                                span,
+                            },
+                            Instruction {
+                                result: Some(ValueId(1)),
+                                kind: InstructionKind::LoadLocal(LocalId(0)),
+                                effect: Effect::Read,
+                                span,
+                            },
+                        ],
+                        terminator: Some(Terminator::Jump(BlockId(1))),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![Instruction {
+                            result: Some(ValueId(2)),
+                            kind: InstructionKind::LoadLocal(LocalId(1)),
+                            effect: Effect::Read,
+                            span,
+                        }],
+                        terminator: Some(Terminator::Branch {
+                            condition: ValueId(2),
+                            then_block: BlockId(2),
+                            else_block: BlockId(3),
+                        }),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![Instruction {
+                            result: None,
+                            kind: InstructionKind::StoreLocal {
+                                local: LocalId(1),
+                                value: ValueId(0),
+                            },
+                            effect: Effect::Write,
+                            span,
+                        }],
+                        terminator: Some(Terminator::Jump(BlockId(1))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                ],
+                value_types: vec![ty.clone(), ty.clone(), ty],
+            }],
+        };
+
+        let counts = access_counts(&module);
+
+        assert_eq!(counts.locals[&(FunctionId(0), LocalId(0))], 2);
+        assert_eq!(counts.locals[&(FunctionId(0), LocalId(1))], 20);
+    }
+
+    #[test]
+    fn promotes_hot_loop_storage_before_cold_storage() {
+        let ty = Type::scalar(TypeKind::Bool);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: vec![ty.clone(), ty.clone()],
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "weighted".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: Type::scalar(TypeKind::Void),
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                entry: Some(BlockId(0)),
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction {
+                                result: Some(ValueId(0)),
+                                kind: InstructionKind::Constant(1),
+                                effect: Effect::Pure,
+                                span,
+                            },
+                            Instruction {
+                                result: None,
+                                kind: InstructionKind::StoreGlobal {
+                                    global: nesc_mir::GlobalId(0),
+                                    value: ValueId(0),
+                                },
+                                effect: Effect::Write,
+                                span,
+                            },
+                        ],
+                        terminator: Some(Terminator::Jump(BlockId(1))),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Branch {
+                            condition: ValueId(0),
+                            then_block: BlockId(2),
+                            else_block: BlockId(3),
+                        }),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: vec![Instruction {
+                            result: None,
+                            kind: InstructionKind::StoreGlobal {
+                                global: nesc_mir::GlobalId(1),
+                                value: ValueId(0),
+                            },
+                            effect: Effect::Write,
+                            span,
+                        }],
+                        terminator: Some(Terminator::Jump(BlockId(1))),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                ],
+                value_types: vec![ty],
+            }],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: vec![ZeroPageRange { start: 2, end: 3 }],
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("weighted allocation");
+
+        assert!(!allocation.globals[0].zero_page);
+        assert!(allocation.globals[1].zero_page);
+        assert!(allocation.values[&(FunctionId(0), ValueId(0))].zero_page);
+    }
 
     #[test]
     fn respects_available_and_reserved_ranges() {
@@ -470,15 +685,15 @@ mod tests {
             ..BackendConfig::default()
         };
         let allocation = allocate(&module, &config).expect("allocation");
-        assert_eq!(allocation.globals[0].address, 0x0200);
+        assert_eq!(allocation.globals[0].address, 0x0300);
         assert_eq!(allocation.globals[0].size, 64);
-        assert_eq!(allocation.globals[1].address, 0x0240);
+        assert_eq!(allocation.globals[1].address, 0x0340);
     }
 
     #[test]
     fn skips_runtime_arithmetic_scratch() {
         let mut array = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
-        array.array_lengths.push(0x0500);
+        array.array_lengths.push(0x0400);
         let module = Module {
             functions: Vec::new(),
             globals: vec![
@@ -495,7 +710,67 @@ mod tests {
             ..BackendConfig::default()
         };
         let allocation = allocate(&module, &config).expect("allocation");
-        assert_eq!(allocation.globals[0].address, 0x0200);
+        assert_eq!(allocation.globals[0].address, 0x0300);
         assert_eq!(allocation.globals[1].address, RUNTIME_SCRATCH_END);
+    }
+
+    #[test]
+    fn never_allocates_the_reserved_shadow_oam_page() {
+        // Force spilling into internal RAM by making zero page unavailable.
+        let module = Module {
+            functions: Vec::new(),
+            globals: vec![
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U16)),
+            ],
+        };
+        let config = BackendConfig {
+            zero_page_available: Vec::new(),
+            zero_page_reserved: Vec::new(),
+            ..BackendConfig::default()
+        };
+        let allocation = allocate(&module, &config).expect("allocation");
+        for global in &allocation.globals {
+            assert!(
+                !global.zero_page,
+                "expected internal-RAM spill without zero page"
+            );
+            assert!(
+                global.address >= SHADOW_OAM_END,
+                "global at ${:04X} overlaps the reserved shadow-OAM page",
+                global.address
+            );
+        }
+    }
+
+    #[test]
+    fn reclaims_the_gap_left_below_the_runtime_scratch() {
+        // A wide value that straddles the scratch hole leaves a small gap just
+        // below it; a later narrower value must backfill that reclaimed byte
+        // instead of wasting it.
+        let mut filler = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        filler
+            .array_lengths
+            .push(u32::from(RUNTIME_SCRATCH_START - SHADOW_OAM_END - 1));
+        let module = Module {
+            functions: Vec::new(),
+            globals: vec![
+                filler,
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U16)),
+                Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
+            ],
+        };
+        let config = BackendConfig {
+            zero_page_available: Vec::new(),
+            zero_page_reserved: Vec::new(),
+            ..BackendConfig::default()
+        };
+        let allocation = allocate(&module, &config).expect("allocation");
+        assert_eq!(allocation.globals[0].address, SHADOW_OAM_END);
+        // The 2-byte value cannot fit in the final byte before the scratch, so
+        // it lands past the scratch block.
+        assert_eq!(allocation.globals[1].address, RUNTIME_SCRATCH_END);
+        // The trailing 1-byte value reclaims the abandoned byte at $06FF.
+        assert_eq!(allocation.globals[2].address, RUNTIME_SCRATCH_START - 1);
     }
 }

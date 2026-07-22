@@ -23,6 +23,17 @@ pub const TEST_STATUS_PASSED: u8 = 1;
 /// An equality assertion failed; the mailbox contains both values.
 pub const TEST_STATUS_ASSERTION_FAILED: u8 = 2;
 
+/// First internal-RAM byte of the reserved, page-aligned shadow-OAM region.
+///
+/// Sprite writers stage OAM bytes here and [`RuntimeEmitter::oam_dma`] copies
+/// the whole page to sprite memory. The 6502 backend's RAM allocator reserves
+/// this page (`nesc_codegen_6502` `SHADOW_OAM_ADDRESS`), so it never overlaps
+/// compiler-managed storage.
+pub const SHADOW_OAM_ADDRESS: u16 = 0x0200;
+/// High byte (page number) of [`SHADOW_OAM_ADDRESS`], used as the `$4014` DMA
+/// source page and as the high byte of every sprite-byte store.
+pub const SHADOW_OAM_PAGE: u8 = (SHADOW_OAM_ADDRESS >> 8) as u8;
+
 /// Generated startup/runtime object and symbolic assembly.
 #[derive(Clone, Debug)]
 pub struct Runtime {
@@ -66,7 +77,10 @@ fn build_selected(
     emitter.disable_rendering();
     emitter.background_color();
     emitter.controller();
-    emitter.simple_return("nes_oam_dma");
+    emitter.oam_dma();
+    emitter.sprite_position();
+    emitter.sprite_tile();
+    emitter.sprite_attributes();
     let trap = emitter.trap();
     emitter.arithmetic_helpers(required_helpers, trap);
     emitter.test_helpers(required_helpers);
@@ -177,8 +191,88 @@ impl RuntimeEmitter {
     }
 
     fn controller(&mut self) {
+        // nescall: port arrives in A. Result mask returned in A, assembled
+        // MSB-first so the first serial bit read (button A) lands in bit 7,
+        // matching the `NES_BUTTON_*` layout in `sdk/include/controller.h`.
         self.define("nes_read_controller");
+        self.emit(&[0xaa], "tax ; X = port select ($4016 + port)");
+        self.emit(&[0xa9, 0x01], "lda #$01");
+        self.emit(&[0x8d, 0x16, 0x40], "sta $4016 ; strobe on");
         self.emit(&[0xa9, 0x00], "lda #$00");
+        self.emit(&[0x8d, 0x16, 0x40], "sta $4016 ; strobe off");
+        self.emit(&[0xa0, 0x08], "ldy #$08 ; 8 buttons");
+        self.assembly.push_str("nes_read_controller.loop:\n");
+        self.emit(&[0xbd, 0x16, 0x40], "lda $4016,x ; port 0 or 1");
+        self.emit(&[0x4a], "lsr a ; button bit -> carry");
+        self.emit(&[0x26, 0xf0], "rol $f0 ; carry -> result, shift MSB-first");
+        self.emit(&[0x88], "dey");
+        self.emit(&[0xd0, 0xf7], "bne nes_read_controller.loop");
+        self.emit(&[0xa5, 0xf0], "lda $f0 ; return mask");
+        self.emit(&[0x60], "rts");
+    }
+
+    fn oam_dma(&mut self) {
+        // Reset OAMADDR then trigger the sprite DMA from the reserved page.
+        self.define("nes_oam_dma");
+        self.emit(&[0xa9, 0x00], "lda #$00");
+        self.emit(&[0x8d, 0x03, 0x20], "sta $2003 ; OAMADDR = 0");
+        self.emit(
+            &[0xa9, SHADOW_OAM_PAGE],
+            &format!("lda #${SHADOW_OAM_PAGE:02X} ; shadow-OAM page"),
+        );
+        self.emit(&[0x8d, 0x14, 0x40], "sta $4014 ; OAM DMA");
+        self.emit(&[0x60], "rts");
+    }
+
+    fn sprite_position(&mut self) {
+        // nescall: sprite in A, x in X, y in Y. Byte offset is sprite*4 into
+        // the shadow page; +0 = Y, +3 = X.
+        self.define("nes_set_sprite_position");
+        self.emit(&[0x86, 0xf0], "stx $f0 ; save x");
+        self.emit(&[0x84, 0xf1], "sty $f1 ; save y");
+        self.emit(&[0x0a], "asl a");
+        self.emit(&[0x0a], "asl a ; A = sprite * 4");
+        self.emit(&[0xaa], "tax ; X = OAM byte offset");
+        self.emit(&[0xa5, 0xf1], "lda $f1 ; y");
+        self.emit(
+            &[0x9d, 0x00, SHADOW_OAM_PAGE],
+            &format!("sta ${SHADOW_OAM_PAGE:02X}00,x ; +0 = Y"),
+        );
+        self.emit(&[0xa5, 0xf0], "lda $f0 ; x");
+        self.emit(
+            &[0x9d, 0x03, SHADOW_OAM_PAGE],
+            &format!("sta ${SHADOW_OAM_PAGE:02X}03,x ; +3 = X"),
+        );
+        self.emit(&[0x60], "rts");
+    }
+
+    fn sprite_tile(&mut self) {
+        // nescall: sprite in A, tile in X. Byte offset sprite*4, +1 = tile.
+        self.define("nes_set_sprite_tile");
+        self.emit(&[0x86, 0xf0], "stx $f0 ; save tile");
+        self.emit(&[0x0a], "asl a");
+        self.emit(&[0x0a], "asl a ; A = sprite * 4");
+        self.emit(&[0xaa], "tax ; X = OAM byte offset");
+        self.emit(&[0xa5, 0xf0], "lda $f0 ; tile");
+        self.emit(
+            &[0x9d, 0x01, SHADOW_OAM_PAGE],
+            &format!("sta ${SHADOW_OAM_PAGE:02X}01,x ; +1 = tile"),
+        );
+        self.emit(&[0x60], "rts");
+    }
+
+    fn sprite_attributes(&mut self) {
+        // nescall: sprite in A, attributes in X. Byte offset sprite*4, +2 = attr.
+        self.define("nes_set_sprite_attributes");
+        self.emit(&[0x86, 0xf0], "stx $f0 ; save attributes");
+        self.emit(&[0x0a], "asl a");
+        self.emit(&[0x0a], "asl a ; A = sprite * 4");
+        self.emit(&[0xaa], "tax ; X = OAM byte offset");
+        self.emit(&[0xa5, 0xf0], "lda $f0 ; attributes");
+        self.emit(
+            &[0x9d, 0x02, SHADOW_OAM_PAGE],
+            &format!("sta ${SHADOW_OAM_PAGE:02X}02,x ; +2 = attributes"),
+        );
         self.emit(&[0x60], "rts");
     }
 
@@ -246,7 +340,19 @@ impl RuntimeEmitter {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{build, build_for, build_for_test};
+    use super::{Runtime, SHADOW_OAM_PAGE, build, build_for, build_for_test};
+
+    fn routine_bytes(runtime: &Runtime, name: &str) -> Vec<u8> {
+        let symbol = runtime
+            .object
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("missing symbol {name}"));
+        let section = symbol.section.expect("routine section");
+        let bytes = &runtime.object.sections[section.0 as usize].bytes;
+        bytes[symbol.offset as usize..].to_vec()
+    }
 
     #[test]
     fn runtime_exports_reset_and_sdk_symbols() {
@@ -314,5 +420,109 @@ mod tests {
         assert!(runtime.assembly.contains("jsr __nesc_test_0000"));
         assert!(runtime.assembly.contains("__nesc_test_assert_eq:"));
         assert!(runtime.assembly.contains("sta $6000 ; test status"));
+    }
+
+    #[test]
+    fn emits_controller_and_sprite_routines_with_expected_opcodes() {
+        let runtime = build();
+        runtime.object.validate().expect("valid runtime object");
+        for name in [
+            "nes_read_controller",
+            "nes_oam_dma",
+            "nes_set_sprite_position",
+            "nes_set_sprite_tile",
+            "nes_set_sprite_attributes",
+        ] {
+            assert!(
+                runtime
+                    .object
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.name == name),
+                "missing export {name}"
+            );
+        }
+
+        // Strobe $4016, then shift eight serial bits in MSB-first so button A
+        // (the first bit) lands in bit 7 to match `NES_BUTTON_A = 0x80`.
+        assert!(
+            routine_bytes(&runtime, "nes_read_controller").starts_with(&[
+                0xaa, 0xa9, 0x01, 0x8d, 0x16, 0x40, 0xa9, 0x00, 0x8d, 0x16, 0x40, 0xa0, 0x08, 0xbd,
+                0x16, 0x40, 0x4a, 0x26, 0xf0, 0x88, 0xd0, 0xf7, 0xa5, 0xf0, 0x60,
+            ])
+        );
+
+        // OAMADDR = 0, then DMA the reserved shadow page through $4014.
+        assert!(routine_bytes(&runtime, "nes_oam_dma").starts_with(&[
+            0xa9,
+            0x00,
+            0x8d,
+            0x03,
+            0x20,
+            0xa9,
+            SHADOW_OAM_PAGE,
+            0x8d,
+            0x14,
+            0x40,
+            0x60,
+        ]));
+
+        // sprite in A, x in X, y in Y: offset = sprite*4; +0 = Y, +3 = X.
+        assert!(
+            routine_bytes(&runtime, "nes_set_sprite_position").starts_with(&[
+                0x86,
+                0xf0,
+                0x84,
+                0xf1,
+                0x0a,
+                0x0a,
+                0xaa,
+                0xa5,
+                0xf1,
+                0x9d,
+                0x00,
+                SHADOW_OAM_PAGE,
+                0xa5,
+                0xf0,
+                0x9d,
+                0x03,
+                SHADOW_OAM_PAGE,
+                0x60,
+            ])
+        );
+
+        // sprite in A, tile in X: +1 = tile.
+        assert!(
+            routine_bytes(&runtime, "nes_set_sprite_tile").starts_with(&[
+                0x86,
+                0xf0,
+                0x0a,
+                0x0a,
+                0xaa,
+                0xa5,
+                0xf0,
+                0x9d,
+                0x01,
+                SHADOW_OAM_PAGE,
+                0x60,
+            ])
+        );
+
+        // sprite in A, attributes in X: +2 = attributes.
+        assert!(
+            routine_bytes(&runtime, "nes_set_sprite_attributes").starts_with(&[
+                0x86,
+                0xf0,
+                0x0a,
+                0x0a,
+                0xaa,
+                0xa5,
+                0xf0,
+                0x9d,
+                0x02,
+                SHADOW_OAM_PAGE,
+                0x60,
+            ])
+        );
     }
 }

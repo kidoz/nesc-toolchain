@@ -1672,4 +1672,88 @@ NES_TEST("failure values") {
             }
         );
     }
+
+    #[test]
+    fn stages_sprites_in_shadow_oam_and_dmas_them_into_sprite_memory() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("sprite-dma");
+        create_project("sprite-dma", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+NES_MAIN int main(void) {
+    nes_set_sprite_position(2u8, 0x40u8, 0x30u8);
+    nes_set_sprite_tile(2u8, 0x55u8);
+    nes_set_sprite_attributes(2u8, 0x03u8);
+    nes_oam_dma();
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("sprite source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+
+        let mut machine = nesc_emulator::Machine::from_rom_bytes(
+            &artifacts.rom,
+            nesc_emulator::EmulatorConfig::default(),
+        )
+        .expect("machine");
+        machine.reset().expect("reset");
+        for _ in 0..200_000 {
+            if machine.oam()[9] == 0x55 {
+                break;
+            }
+            machine.step().expect("bounded execution");
+        }
+
+        // Sprite 2 occupies OAM bytes 8..12 as Y, tile, attributes, X.
+        let oam = machine.oam();
+        assert_eq!(oam[8], 0x30, "sprite 2 Y");
+        assert_eq!(oam[9], 0x55, "sprite 2 tile");
+        assert_eq!(oam[10], 0x03, "sprite 2 attributes");
+        assert_eq!(oam[11], 0x40, "sprite 2 X");
+    }
+
+    #[test]
+    fn reads_a_controller_mask_through_the_nescall_abi() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("controller-read");
+        create_project("controller-read", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+NES_MAIN int main(void) {
+    u8 mask = nes_read_controller(0u8);
+    nes_set_sprite_tile(0u8, mask);
+    nes_oam_dma();
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("controller source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+
+        let mut machine = nesc_emulator::Machine::from_rom_bytes(
+            &artifacts.rom,
+            nesc_emulator::EmulatorConfig::default(),
+        )
+        .expect("machine");
+        machine.reset().expect("reset");
+        // The emulator returns serial bits low-to-high; `nes_read_controller`
+        // assembles them MSB-first, so pressing the first two buttons (0x03)
+        // yields `NES_BUTTON_A | NES_BUTTON_B` (0xC0).
+        machine.set_controller(0, 0x03).expect("controller");
+        for _ in 0..200_000 {
+            if machine.oam()[1] != 0 {
+                break;
+            }
+            machine.step().expect("bounded execution");
+        }
+
+        assert_eq!(machine.oam()[1], 0xc0, "assembled controller mask");
+    }
 }
