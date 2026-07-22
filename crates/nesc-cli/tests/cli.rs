@@ -1635,6 +1635,50 @@ NES_TEST("input edge detection computes pressed, released, and held") {
 }
 
 #[test]
+fn header_only_prng_is_deterministic() {
+    // Proves the header-only NesC SDK path: a static-function PRNG in
+    // `sdk/include/random.h` compiles into the project and produces a
+    // deterministic, reproducible, nonzero sequence after seeding.
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "prng"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("prng");
+    fs::write(
+        project.join("src/main.c"),
+        r#"#include <random.h>
+
+NES_TEST("prng is deterministic, reproducible, and nonzero") {
+    nes_srand(0x1234u16);
+    u16 first = nes_rand();
+    u16 second = nes_rand();
+    nes_srand(0x1234u16);
+    NES_ASSERT_EQ(nes_rand(), first);
+    NES_ASSERT_EQ(nes_rand(), second);
+    NES_ASSERT_EQ(first, 0x3830u16);
+}
+"#,
+    )
+    .expect("write prng test source");
+
+    let tested = nesc()
+        .current_dir(&project)
+        .arg("test")
+        .output()
+        .expect("run project tests");
+    let stdout = String::from_utf8_lossy(&tested.stdout);
+    let stderr = String::from_utf8_lossy(&tested.stderr);
+    assert!(tested.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("test prng is deterministic, reproducible, and nonzero ... ok"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn sprite_setters_write_shadow_oam_through_nescall() {
     // End-to-end proof of the nescall argument ABI for the runtime sprite
     // writers: if `nes_set_sprite_position(sprite, x, y)` and the tile/attribute
