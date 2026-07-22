@@ -35,23 +35,18 @@ static u8 nes_input_held(u8 port) {
     return __nes_input_current_1;
 }
 
-/*
- * pressed/released are written with XOR rather than `current & ~previous`
- * because `a & (a ^ b)` equals `a & ~b` bit-for-bit and avoids the unary `~`
- * operator, whose 6502 lowering is currently defective.
- */
 static u8 nes_input_pressed(u8 port) {
     if (port == 0u8) {
-        return __nes_input_current_0 & (__nes_input_current_0 ^ __nes_input_previous_0);
+        return __nes_input_current_0 & ~__nes_input_previous_0;
     }
-    return __nes_input_current_1 & (__nes_input_current_1 ^ __nes_input_previous_1);
+    return __nes_input_current_1 & ~__nes_input_previous_1;
 }
 
 static u8 nes_input_released(u8 port) {
     if (port == 0u8) {
-        return __nes_input_previous_0 & (__nes_input_previous_0 ^ __nes_input_current_0);
+        return __nes_input_previous_0 & ~__nes_input_current_0;
     }
-    return __nes_input_previous_1 & (__nes_input_previous_1 ^ __nes_input_current_1);
+    return __nes_input_previous_1 & ~__nes_input_current_1;
 }
 
 #endif

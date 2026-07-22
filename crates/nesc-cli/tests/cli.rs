@@ -1594,6 +1594,42 @@ fn runs_built_rom_and_emits_hashes_and_png() {
 }
 
 #[test]
+fn unary_bitwise_not_lowers_with_integer_promotion() {
+    // Regression: `~a` promotes the u8 operand to a wider result, and the unary
+    // MIR lowering must widen the operand to match or codegen reads past its
+    // storage and panics (offset < location.size).
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "bitnot"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("bitnot");
+    fs::write(
+        project.join("src/main.c"),
+        r#"NES_TEST("unary bitwise not") {
+    u8 mask = 0x03u8;
+    u8 buttons = 0x81u8;
+    NES_ASSERT_EQ(buttons & ~mask, 0x80u8);
+    NES_ASSERT_EQ(~mask, 0xFFFCu16);
+}
+"#,
+    )
+    .expect("write bitnot test source");
+
+    let tested = nesc()
+        .current_dir(&project)
+        .arg("test")
+        .output()
+        .expect("run project tests");
+    let stdout = String::from_utf8_lossy(&tested.stdout);
+    let stderr = String::from_utf8_lossy(&tested.stderr);
+    assert!(tested.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("test unary bitwise not ... ok"), "{stdout}");
+}
+
+#[test]
 fn header_only_input_edge_detection_computes_transitions() {
     // Drives the header-only input state directly (nesc test cannot inject live
     // controller input) to verify the pressed/released/held bit logic.

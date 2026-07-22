@@ -786,7 +786,18 @@ impl<'a> Builder<'a> {
                         ty,
                     ));
                 }
+                let operand_type = operand.ty.clone()?;
+                let operand_span = operand.span;
                 let operand = self.lower_expression(operand)?;
+                // Widen the operand to the (possibly integer-promoted) result
+                // type, mirroring binary lowering. Without this, `~a`/`-a` on a
+                // narrower operand left the operand narrower than the result and
+                // codegen read past the operand's storage.
+                let operand = if ty.kind != TypeKind::Bool && ty.pointer_depth == 0 {
+                    self.cast_if_needed(operand, &operand_type, &ty, operand_span)
+                } else {
+                    operand
+                };
                 Some(self.value_instruction(
                     InstructionKind::Unary {
                         operator: *operator,
