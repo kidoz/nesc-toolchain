@@ -313,6 +313,7 @@ fn build_and_inspect_generated_project() {
         "source-map",
         "zero-page",
         "stack",
+        "optimization",
     ] {
         assert!(
             project
@@ -320,6 +321,10 @@ fn build_and_inspect_generated_project() {
                 .is_file()
         );
     }
+    let optimization = fs::read_to_string(project.join("target/rom-demo.optimization"))
+        .expect("optimization report");
+    assert!(optimization.contains("Optimization: size"));
+    assert!(optimization.contains("Code generation goal: size"));
 
     let inspected = nesc()
         .current_dir(&project)
@@ -1477,6 +1482,115 @@ NES_TEST("function result") {
         assert!(stdout.contains("test function result ... ok"), "{stdout}");
         assert!(stdout.contains("test result: ok. 2 passed; 0 failed"));
     }
+}
+
+#[test]
+fn runs_built_rom_and_emits_hashes_and_png() {
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "run-demo"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("run-demo");
+    let built = nesc()
+        .current_dir(&project)
+        .arg("build")
+        .output()
+        .expect("run nesc build");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let hashed = nesc()
+        .current_dir(&project)
+        .args(["run", "target/run-demo.nes", "--frames", "2", "--hash"])
+        .output()
+        .expect("run nesc run with hashes");
+    assert!(
+        hashed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hashed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&hashed.stdout);
+    let hash_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("frame "))
+        .count();
+    assert_eq!(hash_lines, 2, "{stdout}");
+    assert!(stdout.contains("frame 0: "), "{stdout}");
+    assert!(stdout.contains("frame 1: "), "{stdout}");
+
+    let images = project.join("target/frames");
+    let imaged = nesc()
+        .current_dir(&project)
+        .args([
+            "run",
+            "target/run-demo.nes",
+            "--frames",
+            "1",
+            "--png",
+            "--out",
+            images.to_str().expect("UTF-8 test path"),
+        ])
+        .output()
+        .expect("run nesc run with png output");
+    assert!(
+        imaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imaged.stderr)
+    );
+    let frame = images.join("frame.png");
+    assert!(frame.is_file(), "expected {}", frame.display());
+    let bytes = fs::read(&frame).expect("read PNG");
+    assert!(
+        bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "unexpected PNG signature: {:02X?}",
+        &bytes[..bytes.len().min(8)]
+    );
+
+    let audio = project.join("target/audio");
+    let recorded = nesc()
+        .current_dir(&project)
+        .args([
+            "run",
+            "target/run-demo.nes",
+            "--frames",
+            "2",
+            "--wav",
+            "--out",
+            audio.to_str().expect("UTF-8 test path"),
+        ])
+        .output()
+        .expect("run nesc run with wav output");
+    assert!(
+        recorded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let wav = audio.join("audio.wav");
+    assert!(wav.is_file(), "expected {}", wav.display());
+    let wav_bytes = fs::read(&wav).expect("read WAV");
+    assert!(
+        wav_bytes.starts_with(b"RIFF") && wav_bytes[8..12] == *b"WAVE",
+        "unexpected WAV header: {:02X?}",
+        &wav_bytes[..wav_bytes.len().min(12)]
+    );
+
+    let missing_out = nesc()
+        .current_dir(&project)
+        .args(["run", "target/run-demo.nes", "--wav"])
+        .output()
+        .expect("run nesc run wav without out");
+    assert!(!missing_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_out.stderr).contains("E4504"),
+        "{}",
+        String::from_utf8_lossy(&missing_out.stderr)
+    );
 }
 
 #[test]

@@ -156,6 +156,36 @@ enum Command {
         #[arg(long, value_enum)]
         timing: Option<DebugTimingKind>,
     },
+    /// Execute a built `.nes` ROM and emit frame images and/or framebuffer hashes.
+    Run {
+        /// Built ROM file to execute.
+        #[arg(value_name = "ROM")]
+        rom: PathBuf,
+        /// Number of frames to render.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        frames: u64,
+        /// Directory for emitted images; created when absent.
+        #[arg(long, value_name = "DIRECTORY")]
+        out: Option<PathBuf>,
+        /// Write PNG frame images.
+        #[arg(long)]
+        png: bool,
+        /// Write PPM frame images.
+        #[arg(long)]
+        ppm: bool,
+        /// Print one `frame <i>: <checksum>` line per rendered frame.
+        #[arg(long)]
+        hash: bool,
+        /// Explicit timing; defaults to the ROM's declared region.
+        #[arg(long, value_enum, value_name = "REGION")]
+        region: Option<DebugTimingKind>,
+        /// Per-frame controller script; see the command documentation for the format.
+        #[arg(long, value_name = "FILE")]
+        input: Option<PathBuf>,
+        /// Capture APU audio and write `audio.wav` to the output directory.
+        #[arg(long)]
+        wav: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -283,6 +313,21 @@ where
                 stderr,
             );
         }
+        Command::Run {
+            rom,
+            frames,
+            out,
+            png,
+            ppm,
+            hash,
+            region,
+            input: script,
+            wav,
+        } => {
+            return run_rom(
+                &rom, frames, out, png, ppm, hash, region, script, wav, stdout, stderr,
+            );
+        }
         command => command,
     };
 
@@ -374,6 +419,7 @@ fn execute(command: Command) -> Result<String, Vec<Diagnostic>> {
         ),
         Command::Debug { .. } => unreachable!("debug commands are handled before dispatch"),
         Command::Test { .. } => unreachable!("test commands are handled before dispatch"),
+        Command::Run { .. } => unreachable!("run commands are handled before dispatch"),
     }
 }
 
@@ -509,6 +555,219 @@ fn run_project_tests(
     } else {
         write_diagnostics(stderr, diagnostics)
     }
+}
+
+/// Executes a built ROM in the deterministic emulator, emitting frame images
+/// and/or framebuffer checksums.
+///
+/// The optional `--input` script supplies per-frame controller state. Each line
+/// describes one frame as two whitespace-separated port fields, `P1 P2`, where
+/// each field is either `-` for no buttons or a string of button letters drawn
+/// from the set `A`, `B`, `S` (Select), `T` (sTart), `U`, `D`, `L`, `R`. For
+/// example, `RA -` holds Right and A on port 1 and nothing on port 2. Letters
+/// map to the controller bit layout `A=0x80`, `B=0x40`, `Select=0x20`,
+/// `Start=0x10`, `Up=0x08`, `Down=0x04`, `Left=0x02`, `Right=0x01`. Missing
+/// fields and missing lines mean no input, and lines beyond `--frames` are
+/// ignored.
+#[allow(clippy::too_many_arguments)]
+fn run_rom(
+    rom: &Path,
+    frames: u64,
+    out: Option<PathBuf>,
+    png: bool,
+    ppm: bool,
+    hash: bool,
+    region: Option<DebugTimingKind>,
+    input: Option<PathBuf>,
+    wav: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    if wav && out.is_none() {
+        return write_debug_error(stderr, "E4504", "`--wav` requires `--out <DIRECTORY>`");
+    }
+    let bytes = match fs::read(rom) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return write_debug_error(
+                stderr,
+                "E4500",
+                &format!("could not read ROM `{}`: {error}", rom.display()),
+            );
+        }
+    };
+    let script = match input.as_deref().map(parse_input_script).transpose() {
+        Ok(script) => script.unwrap_or_default(),
+        Err(message) => return write_debug_error(stderr, "E4501", &message),
+    };
+    let config = nesc_emulator::EmulatorConfig {
+        timing: region.map(Into::into),
+        ..nesc_emulator::EmulatorConfig::default()
+    };
+    let mut machine = match nesc_emulator::Machine::from_rom_bytes(&bytes, config) {
+        Ok(machine) => machine,
+        Err(error) => return write_debug_error(stderr, "E4502", &error.to_string()),
+    };
+    if let Err(error) = machine.reset() {
+        return write_debug_error(stderr, "E4502", &error.to_string());
+    }
+    if wav {
+        machine.set_audio_capture(true);
+    }
+
+    let want_png = png || (out.is_some() && !png && !ppm);
+    let want_ppm = ppm;
+    if let Some(directory) = out.as_deref() {
+        if let Err(error) = fs::create_dir_all(directory) {
+            return write_debug_error(
+                stderr,
+                "E4503",
+                &format!(
+                    "could not create output directory `{}`: {error}",
+                    directory.display()
+                ),
+            );
+        }
+    }
+
+    let mut rendered = 0_u64;
+    let mut termination = nesc_emulator::Termination::Frame;
+    for index in 0..frames {
+        let (port_one, port_two) = script.get(index as usize).copied().unwrap_or((0, 0));
+        if let Err(error) = machine.set_controller(0, port_one) {
+            return write_debug_error(stderr, "E4502", &error.to_string());
+        }
+        if let Err(error) = machine.set_controller(1, port_two) {
+            return write_debug_error(stderr, "E4502", &error.to_string());
+        }
+        let report = match machine.run_until_vblank(nesc_emulator::RunLimits::default()) {
+            Ok(report) => report,
+            Err(error) => return write_debug_error(stderr, "E4502", &error.to_string()),
+        };
+        termination = report.termination;
+        rendered += 1;
+        if hash && writeln!(stdout, "frame {index}: {}", machine.framebuffer_checksum()).is_err() {
+            return ExitCode::FAILURE;
+        }
+        if let Some(directory) = out.as_deref() {
+            let stem = if frames == 1 {
+                "frame".to_owned()
+            } else {
+                format!("frame-{index:03}")
+            };
+            if want_png {
+                let path = directory.join(format!("{stem}.png"));
+                if let Err(error) = fs::write(&path, machine.framebuffer_png()) {
+                    return write_debug_error(
+                        stderr,
+                        "E4503",
+                        &format!("could not write image `{}`: {error}", path.display()),
+                    );
+                }
+            }
+            if want_ppm {
+                let path = directory.join(format!("{stem}.ppm"));
+                if let Err(error) = fs::write(&path, machine.framebuffer_ppm()) {
+                    return write_debug_error(
+                        stderr,
+                        "E4503",
+                        &format!("could not write image `{}`: {error}", path.display()),
+                    );
+                }
+            }
+        }
+        if termination != nesc_emulator::Termination::Frame {
+            break;
+        }
+    }
+
+    if wav {
+        if let Some(directory) = out.as_deref() {
+            let samples = machine.drain_audio_samples();
+            let audio = nesc_emulator::encode_wav(&samples, machine.audio_sample_rate());
+            let path = directory.join("audio.wav");
+            if let Err(error) = fs::write(&path, audio) {
+                return write_debug_error(
+                    stderr,
+                    "E4503",
+                    &format!("could not write audio `{}`: {error}", path.display()),
+                );
+            }
+        }
+    }
+
+    let plural = if rendered == 1 { "" } else { "s" };
+    let summary = match termination {
+        nesc_emulator::Termination::Frame => {
+            format!(
+                "Ran `{}` for {rendered} frame{plural} (completed)",
+                rom.display()
+            )
+        }
+        nesc_emulator::Termination::Trap { reason } => format!(
+            "Ran `{}` for {rendered} frame{plural}; stopped at trap reason ${reason:02X}",
+            rom.display()
+        ),
+        nesc_emulator::Termination::InstructionLimit => format!(
+            "Ran `{}` for {rendered} frame{plural}; stopped at the instruction limit",
+            rom.display()
+        ),
+        nesc_emulator::Termination::CycleLimit => format!(
+            "Ran `{}` for {rendered} frame{plural}; stopped at the cycle limit",
+            rom.display()
+        ),
+    };
+    if writeln!(stdout, "{summary}").is_err() {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+fn parse_input_script(path: &Path) -> Result<Vec<(u8, u8)>, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("could not read input script `{}`: {error}", path.display()))?;
+    let mut frames = Vec::new();
+    for (offset, line) in contents.lines().enumerate() {
+        let number = offset + 1;
+        let mut fields = line.split_whitespace();
+        let port_one = fields
+            .next()
+            .map(|field| parse_button_field(field, number))
+            .transpose()?
+            .unwrap_or(0);
+        let port_two = fields
+            .next()
+            .map(|field| parse_button_field(field, number))
+            .transpose()?
+            .unwrap_or(0);
+        frames.push((port_one, port_two));
+    }
+    Ok(frames)
+}
+
+fn parse_button_field(field: &str, line: usize) -> Result<u8, String> {
+    if field == "-" {
+        return Ok(0);
+    }
+    let mut buttons = 0_u8;
+    for letter in field.chars() {
+        buttons |= match letter.to_ascii_uppercase() {
+            'A' => 0x80,
+            'B' => 0x40,
+            'S' => 0x20,
+            'T' => 0x10,
+            'U' => 0x08,
+            'D' => 0x04,
+            'L' => 0x02,
+            'R' => 0x01,
+            other => {
+                return Err(format!(
+                    "input script line {line}: unknown button `{other}`; use letters from A,B,S,T,U,D,L,R or `-`"
+                ));
+            }
+        };
+    }
+    Ok(buttons)
 }
 
 fn write_diagnostics(stderr: &mut dyn Write, diagnostics: Vec<Diagnostic>) -> ExitCode {
@@ -698,6 +957,7 @@ fn write_artifacts(
         ("source-map", artifacts.source_map.as_bytes()),
         ("zero-page", artifacts.zero_page.as_bytes()),
         ("stack", artifacts.stack.as_bytes()),
+        ("optimization", artifacts.optimization.as_bytes()),
     ] {
         let path = target.join(format!("{name}.{extension}"));
         fs::write(&path, contents).map_err(|error| {
