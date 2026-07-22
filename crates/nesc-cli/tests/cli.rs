@@ -1594,6 +1594,52 @@ fn runs_built_rom_and_emits_hashes_and_png() {
 }
 
 #[test]
+fn sprite_setters_write_shadow_oam_through_nescall() {
+    // End-to-end proof of the nescall argument ABI for the runtime sprite
+    // writers: if `nes_set_sprite_position(sprite, x, y)` and the tile/attribute
+    // setters received their arguments from the wrong registers/slots, the bytes
+    // in the reserved shadow-OAM page would not match, and the assertions fail.
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "sprite-abi"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("sprite-abi");
+    fs::write(
+        project.join("src/main.c"),
+        r#"#include <nes.h>
+
+NES_TEST("sprite setters write the shadow OAM page") {
+    nes_set_sprite_position(3u8, 5u8, 7u8);
+    nes_set_sprite_tile(3u8, 0x2Au8);
+    nes_set_sprite_attributes(3u8, 0x01u8);
+    ptr<internal_ram, volatile u8> oam = (ptr<internal_ram, volatile u8>)0x0200u16;
+    NES_ASSERT_EQ(oam[12], 7u8);
+    NES_ASSERT_EQ(oam[13], 0x2Au8);
+    NES_ASSERT_EQ(oam[14], 0x01u8);
+    NES_ASSERT_EQ(oam[15], 5u8);
+}
+"#,
+    )
+    .expect("write sprite test source");
+
+    let tested = nesc()
+        .current_dir(&project)
+        .arg("test")
+        .output()
+        .expect("run project tests");
+    let stdout = String::from_utf8_lossy(&tested.stdout);
+    let stderr = String::from_utf8_lossy(&tested.stderr);
+    assert!(tested.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("test sprite setters write the shadow OAM page ... ok"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn reports_test_assertion_values_and_cycle_limits() {
     let temporary = tempdir().expect("temporary directory");
     let created = nesc()
