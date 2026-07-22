@@ -1,7 +1,9 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use nesc_mir::{FunctionId, GlobalId, InstructionKind, LocalId, Module, Terminator, Type, ValueId};
+use nesc_mir::{
+    Function, FunctionId, GlobalId, InstructionKind, LocalId, Module, Terminator, Type, ValueId,
+};
 
 use crate::{CodegenError, CodegenGoal};
 
@@ -104,6 +106,7 @@ pub(crate) struct Allocation {
     pub zero_page_free: usize,
 }
 
+#[derive(Clone, Copy)]
 enum RequestKey {
     Global(GlobalId),
     Local(FunctionId, LocalId),
@@ -121,6 +124,12 @@ struct AccessCounts {
     globals: HashMap<GlobalId, u32>,
     locals: HashMap<(FunctionId, LocalId), u32>,
     values: HashMap<(FunctionId, ValueId), u32>,
+}
+
+struct ReusableValueSlot {
+    function: FunctionId,
+    location: Location,
+    occupants: Vec<ValueId>,
 }
 
 pub(crate) fn allocate(
@@ -143,6 +152,12 @@ pub(crate) fn allocate(
         }
     }
     let access_counts = access_counts(module);
+    let value_interferences = module
+        .functions
+        .iter()
+        .filter(|function| !function.blocks.is_empty())
+        .map(|function| (function.id, value_interferences(function)))
+        .collect::<HashMap<_, _>>();
     let mut requests = Vec::new();
     for (index, ty) in module.globals.iter().enumerate() {
         requests.push(Request {
@@ -224,52 +239,85 @@ pub(crate) fn allocate(
     let mut values = HashMap::new();
     let mut entries = Vec::new();
     let mut zero_page_used = 0;
+    let mut reusable_value_slots = Vec::<ReusableValueSlot>::new();
     // Free bytes below the runtime arithmetic scratch that a wider request had
     // to skip over. Reclaimed for later requests small enough to fit so the
     // fixed scratch hole does not waste internal RAM.
     let mut scratch_gap: Option<(u16, u16)> = None;
 
     for request in requests {
-        let location = find_zero_page(&available, request.size).map_or_else(
-            || {
-                if let Some((gap_start, gap_end)) = scratch_gap {
-                    if request.size <= gap_end - gap_start {
-                        let address = gap_start;
-                        let next = gap_start + request.size;
-                        scratch_gap = (next < gap_end).then_some((next, gap_end));
-                        return Location {
-                            address,
-                            size: request.size,
-                            zero_page: false,
-                        };
+        let reusable_slot = match request.key {
+            RequestKey::Value(function, value) => {
+                value_interferences
+                    .get(&function)
+                    .and_then(|interferences| {
+                        reusable_value_slots.iter().position(|slot| {
+                            slot.function == function
+                                && slot.location.size == request.size
+                                && slot.occupants.iter().all(|occupant| {
+                                    !interferences[value.0 as usize].contains(occupant)
+                                })
+                        })
+                    })
+            }
+            RequestKey::Global(_) | RequestKey::Local(_, _) => None,
+        };
+        let location = if let Some(slot) = reusable_slot {
+            let slot = &mut reusable_value_slots[slot];
+            if let RequestKey::Value(_, value) = request.key {
+                slot.occupants.push(value);
+            }
+            slot.location
+        } else {
+            let location = find_zero_page(&available, request.size).map_or_else(
+                || {
+                    if let Some((gap_start, gap_end)) = scratch_gap {
+                        if request.size <= gap_end - gap_start {
+                            let address = gap_start;
+                            let next = gap_start + request.size;
+                            scratch_gap = (next < gap_end).then_some((next, gap_end));
+                            return Location {
+                                address,
+                                size: request.size,
+                                zero_page: false,
+                            };
+                        }
                     }
-                }
-                if internal_cursor < RUNTIME_SCRATCH_END
-                    && internal_cursor.saturating_add(request.size) > RUNTIME_SCRATCH_START
-                {
-                    if internal_cursor < RUNTIME_SCRATCH_START {
-                        scratch_gap = Some((internal_cursor, RUNTIME_SCRATCH_START));
+                    if internal_cursor < RUNTIME_SCRATCH_END
+                        && internal_cursor.saturating_add(request.size) > RUNTIME_SCRATCH_START
+                    {
+                        if internal_cursor < RUNTIME_SCRATCH_START {
+                            scratch_gap = Some((internal_cursor, RUNTIME_SCRATCH_START));
+                        }
+                        internal_cursor = RUNTIME_SCRATCH_END;
                     }
-                    internal_cursor = RUNTIME_SCRATCH_END;
-                }
-                let location = Location {
-                    address: internal_cursor,
-                    size: request.size,
-                    zero_page: false,
-                };
-                internal_cursor = internal_cursor.saturating_add(request.size);
-                location
-            },
-            |start| {
-                available[start..start + usize::from(request.size)].fill(false);
-                zero_page_used += usize::from(request.size);
-                Location {
-                    address: start as u16,
-                    size: request.size,
-                    zero_page: true,
-                }
-            },
-        );
+                    let location = Location {
+                        address: internal_cursor,
+                        size: request.size,
+                        zero_page: false,
+                    };
+                    internal_cursor = internal_cursor.saturating_add(request.size);
+                    location
+                },
+                |start| {
+                    available[start..start + usize::from(request.size)].fill(false);
+                    zero_page_used += usize::from(request.size);
+                    Location {
+                        address: start as u16,
+                        size: request.size,
+                        zero_page: true,
+                    }
+                },
+            );
+            if let RequestKey::Value(function, value) = request.key {
+                reusable_value_slots.push(ReusableValueSlot {
+                    function,
+                    location,
+                    occupants: vec![value],
+                });
+            }
+            location
+        };
         if location.address.saturating_add(location.size) > 0x0800 {
             return Err(vec![CodegenError {
                 message: "compiler storage exceeds the 2 KiB internal RAM capacity".to_owned(),
@@ -300,6 +348,168 @@ pub(crate) fn allocate(
         zero_page_used,
         zero_page_free: total_available.saturating_sub(zero_page_used),
     })
+}
+
+fn value_interferences(function: &Function) -> Vec<BTreeSet<ValueId>> {
+    let value_count = function.value_types.len();
+    let mut uses = vec![BTreeSet::new(); function.blocks.len()];
+    let mut definitions = vec![BTreeSet::new(); function.blocks.len()];
+    for block in &function.blocks {
+        let index = block.id.0 as usize;
+        for instruction in &block.instructions {
+            for value in instruction_operands(&instruction.kind) {
+                if !definitions[index].contains(&value) {
+                    uses[index].insert(value);
+                }
+            }
+            if let Some(result) = instruction.result {
+                definitions[index].insert(result);
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for value in terminator_operands(terminator) {
+                if !definitions[index].contains(&value) {
+                    uses[index].insert(value);
+                }
+            }
+        }
+    }
+
+    let mut live_in = vec![BTreeSet::new(); function.blocks.len()];
+    let mut live_out = vec![BTreeSet::new(); function.blocks.len()];
+    loop {
+        let mut changed = false;
+        for block in function.blocks.iter().rev() {
+            let index = block.id.0 as usize;
+            let mut outgoing = BTreeSet::new();
+            if let Some(terminator) = &block.terminator {
+                for successor in terminator_successors(terminator) {
+                    outgoing.extend(live_in[successor.0 as usize].iter().copied());
+                }
+            }
+            let mut incoming = uses[index].clone();
+            incoming.extend(outgoing.difference(&definitions[index]).copied());
+            if outgoing != live_out[index] || incoming != live_in[index] {
+                live_out[index] = outgoing;
+                live_in[index] = incoming;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut interferences = vec![BTreeSet::new(); value_count];
+    for block in &function.blocks {
+        let mut live = live_out[block.id.0 as usize].clone();
+        if let Some(terminator) = &block.terminator {
+            let operands = terminator_operands(terminator);
+            connect_simultaneous_values(&mut interferences, &operands, &live);
+            live.extend(operands);
+        }
+        for instruction in block.instructions.iter().rev() {
+            let operands = instruction_operands(&instruction.kind);
+            if let Some(result) = instruction.result {
+                connect_value_to_set(&mut interferences, result, &live);
+                connect_value_to_values(&mut interferences, result, &operands);
+                live.remove(&result);
+            }
+            connect_simultaneous_values(&mut interferences, &operands, &live);
+            live.extend(operands);
+        }
+    }
+    interferences
+}
+
+fn instruction_operands(kind: &InstructionKind) -> Vec<ValueId> {
+    match kind {
+        InstructionKind::Constant(_)
+        | InstructionKind::LoadLocal(_)
+        | InstructionKind::LoadGlobal(_)
+        | InstructionKind::AddressOfLocal(_)
+        | InstructionKind::AddressOfGlobal(_) => Vec::new(),
+        InstructionKind::StoreLocal { value, .. }
+        | InstructionKind::StoreGlobal { value, .. }
+        | InstructionKind::Cast { value, .. } => vec![*value],
+        InstructionKind::BoundsCheck { index, .. } => vec![*index],
+        InstructionKind::PointerOffset { base, offset, .. }
+        | InstructionKind::Binary {
+            left: base,
+            right: offset,
+            ..
+        } => vec![*base, *offset],
+        InstructionKind::LoadIndirect { address, .. }
+        | InstructionKind::Unary {
+            operand: address, ..
+        } => vec![*address],
+        InstructionKind::StoreIndirect { address, value, .. } => vec![*address, *value],
+        InstructionKind::Call { arguments, .. } => arguments.clone(),
+        InstructionKind::InlineAssembly(assembly) => {
+            assembly.inputs.iter().map(|input| input.value).collect()
+        }
+    }
+}
+
+fn terminator_operands(terminator: &Terminator) -> Vec<ValueId> {
+    match terminator {
+        Terminator::Branch { condition, .. } => vec![*condition],
+        Terminator::Return(Some(value)) => vec![*value],
+        Terminator::Jump(_) | Terminator::Return(None) | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+fn terminator_successors(terminator: &Terminator) -> Vec<nesc_mir::BlockId> {
+    match terminator {
+        Terminator::Jump(target) => vec![*target],
+        Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+fn connect_simultaneous_values(
+    interferences: &mut [BTreeSet<ValueId>],
+    values: &[ValueId],
+    live: &BTreeSet<ValueId>,
+) {
+    for value in values {
+        connect_value_to_set(interferences, *value, live);
+    }
+    for (index, value) in values.iter().enumerate() {
+        connect_value_to_values(interferences, *value, &values[index + 1..]);
+    }
+}
+
+fn connect_value_to_set(
+    interferences: &mut [BTreeSet<ValueId>],
+    value: ValueId,
+    others: &BTreeSet<ValueId>,
+) {
+    for other in others {
+        connect_values(interferences, value, *other);
+    }
+}
+
+fn connect_value_to_values(
+    interferences: &mut [BTreeSet<ValueId>],
+    value: ValueId,
+    others: &[ValueId],
+) {
+    for other in others {
+        connect_values(interferences, value, *other);
+    }
+}
+
+fn connect_values(interferences: &mut [BTreeSet<ValueId>], left: ValueId, right: ValueId) {
+    if left == right {
+        return;
+    }
+    interferences[left.0 as usize].insert(right);
+    interferences[right.0 as usize].insert(left);
 }
 
 fn access_counts(module: &Module) -> AccessCounts {
@@ -456,9 +666,9 @@ pub(crate) fn render_report(allocation: &Allocation) -> String {
 #[cfg(test)]
 mod tests {
     use nesc_mir::{
-        BankPlacement, BasicBlock, BlockId, Effect, Function, FunctionId, Instruction,
-        InstructionKind, Local, LocalId, Module, SourceId, SourceSpan, Terminator, Type, TypeKind,
-        ValueId,
+        BankPlacement, BasicBlock, BinaryOperator, BlockId, Effect, Function, FunctionId,
+        Instruction, InstructionKind, Local, LocalId, Module, SourceId, SourceSpan, Terminator,
+        Type, TypeKind, ValueId,
     };
 
     use super::{
@@ -562,6 +772,186 @@ mod tests {
 
         assert_eq!(counts.locals[&(FunctionId(0), LocalId(0))], 2);
         assert_eq!(counts.locals[&(FunctionId(0), LocalId(1))], 20);
+    }
+
+    #[test]
+    fn reuses_storage_for_nonoverlapping_values() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "reuse".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: Type::scalar(TypeKind::Void),
+                parameters: Vec::new(),
+                locals: vec![Local {
+                    id: LocalId(0),
+                    name: "destination".to_owned(),
+                    ty: ty.clone(),
+                    parameter: false,
+                }],
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::Constant(1),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: None,
+                            kind: InstructionKind::StoreLocal {
+                                local: LocalId(0),
+                                value: ValueId(0),
+                            },
+                            effect: Effect::Write,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(1)),
+                            kind: InstructionKind::Constant(2),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: None,
+                            kind: InstructionKind::StoreLocal {
+                                local: LocalId(0),
+                                value: ValueId(1),
+                            },
+                            effect: Effect::Write,
+                            span,
+                        },
+                    ],
+                    terminator: Some(Terminator::Return(None)),
+                }],
+                value_types: vec![ty.clone(), ty],
+            }],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("reusable allocation");
+
+        assert_eq!(
+            allocation.values[&(FunctionId(0), ValueId(0))].address,
+            allocation.values[&(FunctionId(0), ValueId(1))].address
+        );
+    }
+
+    #[test]
+    fn keeps_value_storage_isolated_between_functions() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let function = |id: u32, name: &str| Function {
+            id: FunctionId(id),
+            name: name.to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: ty.clone(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction {
+                    result: Some(ValueId(0)),
+                    kind: InstructionKind::Constant(u64::from(id)),
+                    effect: Effect::Pure,
+                    span,
+                }],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+            value_types: vec![ty.clone()],
+        };
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![function(0, "main"), function(1, "nmi")],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("function-isolated allocation");
+
+        assert_ne!(
+            allocation.values[&(FunctionId(0), ValueId(0))].address,
+            allocation.values[&(FunctionId(1), ValueId(0))].address
+        );
+    }
+
+    #[test]
+    fn keeps_simultaneous_operands_and_results_in_distinct_storage() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "overlap".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: ty.clone(),
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::Constant(1),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(1)),
+                            kind: InstructionKind::Constant(2),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(2)),
+                            kind: InstructionKind::Binary {
+                                operator: BinaryOperator::Add,
+                                left: ValueId(0),
+                                right: ValueId(1),
+                            },
+                            effect: Effect::Pure,
+                            span,
+                        },
+                    ],
+                    terminator: Some(Terminator::Return(Some(ValueId(2)))),
+                }],
+                value_types: vec![ty.clone(), ty.clone(), ty],
+            }],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("interference-aware allocation");
+        let locations = [ValueId(0), ValueId(1), ValueId(2)]
+            .map(|value| allocation.values[&(FunctionId(0), value)].address);
+
+        assert_ne!(locations[0], locations[1]);
+        assert_ne!(locations[0], locations[2]);
+        assert_ne!(locations[1], locations[2]);
     }
 
     #[test]

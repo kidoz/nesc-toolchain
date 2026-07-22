@@ -545,7 +545,9 @@ inline. The backend places hot CFG successors as fall-throughs, inverts a
 conditional when its true edge becomes the fall-through, removes redundant
 jumps, and expands any relative branch outside the signed 8-bit range. Each
 build writes an `.optimization` report beside the ROM, assembly, map, symbols,
-source map, zero-page report, and stack report.
+source map, zero-page report, and stack report. CFG liveness also lets the
+storage allocator reuse same-width virtual-value slots within one function;
+globals, source locals, and values owned by different functions stay isolated.
 
 ## Workspace
 
@@ -582,7 +584,7 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Extend zero-page selection with reusable-slot and spill costs
+1. Add spill-cost modeling and address-safe reuse for source-local slots
 2. Add accumulator forwarding, register reuse, and flag-liveness optimization
 
 ## License
