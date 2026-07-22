@@ -2,7 +2,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use nesc_mir::{
-    Function, FunctionId, GlobalId, InstructionKind, LocalId, Module, Terminator, Type, ValueId,
+    Function, FunctionId, GlobalId, Instruction, InstructionKind, LocalId, Module, Terminator,
+    Type, ValueId,
 };
 
 use crate::{CodegenError, CodegenGoal};
@@ -31,9 +32,9 @@ pub struct ZeroPageRange {
 /// Zero-page allocation priority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ZeroPageStrategy {
-    /// Allocate stable objects before temporary values.
+    /// Prioritize slots by aggregate loop-weighted access frequency.
     Frequency,
-    /// Allocate temporary values before stable objects.
+    /// Prioritize slots by estimated byte-access cycle savings.
     Cycles,
 }
 
@@ -106,7 +107,7 @@ pub(crate) struct Allocation {
     pub zero_page_free: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum RequestKey {
     Global(GlobalId),
     Local(FunctionId, LocalId),
@@ -126,10 +127,16 @@ struct AccessCounts {
     values: HashMap<(FunctionId, ValueId), u32>,
 }
 
-struct ReusableValueSlot {
-    function: FunctionId,
-    location: Location,
-    occupants: Vec<ValueId>,
+struct FunctionStorageAnalysis {
+    reusable: BTreeSet<RequestKey>,
+    interferences: HashMap<RequestKey, BTreeSet<RequestKey>>,
+}
+
+struct StorageSlot {
+    function: Option<FunctionId>,
+    size: u16,
+    access_weight: u32,
+    occupants: Vec<Request>,
 }
 
 pub(crate) fn allocate(
@@ -152,11 +159,11 @@ pub(crate) fn allocate(
         }
     }
     let access_counts = access_counts(module);
-    let value_interferences = module
+    let storage_analyses = module
         .functions
         .iter()
         .filter(|function| !function.blocks.is_empty())
-        .map(|function| (function.id, value_interferences(function)))
+        .map(|function| (function.id, analyze_function_storage(function)))
         .collect::<HashMap<_, _>>();
     let mut requests = Vec::new();
     for (index, ty) in module.globals.iter().enumerate() {
@@ -200,16 +207,7 @@ pub(crate) fn allocate(
             });
         }
     }
-    match config.zero_page_strategy {
-        ZeroPageStrategy::Frequency => {
-            requests.sort_by_key(|request| Reverse(request.accesses));
-        }
-        ZeroPageStrategy::Cycles => {
-            requests.sort_by_key(|request| {
-                Reverse(u64::from(request.accesses) * u64::from(request.size))
-            });
-        }
-    }
+    let slots = form_storage_slots(requests, &storage_analyses, config.zero_page_strategy);
 
     let mut available = [false; 256];
     for range in &config.zero_page_available {
@@ -239,105 +237,74 @@ pub(crate) fn allocate(
     let mut values = HashMap::new();
     let mut entries = Vec::new();
     let mut zero_page_used = 0;
-    let mut reusable_value_slots = Vec::<ReusableValueSlot>::new();
     // Free bytes below the runtime arithmetic scratch that a wider request had
     // to skip over. Reclaimed for later requests small enough to fit so the
     // fixed scratch hole does not waste internal RAM.
     let mut scratch_gap: Option<(u16, u16)> = None;
 
-    for request in requests {
-        let reusable_slot = match request.key {
-            RequestKey::Value(function, value) => {
-                value_interferences
-                    .get(&function)
-                    .and_then(|interferences| {
-                        reusable_value_slots.iter().position(|slot| {
-                            slot.function == function
-                                && slot.location.size == request.size
-                                && slot.occupants.iter().all(|occupant| {
-                                    !interferences[value.0 as usize].contains(occupant)
-                                })
-                        })
-                    })
-            }
-            RequestKey::Global(_) | RequestKey::Local(_, _) => None,
-        };
-        let location = if let Some(slot) = reusable_slot {
-            let slot = &mut reusable_value_slots[slot];
-            if let RequestKey::Value(_, value) = request.key {
-                slot.occupants.push(value);
-            }
-            slot.location
-        } else {
-            let location = find_zero_page(&available, request.size).map_or_else(
-                || {
-                    if let Some((gap_start, gap_end)) = scratch_gap {
-                        if request.size <= gap_end - gap_start {
-                            let address = gap_start;
-                            let next = gap_start + request.size;
-                            scratch_gap = (next < gap_end).then_some((next, gap_end));
-                            return Location {
-                                address,
-                                size: request.size,
-                                zero_page: false,
-                            };
-                        }
+    for slot in slots {
+        let location = find_zero_page(&available, slot.size).map_or_else(
+            || {
+                if let Some((gap_start, gap_end)) = scratch_gap {
+                    if slot.size <= gap_end - gap_start {
+                        let address = gap_start;
+                        let next = gap_start + slot.size;
+                        scratch_gap = (next < gap_end).then_some((next, gap_end));
+                        return Location {
+                            address,
+                            size: slot.size,
+                            zero_page: false,
+                        };
                     }
-                    if internal_cursor < RUNTIME_SCRATCH_END
-                        && internal_cursor.saturating_add(request.size) > RUNTIME_SCRATCH_START
-                    {
-                        if internal_cursor < RUNTIME_SCRATCH_START {
-                            scratch_gap = Some((internal_cursor, RUNTIME_SCRATCH_START));
-                        }
-                        internal_cursor = RUNTIME_SCRATCH_END;
+                }
+                if internal_cursor < RUNTIME_SCRATCH_END
+                    && internal_cursor.saturating_add(slot.size) > RUNTIME_SCRATCH_START
+                {
+                    if internal_cursor < RUNTIME_SCRATCH_START {
+                        scratch_gap = Some((internal_cursor, RUNTIME_SCRATCH_START));
                     }
-                    let location = Location {
-                        address: internal_cursor,
-                        size: request.size,
-                        zero_page: false,
-                    };
-                    internal_cursor = internal_cursor.saturating_add(request.size);
-                    location
-                },
-                |start| {
-                    available[start..start + usize::from(request.size)].fill(false);
-                    zero_page_used += usize::from(request.size);
-                    Location {
-                        address: start as u16,
-                        size: request.size,
-                        zero_page: true,
-                    }
-                },
-            );
-            if let RequestKey::Value(function, value) = request.key {
-                reusable_value_slots.push(ReusableValueSlot {
-                    function,
-                    location,
-                    occupants: vec![value],
-                });
-            }
-            location
-        };
+                    internal_cursor = RUNTIME_SCRATCH_END;
+                }
+                let location = Location {
+                    address: internal_cursor,
+                    size: slot.size,
+                    zero_page: false,
+                };
+                internal_cursor = internal_cursor.saturating_add(slot.size);
+                location
+            },
+            |start| {
+                available[start..start + usize::from(slot.size)].fill(false);
+                zero_page_used += usize::from(slot.size);
+                Location {
+                    address: start as u16,
+                    size: slot.size,
+                    zero_page: true,
+                }
+            },
+        );
         if location.address.saturating_add(location.size) > 0x0800 {
             return Err(vec![CodegenError {
                 message: "compiler storage exceeds the 2 KiB internal RAM capacity".to_owned(),
                 span: None,
             }]);
         }
-        match request.key {
-            RequestKey::Global(global) => globals[global.0 as usize] = location,
-            RequestKey::Local(function, local) => {
-                locals.insert((function, local), location);
+        for request in slot.occupants {
+            match request.key {
+                RequestKey::Global(global) => globals[global.0 as usize] = location,
+                RequestKey::Local(function, local) => {
+                    locals.insert((function, local), location);
+                }
+                RequestKey::Value(function, value) => {
+                    values.insert((function, value), location);
+                }
             }
-            RequestKey::Value(function, value) => {
-                values.insert((function, value), location);
-            }
+            entries.push(AllocationEntry {
+                name: request.name,
+                location,
+                access_weight: request.accesses,
+            });
         }
-        entries.push(AllocationEntry {
-            name: request.name,
-            location,
-            access_weight: request.accesses,
-        });
     }
 
     Ok(Allocation {
@@ -350,26 +317,123 @@ pub(crate) fn allocate(
     })
 }
 
-fn value_interferences(function: &Function) -> Vec<BTreeSet<ValueId>> {
-    let value_count = function.value_types.len();
+fn form_storage_slots(
+    mut requests: Vec<Request>,
+    analyses: &HashMap<FunctionId, FunctionStorageAnalysis>,
+    strategy: ZeroPageStrategy,
+) -> Vec<StorageSlot> {
+    requests.sort_by_key(|request| {
+        let degree = request_function(request.key)
+            .and_then(|function| analyses.get(&function))
+            .and_then(|analysis| analysis.interferences.get(&request.key))
+            .map_or(0, BTreeSet::len);
+        (
+            Reverse(degree),
+            Reverse(spill_cost(request.accesses, request.size, strategy)),
+        )
+    });
+
+    let mut slots = Vec::<StorageSlot>::new();
+    for request in requests {
+        let function = request_function(request.key);
+        let analysis = function.and_then(|function| analyses.get(&function));
+        let reusable = analysis.is_some_and(|analysis| analysis.reusable.contains(&request.key));
+        let reusable_slot = if reusable {
+            slots.iter().position(|slot| {
+                slot.function == function
+                    && slot.size == request.size
+                    && slot.occupants.iter().all(|occupant| {
+                        !analysis.is_some_and(|analysis| {
+                            analysis
+                                .interferences
+                                .get(&request.key)
+                                .is_some_and(|neighbors| neighbors.contains(&occupant.key))
+                        })
+                    })
+            })
+        } else {
+            None
+        };
+        if let Some(index) = reusable_slot {
+            let slot = &mut slots[index];
+            slot.access_weight = slot.access_weight.saturating_add(request.accesses);
+            slot.occupants.push(request);
+        } else {
+            slots.push(StorageSlot {
+                function: reusable.then_some(function).flatten(),
+                size: request.size,
+                access_weight: request.accesses,
+                occupants: vec![request],
+            });
+        }
+    }
+    slots.sort_by_key(|slot| Reverse(spill_cost(slot.access_weight, slot.size, strategy)));
+    slots
+}
+
+fn spill_cost(access_weight: u32, size: u16, strategy: ZeroPageStrategy) -> u64 {
+    match strategy {
+        ZeroPageStrategy::Frequency => u64::from(access_weight),
+        ZeroPageStrategy::Cycles => u64::from(access_weight) * u64::from(size),
+    }
+}
+
+fn request_function(key: RequestKey) -> Option<FunctionId> {
+    match key {
+        RequestKey::Local(function, _) | RequestKey::Value(function, _) => Some(function),
+        RequestKey::Global(_) => None,
+    }
+}
+
+fn analyze_function_storage(function: &Function) -> FunctionStorageAnalysis {
+    let mut pinned_locals = function
+        .locals
+        .iter()
+        .filter(|local| {
+            local.parameter || local.ty.is_volatile || !local.ty.array_lengths.is_empty()
+        })
+        .map(|local| local.id)
+        .collect::<BTreeSet<_>>();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let InstructionKind::AddressOfLocal(local) = instruction.kind {
+                pinned_locals.insert(local);
+            }
+        }
+    }
+
+    let mut reusable = function
+        .locals
+        .iter()
+        .filter(|local| !pinned_locals.contains(&local.id))
+        .map(|local| RequestKey::Local(function.id, local.id))
+        .collect::<BTreeSet<_>>();
+    reusable.extend(
+        function
+            .value_types
+            .iter()
+            .enumerate()
+            .map(|(index, _)| RequestKey::Value(function.id, ValueId(index as u32))),
+    );
+
     let mut uses = vec![BTreeSet::new(); function.blocks.len()];
     let mut definitions = vec![BTreeSet::new(); function.blocks.len()];
     for block in &function.blocks {
         let index = block.id.0 as usize;
         for instruction in &block.instructions {
-            for value in instruction_operands(&instruction.kind) {
-                if !definitions[index].contains(&value) {
-                    uses[index].insert(value);
+            let (instruction_uses, instruction_definitions) =
+                instruction_storage(function.id, instruction, &reusable);
+            for key in instruction_uses {
+                if !definitions[index].contains(&key) {
+                    uses[index].insert(key);
                 }
             }
-            if let Some(result) = instruction.result {
-                definitions[index].insert(result);
-            }
+            definitions[index].extend(instruction_definitions);
         }
         if let Some(terminator) = &block.terminator {
-            for value in terminator_operands(terminator) {
-                if !definitions[index].contains(&value) {
-                    uses[index].insert(value);
+            for key in terminator_storage(function.id, terminator) {
+                if !definitions[index].contains(&key) {
+                    uses[index].insert(key);
                 }
             }
         }
@@ -400,26 +464,78 @@ fn value_interferences(function: &Function) -> Vec<BTreeSet<ValueId>> {
         }
     }
 
-    let mut interferences = vec![BTreeSet::new(); value_count];
+    let mut interferences = reusable
+        .iter()
+        .copied()
+        .map(|key| (key, BTreeSet::new()))
+        .collect::<HashMap<_, _>>();
     for block in &function.blocks {
         let mut live = live_out[block.id.0 as usize].clone();
         if let Some(terminator) = &block.terminator {
-            let operands = terminator_operands(terminator);
-            connect_simultaneous_values(&mut interferences, &operands, &live);
-            live.extend(operands);
+            let term_uses = terminator_storage(function.id, terminator);
+            connect_uses(&mut interferences, &term_uses, &live);
+            live.extend(term_uses);
         }
         for instruction in block.instructions.iter().rev() {
-            let operands = instruction_operands(&instruction.kind);
-            if let Some(result) = instruction.result {
-                connect_value_to_set(&mut interferences, result, &live);
-                connect_value_to_values(&mut interferences, result, &operands);
-                live.remove(&result);
+            let (instruction_uses, instruction_definitions) =
+                instruction_storage(function.id, instruction, &reusable);
+            for definition in &instruction_definitions {
+                connect_key_to_set(&mut interferences, *definition, &live);
+                connect_key_to_keys(&mut interferences, *definition, &instruction_uses);
+                connect_key_to_keys(&mut interferences, *definition, &instruction_definitions);
             }
-            connect_simultaneous_values(&mut interferences, &operands, &live);
-            live.extend(operands);
+            for definition in &instruction_definitions {
+                live.remove(definition);
+            }
+            connect_uses(&mut interferences, &instruction_uses, &live);
+            live.extend(instruction_uses);
         }
     }
-    interferences
+    FunctionStorageAnalysis {
+        reusable,
+        interferences,
+    }
+}
+
+fn instruction_storage(
+    function: FunctionId,
+    instruction: &Instruction,
+    reusable: &BTreeSet<RequestKey>,
+) -> (Vec<RequestKey>, Vec<RequestKey>) {
+    let uses = instruction_operands(&instruction.kind)
+        .into_iter()
+        .map(|value| RequestKey::Value(function, value))
+        .collect::<Vec<_>>();
+    let mut definitions = instruction
+        .result
+        .map(|value| vec![RequestKey::Value(function, value)])
+        .unwrap_or_default();
+    let mut uses = uses;
+    match &instruction.kind {
+        InstructionKind::LoadLocal(local) => {
+            let key = RequestKey::Local(function, *local);
+            if reusable.contains(&key) {
+                uses.push(key);
+            }
+        }
+        InstructionKind::StoreLocal { local, .. } => {
+            let key = RequestKey::Local(function, *local);
+            if reusable.contains(&key) {
+                definitions.push(key);
+            }
+        }
+        InstructionKind::InlineAssembly(assembly) => {
+            definitions.extend(assembly.outputs.iter().filter_map(|output| {
+                let nesc_mir::AssemblyOutputTarget::Local(local) = output.target else {
+                    return None;
+                };
+                let key = RequestKey::Local(function, local);
+                reusable.contains(&key).then_some(key)
+            }));
+        }
+        _ => {}
+    }
+    (uses, definitions)
 }
 
 fn instruction_operands(kind: &InstructionKind) -> Vec<ValueId> {
@@ -451,10 +567,12 @@ fn instruction_operands(kind: &InstructionKind) -> Vec<ValueId> {
     }
 }
 
-fn terminator_operands(terminator: &Terminator) -> Vec<ValueId> {
+fn terminator_storage(function: FunctionId, terminator: &Terminator) -> Vec<RequestKey> {
     match terminator {
-        Terminator::Branch { condition, .. } => vec![*condition],
-        Terminator::Return(Some(value)) => vec![*value],
+        Terminator::Branch { condition, .. } => {
+            vec![RequestKey::Value(function, *condition)]
+        }
+        Terminator::Return(Some(value)) => vec![RequestKey::Value(function, *value)],
         Terminator::Jump(_) | Terminator::Return(None) | Terminator::Unreachable => Vec::new(),
     }
 }
@@ -471,45 +589,53 @@ fn terminator_successors(terminator: &Terminator) -> Vec<nesc_mir::BlockId> {
     }
 }
 
-fn connect_simultaneous_values(
-    interferences: &mut [BTreeSet<ValueId>],
-    values: &[ValueId],
-    live: &BTreeSet<ValueId>,
+fn connect_uses(
+    interferences: &mut HashMap<RequestKey, BTreeSet<RequestKey>>,
+    keys: &[RequestKey],
+    live: &BTreeSet<RequestKey>,
 ) {
-    for value in values {
-        connect_value_to_set(interferences, *value, live);
+    for key in keys {
+        connect_key_to_set(interferences, *key, live);
     }
-    for (index, value) in values.iter().enumerate() {
-        connect_value_to_values(interferences, *value, &values[index + 1..]);
+    for (index, key) in keys.iter().enumerate() {
+        connect_key_to_keys(interferences, *key, &keys[index + 1..]);
     }
 }
 
-fn connect_value_to_set(
-    interferences: &mut [BTreeSet<ValueId>],
-    value: ValueId,
-    others: &BTreeSet<ValueId>,
-) {
-    for other in others {
-        connect_values(interferences, value, *other);
-    }
-}
-
-fn connect_value_to_values(
-    interferences: &mut [BTreeSet<ValueId>],
-    value: ValueId,
-    others: &[ValueId],
+fn connect_key_to_set(
+    interferences: &mut HashMap<RequestKey, BTreeSet<RequestKey>>,
+    key: RequestKey,
+    others: &BTreeSet<RequestKey>,
 ) {
     for other in others {
-        connect_values(interferences, value, *other);
+        connect_keys(interferences, key, *other);
     }
 }
 
-fn connect_values(interferences: &mut [BTreeSet<ValueId>], left: ValueId, right: ValueId) {
+fn connect_key_to_keys(
+    interferences: &mut HashMap<RequestKey, BTreeSet<RequestKey>>,
+    key: RequestKey,
+    others: &[RequestKey],
+) {
+    for other in others {
+        connect_keys(interferences, key, *other);
+    }
+}
+
+fn connect_keys(
+    interferences: &mut HashMap<RequestKey, BTreeSet<RequestKey>>,
+    left: RequestKey,
+    right: RequestKey,
+) {
     if left == right {
         return;
     }
-    interferences[left.0 as usize].insert(right);
-    interferences[right.0 as usize].insert(left);
+    if let Some(neighbors) = interferences.get_mut(&left) {
+        neighbors.insert(right);
+    }
+    if let Some(neighbors) = interferences.get_mut(&right) {
+        neighbors.insert(left);
+    }
 }
 
 fn access_counts(module: &Module) -> AccessCounts {
@@ -638,21 +764,35 @@ fn find_zero_page(available: &[bool; 256], size: u16) -> Option<usize> {
 
 pub(crate) fn render_report(allocation: &Allocation) -> String {
     let mut report = String::from("Zero-page allocation\n--------------------\n");
+    let mut slots = BTreeMap::<(u16, u16), Vec<&AllocationEntry>>::new();
     for entry in allocation
         .entries
         .iter()
         .filter(|entry| entry.location.zero_page)
     {
-        let end = entry.location.address + entry.location.size - 1;
-        if end == entry.location.address {
+        slots
+            .entry((entry.location.address, entry.location.size))
+            .or_default()
+            .push(entry);
+    }
+    for ((address, size), occupants) in slots {
+        let end = address + size - 1;
+        let names = occupants
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let access_weight = occupants.iter().fold(0_u32, |total, entry| {
+            total.saturating_add(entry.access_weight)
+        });
+        let shared = if occupants.len() > 1 { ", shared" } else { "" };
+        if end == address {
             report.push_str(&format!(
-                "${:02X}      {} (weight {})\n",
-                entry.location.address, entry.name, entry.access_weight
+                "${address:02X}      {names} (weight {access_weight}{shared})\n"
             ));
         } else {
             report.push_str(&format!(
-                "${:02X}-${end:02X} {} (weight {})\n",
-                entry.location.address, entry.name, entry.access_weight
+                "${address:02X}-${end:02X} {names} (weight {access_weight}{shared})\n"
             ));
         }
     }
@@ -665,6 +805,8 @@ pub(crate) fn render_report(allocation: &Allocation) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use nesc_mir::{
         BankPlacement, BasicBlock, BinaryOperator, BlockId, Effect, Function, FunctionId,
         Instruction, InstructionKind, Local, LocalId, Module, SourceId, SourceSpan, Terminator,
@@ -672,8 +814,9 @@ mod tests {
     };
 
     use super::{
-        BackendConfig, RUNTIME_SCRATCH_END, RUNTIME_SCRATCH_START, SHADOW_OAM_END, ZeroPageRange,
-        access_counts, allocate,
+        BackendConfig, RUNTIME_SCRATCH_END, RUNTIME_SCRATCH_START, Request, RequestKey,
+        SHADOW_OAM_END, ZeroPageRange, ZeroPageStrategy, access_counts, allocate,
+        form_storage_slots, render_report,
     };
 
     #[test]
@@ -846,6 +989,253 @@ mod tests {
             allocation.values[&(FunctionId(0), ValueId(0))].address,
             allocation.values[&(FunctionId(0), ValueId(1))].address
         );
+    }
+
+    #[test]
+    fn reuses_storage_for_nonoverlapping_source_locals() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "locals".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: ty.clone(),
+                parameters: Vec::new(),
+                locals: vec![
+                    Local {
+                        id: LocalId(0),
+                        name: "first".to_owned(),
+                        ty: ty.clone(),
+                        parameter: false,
+                    },
+                    Local {
+                        id: LocalId(1),
+                        name: "second".to_owned(),
+                        ty: ty.clone(),
+                        parameter: false,
+                    },
+                ],
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::Constant(1),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: None,
+                            kind: InstructionKind::StoreLocal {
+                                local: LocalId(0),
+                                value: ValueId(0),
+                            },
+                            effect: Effect::Write,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(1)),
+                            kind: InstructionKind::LoadLocal(LocalId(0)),
+                            effect: Effect::Read,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(2)),
+                            kind: InstructionKind::Constant(2),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: None,
+                            kind: InstructionKind::StoreLocal {
+                                local: LocalId(1),
+                                value: ValueId(2),
+                            },
+                            effect: Effect::Write,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(3)),
+                            kind: InstructionKind::LoadLocal(LocalId(1)),
+                            effect: Effect::Read,
+                            span,
+                        },
+                    ],
+                    terminator: Some(Terminator::Return(Some(ValueId(3)))),
+                }],
+                value_types: vec![ty.clone(), ty.clone(), ty.clone(), ty],
+            }],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("source-local reuse");
+
+        assert_eq!(
+            allocation.locals[&(FunctionId(0), LocalId(0))].address,
+            allocation.locals[&(FunctionId(0), LocalId(1))].address
+        );
+    }
+
+    #[test]
+    fn pins_parameters_and_address_taken_locals() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let pointer = Type {
+            pointer_depth: 1,
+            ..ty.clone()
+        };
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "pinned".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: pointer.clone(),
+                parameters: vec![LocalId(0)],
+                locals: vec![
+                    Local {
+                        id: LocalId(0),
+                        name: "parameter".to_owned(),
+                        ty: ty.clone(),
+                        parameter: true,
+                    },
+                    Local {
+                        id: LocalId(1),
+                        name: "addressed".to_owned(),
+                        ty,
+                        parameter: false,
+                    },
+                ],
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![Instruction {
+                        result: Some(ValueId(0)),
+                        kind: InstructionKind::AddressOfLocal(LocalId(1)),
+                        effect: Effect::Pure,
+                        span,
+                    }],
+                    terminator: Some(Terminator::Return(Some(ValueId(0)))),
+                }],
+                value_types: vec![pointer],
+            }],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("pinned allocation");
+        let parameter = allocation.locals[&(FunctionId(0), LocalId(0))];
+        let addressed = allocation.locals[&(FunctionId(0), LocalId(1))];
+
+        assert_ne!(parameter.address, addressed.address);
+        assert_ne!(
+            addressed.address,
+            allocation.values[&(FunctionId(0), ValueId(0))].address
+        );
+    }
+
+    #[test]
+    fn aggregates_shared_slot_cost_before_zero_page_placement() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let mut instructions = Vec::new();
+        for value in 0..3 {
+            instructions.push(Instruction {
+                result: Some(ValueId(value)),
+                kind: InstructionKind::LoadGlobal(nesc_mir::GlobalId(0)),
+                effect: Effect::Read,
+                span,
+            });
+        }
+        for value in 3..7 {
+            instructions.push(Instruction {
+                result: Some(ValueId(value)),
+                kind: InstructionKind::Constant(u64::from(value)),
+                effect: Effect::Pure,
+                span,
+            });
+        }
+        let module = Module {
+            globals: vec![ty.clone()],
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "aggregate".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: Type::scalar(TypeKind::Void),
+                parameters: Vec::new(),
+                locals: Vec::new(),
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions,
+                    terminator: Some(Terminator::Return(None)),
+                }],
+                value_types: vec![ty; 7],
+            }],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: vec![ZeroPageRange { start: 2, end: 2 }],
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("aggregate spill cost");
+
+        assert!(!allocation.globals[0].zero_page);
+        for value in 0..7 {
+            assert!(allocation.values[&(FunctionId(0), ValueId(value))].zero_page);
+        }
+        assert_eq!(allocation.zero_page_used, 1);
+        assert!(render_report(&allocation).contains("(weight 7, shared)"));
+    }
+
+    #[test]
+    fn spill_strategies_make_distinct_width_tradeoffs() {
+        let requests = || {
+            vec![
+                Request {
+                    key: RequestKey::Global(nesc_mir::GlobalId(0)),
+                    name: "frequent-byte".to_owned(),
+                    size: 1,
+                    accesses: 5,
+                },
+                Request {
+                    key: RequestKey::Global(nesc_mir::GlobalId(1)),
+                    name: "cycle-heavy-word".to_owned(),
+                    size: 2,
+                    accesses: 3,
+                },
+            ]
+        };
+        let analyses = HashMap::new();
+
+        let frequency = form_storage_slots(requests(), &analyses, ZeroPageStrategy::Frequency);
+        let cycles = form_storage_slots(requests(), &analyses, ZeroPageStrategy::Cycles);
+
+        assert!(matches!(
+            frequency[0].occupants[0].key,
+            RequestKey::Global(nesc_mir::GlobalId(0))
+        ));
+        assert!(matches!(
+            cycles[0].occupants[0].key,
+            RequestKey::Global(nesc_mir::GlobalId(1))
+        ));
     }
 
     #[test]
