@@ -22,9 +22,12 @@ ROM. The toolkit is written in stable Rust 2024.
 ## Highlights
 
 - Preprocessing, parsing, semantic analysis, typed HIR, verified MIR, and safe
-  optimization passes
+  optimization passes with inter-block constant propagation and natural-loop
+  analysis
 - Ricoh 2A03/2A07 code generation with a stable `nescall` ABI, zero-page
-  allocation, stack reports, and reference-driven arithmetic helpers
+  allocation weighted by loop frequency, stack reports, profile-driven
+  arithmetic selection, hot fall-through placement, branch relaxation, and
+  auditable size/cycle estimates
 - Fixed arrays, pointer arithmetic, typed CPU-bus address spaces, volatile
   indirect access, and configurable bounds checks
 - Verified `NES_ASM` blocks with register operands, explicit clobbers, symbolic
@@ -49,9 +52,12 @@ ROM. The toolkit is written in stable Rust 2024.
 - DMC sample playback with regional rates, bounded DAC updates, address
   wrapping, looping, IRQs, four-clock traced CPU stalls, and OAM DMA
   arbitration
-- `nesc new`, `nesc check`, `nesc build`, `nesc inspect`, Mapper 0/2/3
+- `nesc new`, `nesc check`, `nesc build`, `nesc run`, `nesc inspect`, Mapper 0/2/3
   `nesc test`, `nesc disassemble`, `nesc decompile --emit=nesc`, and
   `nesc decompile --emit=rust` workflows
+- Deterministic `nesc run` frame execution that renders a ROM to a palette-index
+  framebuffer and emits dependency-free PNG/PPM frame images, per-frame
+  framebuffer hashes, and applies a per-frame controller-input script
 - Emulator-backed `NES_TEST` discovery with independently linked test ROMs,
   typed single-evaluation `NES_ASSERT_EQ`, source-attached failures, per-test
   cycle budgets, name filtering, and bounded NTSC/PAL/Dendy execution
@@ -89,6 +95,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | Emulator-backed `nesc test` discovery, assertions, filtering, and execution | Available |
 | NesC preprocessing and parsing | Available |
 | HIR, MIR, verification, and optimization | Available |
+| Profile-specific MIR pipelines and 6502 sequence cost reports | Available |
+| Inter-block constant propagation and loop-weighted zero-page allocation | Available |
+| Frequency-guided block placement, branch inversion, and branch relaxation | Available |
 | Target-specific inline 6502 assembly | Available |
 | Standalone relocatable 6502 assembly modules | Available |
 | 6502 code generation and Mapper 0/2/3 linking | Available |
@@ -106,6 +115,9 @@ ROM. The toolkit is written in stable Rust 2024.
 | CPU-cycle stepping and NTSC/PAL/Dendy PPU beam position | Available |
 | Per-clock official CPU bus operations, dummy accesses, interrupts, and OAM DMA | Available |
 | PPU background/sprite rendering and palette-index framebuffer | Available |
+| Deterministic `nesc run` frame execution with PNG/PPM export, framebuffer hashing, and scripted controller input | Available |
+| Deterministic APU audio capture with WAV export (`nesc run --wav`) | Available |
+| Visual `nesc debug` framebuffer, sprite/OAM, nametable, and palette inspection | Available |
 | PPU I/O latch, vblank/NMI boundary behavior, and rendering-time OAM restrictions | Available |
 | PPU background fetch pipeline, secondary OAM, timed sprite fetches, and overflow bug | Available |
 | APU pulse, triangle, noise, frame-counter, and IRQ timing | Available |
@@ -122,6 +134,8 @@ cargo run -p nesc-cli -- new demo
 cd demo
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- check
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- build
+cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
+  run target/demo.nes --frames 3 --hash --png --out target/frames
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
   disassemble target/demo.nes --round-trip-check
 cargo run --manifest-path ../Cargo.toml -p nesc-cli -- \
@@ -158,6 +172,38 @@ demo/
 └── src/
     └── main.c
 ```
+
+## Running and viewing frames
+
+`nesc run` executes a built `.nes` ROM in the deterministic emulator, renders
+whole video frames, and emits the results for inspection and regression testing:
+
+```bash
+nesc run target/demo.nes --frames 3 --hash --png --out target/frames
+nesc run target/demo.nes --frames 120 --input inputs.txt --png --out target/play
+nesc run target/demo.nes --region pal --ppm --out target/frames
+```
+
+- `--frames N` renders `N` frames (default `1`).
+- `--png` / `--ppm` write dependency-free `frame.png` / `frame.ppm` (single frame)
+  or `frame-000.png…` (multiple frames) into `--out`; `--png` is the default when
+  `--out` is set with neither flag.
+- `--hash` prints one deterministic `frame <i>: <checksum>` line per frame, for
+  golden-frame regression checks.
+- `--region ntsc|pal|dendy` overrides the ROM's declared timing.
+- `--input FILE` applies a per-frame controller script: one line per frame,
+  `P1 P2`, where each port field is `-` for none or letters from
+  `A B S(elect) T(=sTart) U D L R` (for example `RA -` holds Right+A on port 1).
+- `--wav` captures deterministic APU audio and writes `audio.wav` to `--out`.
+
+Rendering, framebuffer hashing, frame stepping, and audio capture are
+deterministic across runs and regions, so `--hash` output and captured audio are
+stable and suitable for committed goldens.
+
+The interactive `nesc debug` ROM debugger adds visual inspection over the running
+machine: `framebuffer <path>` writes the current frame as PNG (or PPM by
+extension), and `oam`, `nametable`, and `palette` dump the sprite list, the
+nametable-0 tile map, and the active palette with its RGB colors.
 
 ## Emulator-backed tests
 
@@ -489,6 +535,18 @@ The checker rejects unsafe entry paths, missing source files, unsupported
 compiler cartridge layouts, invalid NROM capacities, overlapping zero-page
 ranges, malformed versions, invalid stack limits, and source-level type errors.
 
+Optimization accepts `"0"`, `"1"`, `"2"`, `"size"`, `"min-size"`, and
+`"cycles"`. The stronger MIR settings propagate predecessor-agreed local
+constants, simplify constant branches, and remove dead pure values. Natural
+loop depth supplies relative execution weights to zero-page placement.
+Size-oriented code generation can reuse an arithmetic helper that is already
+required elsewhere, while cycle-oriented code generation keeps constant shifts
+inline. The backend places hot CFG successors as fall-throughs, inverts a
+conditional when its true edge becomes the fall-through, removes redundant
+jumps, and expands any relative branch outside the signed 8-bit range. Each
+build writes an `.optimization` report beside the ROM, assembly, map, symbols,
+source map, zero-page report, and stack report.
+
 ## Workspace
 
 The workspace separates frontend, intermediate representation, optimization,
@@ -524,7 +582,8 @@ CI runs the same commands on pushes and pull requests.
 
 ## Next work
 
-1. Expand optimization quality and generated-code cost modeling
+1. Extend zero-page selection with reusable-slot and spill costs
+2. Add accumulator forwarding, register reuse, and flag-liveness optimization
 
 ## License
 
