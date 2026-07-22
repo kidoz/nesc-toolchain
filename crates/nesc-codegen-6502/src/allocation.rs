@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use nesc_mir::{FunctionId, GlobalId, InstructionKind, LocalId, Module, Terminator, Type, ValueId};
 
-use crate::CodegenError;
+use crate::{CodegenError, CodegenGoal};
 
 /// First internal-RAM byte reserved for arithmetic runtime helpers.
 pub const RUNTIME_SCRATCH_START: u16 = 0x0700;
@@ -31,6 +31,8 @@ pub enum ZeroPageStrategy {
 /// Target resource settings for code generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendConfig {
+    /// Instruction-selection preference.
+    pub goal: CodegenGoal,
     /// Addresses the compiler may allocate.
     pub zero_page_available: Vec<ZeroPageRange>,
     /// Addresses excluded even when they overlap an available range.
@@ -46,6 +48,7 @@ pub struct BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
+            goal: CodegenGoal::Balanced,
             zero_page_available: vec![ZeroPageRange {
                 start: 0x00,
                 end: 0xef,
@@ -79,6 +82,8 @@ pub struct AllocationEntry {
     pub name: String,
     /// Assigned location.
     pub location: Location,
+    /// Loop-weighted number of expected storage accesses.
+    pub access_weight: u32,
 }
 
 /// Complete deterministic storage allocation.
@@ -255,6 +260,7 @@ pub(crate) fn allocate(
         entries.push(AllocationEntry {
             name: request.name,
             location,
+            access_weight: request.accesses,
         });
     }
 
@@ -273,67 +279,73 @@ fn access_counts(module: &Module) -> AccessCounts {
     let mut locals = HashMap::new();
     let mut values = HashMap::new();
     for function in &module.functions {
+        let control_flow = nesc_opt::analyze_control_flow(function);
         for block in &function.blocks {
+            let weight = control_flow.block_frequency(block.id);
             for instruction in &block.instructions {
                 if let Some(result) = instruction.result {
-                    bump(&mut values, (function.id, result));
+                    bump_by(&mut values, (function.id, result), weight);
                 }
                 match &instruction.kind {
                     InstructionKind::Constant(_) => {}
                     InstructionKind::LoadLocal(local) => {
-                        bump(&mut locals, (function.id, *local));
+                        bump_by(&mut locals, (function.id, *local), weight);
                     }
                     InstructionKind::StoreLocal { local, value } => {
-                        bump(&mut locals, (function.id, *local));
-                        bump(&mut values, (function.id, *value));
+                        bump_by(&mut locals, (function.id, *local), weight);
+                        bump_by(&mut values, (function.id, *value), weight);
                     }
-                    InstructionKind::LoadGlobal(global) => bump(&mut globals, *global),
+                    InstructionKind::LoadGlobal(global) => {
+                        bump_by(&mut globals, *global, weight);
+                    }
                     InstructionKind::StoreGlobal { global, value } => {
-                        bump(&mut globals, *global);
-                        bump(&mut values, (function.id, *value));
+                        bump_by(&mut globals, *global, weight);
+                        bump_by(&mut values, (function.id, *value), weight);
                     }
                     InstructionKind::AddressOfLocal(local) => {
-                        bump(&mut locals, (function.id, *local));
+                        bump_by(&mut locals, (function.id, *local), weight);
                     }
-                    InstructionKind::AddressOfGlobal(global) => bump(&mut globals, *global),
+                    InstructionKind::AddressOfGlobal(global) => {
+                        bump_by(&mut globals, *global, weight);
+                    }
                     InstructionKind::BoundsCheck { index, .. }
                     | InstructionKind::LoadIndirect { address: index, .. } => {
-                        bump(&mut values, (function.id, *index));
+                        bump_by(&mut values, (function.id, *index), weight);
                     }
                     InstructionKind::PointerOffset { base, offset, .. } => {
-                        bump(&mut values, (function.id, *base));
-                        bump(&mut values, (function.id, *offset));
+                        bump_by(&mut values, (function.id, *base), weight);
+                        bump_by(&mut values, (function.id, *offset), weight);
                     }
                     InstructionKind::StoreIndirect { address, value, .. } => {
-                        bump(&mut values, (function.id, *address));
-                        bump(&mut values, (function.id, *value));
+                        bump_by(&mut values, (function.id, *address), weight);
+                        bump_by(&mut values, (function.id, *value), weight);
                     }
                     InstructionKind::Unary { operand, .. } => {
-                        bump(&mut values, (function.id, *operand));
+                        bump_by(&mut values, (function.id, *operand), weight);
                     }
                     InstructionKind::Binary { left, right, .. } => {
-                        bump(&mut values, (function.id, *left));
-                        bump(&mut values, (function.id, *right));
+                        bump_by(&mut values, (function.id, *left), weight);
+                        bump_by(&mut values, (function.id, *right), weight);
                     }
                     InstructionKind::Cast { value, .. } => {
-                        bump(&mut values, (function.id, *value));
+                        bump_by(&mut values, (function.id, *value), weight);
                     }
                     InstructionKind::Call { arguments, .. } => {
                         for argument in arguments {
-                            bump(&mut values, (function.id, *argument));
+                            bump_by(&mut values, (function.id, *argument), weight);
                         }
                     }
                     InstructionKind::InlineAssembly(assembly) => {
                         for input in &assembly.inputs {
-                            bump(&mut values, (function.id, input.value));
+                            bump_by(&mut values, (function.id, input.value), weight);
                         }
                         for output in &assembly.outputs {
                             match output.target {
                                 nesc_mir::AssemblyOutputTarget::Local(local) => {
-                                    bump(&mut locals, (function.id, local));
+                                    bump_by(&mut locals, (function.id, local), weight);
                                 }
                                 nesc_mir::AssemblyOutputTarget::Global(global) => {
-                                    bump(&mut globals, global);
+                                    bump_by(&mut globals, global, weight);
                                 }
                             }
                         }
@@ -342,10 +354,10 @@ fn access_counts(module: &Module) -> AccessCounts {
             }
             match &block.terminator {
                 Some(Terminator::Branch { condition, .. }) => {
-                    bump(&mut values, (function.id, *condition));
+                    bump_by(&mut values, (function.id, *condition), weight);
                 }
                 Some(Terminator::Return(Some(value))) => {
-                    bump(&mut values, (function.id, *value));
+                    bump_by(&mut values, (function.id, *value), weight);
                 }
                 _ => {}
             }
@@ -358,9 +370,12 @@ fn access_counts(module: &Module) -> AccessCounts {
     }
 }
 
-fn bump<Key: Eq + std::hash::Hash>(counts: &mut HashMap<Key, u32>, key: Key) {
+fn bump_by<Key: Eq + std::hash::Hash>(counts: &mut HashMap<Key, u32>, key: Key, weight: u32) {
+    if weight == 0 {
+        return;
+    }
     let count = counts.entry(key).or_default();
-    *count = count.saturating_add(1);
+    *count = count.saturating_add(weight);
 }
 
 pub(crate) fn type_size(ty: &Type) -> u16 {
@@ -393,13 +408,13 @@ pub(crate) fn render_report(allocation: &Allocation) -> String {
         let end = entry.location.address + entry.location.size - 1;
         if end == entry.location.address {
             report.push_str(&format!(
-                "${:02X}      {}\n",
-                entry.location.address, entry.name
+                "${:02X}      {} (weight {})\n",
+                entry.location.address, entry.name, entry.access_weight
             ));
         } else {
             report.push_str(&format!(
-                "${:02X}-${end:02X} {}\n",
-                entry.location.address, entry.name
+                "${:02X}-${end:02X} {} (weight {})\n",
+                entry.location.address, entry.name, entry.access_weight
             ));
         }
     }

@@ -11,6 +11,7 @@ publish = false
 nesc-asm = { path = "../nesc-asm" }
 nesc-mir = { path = "../nesc-mir" }
 nesc-object = { path = "../nesc-object" }
+nesc-opt = { path = "../nesc-opt" }
 
 [lints]
 workspace = true

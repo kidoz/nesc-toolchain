@@ -228,6 +228,7 @@ dependencies = [
  "nesc-asm",
  "nesc-mir",
  "nesc-object",
+ "nesc-opt",
 ]
 
 [[package]]

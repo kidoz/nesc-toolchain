@@ -2,9 +2,11 @@
 
 mod abi;
 mod allocation;
+mod cost;
+mod layout;
 mod stack;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -26,6 +28,7 @@ pub use allocation::{
     AllocationEntry, BackendConfig, Location, RUNTIME_SCRATCH_END, RUNTIME_SCRATCH_START,
     ZeroPageRange, ZeroPageStrategy,
 };
+pub use cost::{CodegenGoal, SequenceCost};
 pub use stack::StackReport;
 
 /// Result of 6502 instruction selection.
@@ -39,6 +42,8 @@ pub struct GeneratedCode {
     pub zero_page_report: String,
     /// Deterministic hardware-stack report.
     pub stack_report: String,
+    /// Auditable instruction-selection decisions and their estimated costs.
+    pub optimization_report: String,
     /// Structured hardware-stack analysis.
     pub stack: StackReport,
 }
@@ -59,6 +64,181 @@ impl fmt::Display for CodegenError {
 }
 
 impl Error for CodegenError {}
+
+fn arithmetic_helper_name(operator: BinaryOperator, signed: bool, bits: u16) -> Option<String> {
+    match operator {
+        BinaryOperator::Multiply => Some(format!("__nesc_mul_{bits}")),
+        BinaryOperator::Divide => Some(format!(
+            "__nesc_{}div_{bits}",
+            if signed { "s" } else { "u" }
+        )),
+        BinaryOperator::Remainder => Some(format!(
+            "__nesc_{}rem_{bits}",
+            if signed { "s" } else { "u" }
+        )),
+        BinaryOperator::ShiftLeft => Some(format!("__nesc_shl_{bits}")),
+        BinaryOperator::ShiftRight if signed => Some(format!("__nesc_ashr_{bits}")),
+        BinaryOperator::ShiftRight => Some(format!("__nesc_lshr_{bits}")),
+        _ => None,
+    }
+}
+
+fn constant_arithmetic_is_self_contained(
+    operator: BinaryOperator,
+    signed: bool,
+    constant: u64,
+) -> bool {
+    match operator {
+        BinaryOperator::Multiply => constant == 0 || constant.is_power_of_two(),
+        BinaryOperator::Divide => constant == 0 || (!signed && constant.is_power_of_two()),
+        BinaryOperator::Remainder => constant == 0 || (!signed && constant.is_power_of_two()),
+        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => true,
+        _ => false,
+    }
+}
+
+fn required_arithmetic_helpers(
+    module: &Module,
+    constants: &HashMap<(u32, u32), u64>,
+) -> BTreeSet<String> {
+    let mut helpers = BTreeSet::new();
+    for function in &module.functions {
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            let InstructionKind::Binary {
+                operator,
+                left,
+                right,
+            } = instruction.kind
+            else {
+                continue;
+            };
+            let Some(result) = instruction.result else {
+                continue;
+            };
+            let bits = allocation::type_size(&function.value_types[result.0 as usize]) * 8;
+            if !(8..=32).contains(&bits) {
+                continue;
+            }
+            let left_type = &function.value_types[left.0 as usize];
+            let signed = left_type.pointer_depth == 0
+                && matches!(
+                    left_type.kind,
+                    TypeKind::Integer(integer) if integer.is_signed()
+                );
+            if constants
+                .get(&(function.id.0, right.0))
+                .is_some_and(|constant| {
+                    constant_arithmetic_is_self_contained(operator, signed, *constant)
+                })
+            {
+                continue;
+            }
+            if let Some(helper) = arithmetic_helper_name(operator, signed, bits) {
+                helpers.insert(helper);
+            }
+        }
+    }
+    helpers
+}
+
+fn add_instruction_cost(cost: &mut SequenceCost, bytes: u32, cycles: u32) {
+    cost.bytes = cost.bytes.saturating_add(bytes);
+    cost.base_cycles = cost.base_cycles.saturating_add(cycles);
+}
+
+fn location_instruction_cost(location: Location, read_modify_write: bool) -> (u32, u32) {
+    match (location.zero_page, read_modify_write) {
+        (true, false) => (2, 3),
+        (false, false) => (3, 4),
+        (true, true) => (2, 5),
+        (false, true) => (3, 6),
+    }
+}
+
+fn inline_shift_cost(
+    source: Location,
+    destination: Location,
+    count: u16,
+    operator: BinaryOperator,
+    signed: bool,
+) -> SequenceCost {
+    let mut cost = SequenceCost {
+        interrupt_safe: true,
+        ..SequenceCost::default()
+    };
+    let copied = source.size.min(destination.size);
+    for _ in 0..copied {
+        let (bytes, cycles) = location_instruction_cost(source, false);
+        add_instruction_cost(&mut cost, bytes, cycles);
+        let (bytes, cycles) = location_instruction_cost(destination, false);
+        add_instruction_cost(&mut cost, bytes, cycles);
+    }
+    for _ in copied..destination.size {
+        add_instruction_cost(&mut cost, 2, 2);
+        let (bytes, cycles) = location_instruction_cost(destination, false);
+        add_instruction_cost(&mut cost, bytes, cycles);
+    }
+    for _ in 0..count {
+        if operator == BinaryOperator::ShiftRight && signed {
+            let (bytes, cycles) = location_instruction_cost(destination, false);
+            add_instruction_cost(&mut cost, bytes, cycles);
+            add_instruction_cost(&mut cost, 1, 2);
+        }
+        for _ in 0..destination.size {
+            let (bytes, cycles) = location_instruction_cost(destination, true);
+            add_instruction_cost(&mut cost, bytes, cycles);
+        }
+    }
+    cost
+}
+
+fn helper_call_cost(
+    left: Location,
+    right: Location,
+    destination: Location,
+    operator: BinaryOperator,
+    constant: u16,
+) -> SequenceCost {
+    let mut cost = SequenceCost {
+        stack_bytes: 2,
+        interrupt_safe: true,
+        ..SequenceCost::default()
+    };
+    let arguments = [left, right]
+        .into_iter()
+        .flat_map(|location| (0..location.size).map(move |_| location))
+        .collect::<Vec<_>>();
+    for location in arguments.iter().skip(3) {
+        let (bytes, cycles) = location_instruction_cost(*location, false);
+        add_instruction_cost(&mut cost, bytes, cycles);
+        add_instruction_cost(&mut cost, 2, 3);
+    }
+    for location in arguments.iter().take(3) {
+        let (bytes, cycles) = location_instruction_cost(*location, false);
+        add_instruction_cost(&mut cost, bytes, cycles);
+    }
+    add_instruction_cost(&mut cost, 3, 6);
+    for _ in 0..destination.size.min(3) {
+        let (bytes, cycles) = location_instruction_cost(destination, false);
+        add_instruction_cost(&mut cost, bytes, cycles);
+    }
+    for _ in 3..destination.size {
+        add_instruction_cost(&mut cost, 2, 3);
+        let (bytes, cycles) = location_instruction_cost(destination, false);
+        add_instruction_cost(&mut cost, bytes, cycles);
+    }
+    let width = u32::from(destination.size);
+    let bits = width * 8;
+    cost.runtime_cycles = match operator {
+        BinaryOperator::Multiply => 48 + bits * (20 + 6 * width),
+        BinaryOperator::Divide => 64 + bits * (28 + 10 * width),
+        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
+            48 + bits * (18 + 5 * width) + u32::from(constant) * (6 + 5 * width)
+        }
+        _ => 0,
+    };
+    cost
+}
 
 /// Lowers verified MIR to a relocatable 6502 code section.
 ///
@@ -88,13 +268,28 @@ pub fn generate_with_config(
     let stack = stack::analyze(module, config.stack_limit, &config.external_stack_bytes)?;
     let zero_page_report = allocation::render_report(&allocation);
     let stack_report = stack::render_report(&stack);
-    let mut emitter = Emitter::new(module, allocation)?;
-    for function in &module.functions {
-        if !function.blocks.is_empty() {
-            emitter.function(function);
+    let mut long_branches = BTreeSet::new();
+    loop {
+        let mut emitter = Emitter::new(
+            module,
+            allocation.clone(),
+            config.goal,
+            long_branches.clone(),
+        )?;
+        for function in &module.functions {
+            if !function.blocks.is_empty() {
+                emitter.function(function);
+            }
         }
-    }
-    if emitter.errors.is_empty() {
+        if !emitter.errors.is_empty() {
+            return Err(emitter.errors);
+        }
+        let overflowing = emitter.out_of_range_branches()?;
+        if !overflowing.is_empty() {
+            long_branches.extend(overflowing);
+            continue;
+        }
+        emitter.finish_layout_report();
         emitter.object.validate().map_err(|errors| {
             errors
                 .into_iter()
@@ -104,16 +299,35 @@ pub fn generate_with_config(
                 })
                 .collect::<Vec<_>>()
         })?;
-        Ok(GeneratedCode {
+        return Ok(GeneratedCode {
             object: emitter.object,
             assembly: emitter.assembly,
             zero_page_report,
             stack_report,
+            optimization_report: emitter.optimization_report,
             stack,
-        })
-    } else {
-        Err(emitter.errors)
+        });
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BranchSite {
+    id: u32,
+    section: SectionId,
+    operand_offset: u32,
+    symbol: SymbolId,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LayoutStats {
+    blocks_placed: u32,
+    fallthrough_jumps: u32,
+    conditional_fallthroughs: u32,
+    inverted_branches: u32,
+    bytes_saved: u32,
+    weighted_branch_base_cycles: u64,
+    weighted_branch_taken_cycles: u64,
+    weighted_page_cross_cycles: u64,
 }
 
 struct Emitter {
@@ -124,14 +338,38 @@ struct Emitter {
     block_symbols: HashMap<(u32, u32), SymbolId>,
     helper_symbols: HashMap<String, SymbolId>,
     constants: HashMap<(u32, u32), u64>,
+    unavoidable_helpers: BTreeSet<String>,
+    goal: CodegenGoal,
     allocation: allocation::Allocation,
     assembly: String,
+    optimization_report: String,
     label_counter: u32,
+    branch_counter: u32,
+    branch_sites: Vec<BranchSite>,
+    long_branches: BTreeSet<u32>,
+    layout_stats: LayoutStats,
     errors: Vec<CodegenError>,
 }
 
+struct ConstantArithmetic<'a> {
+    operator: BinaryOperator,
+    signed: bool,
+    constant: u64,
+    source: Location,
+    right: Location,
+    destination: Location,
+    bit_width: u16,
+    helper_name: &'a str,
+    function_name: &'a str,
+}
+
 impl Emitter {
-    fn new(module: &Module, allocation: allocation::Allocation) -> Result<Self, Vec<CodegenError>> {
+    fn new(
+        module: &Module,
+        allocation: allocation::Allocation,
+        goal: CodegenGoal,
+        long_branches: BTreeSet<u32>,
+    ) -> Result<Self, Vec<CodegenError>> {
         let mut object = Object::default();
         let mut function_sections = Vec::with_capacity(module.functions.len());
         for function in &module.functions {
@@ -213,6 +451,7 @@ impl Emitter {
                 }
             }
         }
+        let unavoidable_helpers = required_arithmetic_helpers(module, &constants);
         Ok(Self {
             object,
             code,
@@ -221,9 +460,16 @@ impl Emitter {
             block_symbols,
             helper_symbols: HashMap::new(),
             constants,
+            unavoidable_helpers,
+            goal,
             allocation,
             assembly: ".segment \"CODE\"\n".to_owned(),
+            optimization_report: format!("Code generation goal: {}\n", goal.name()),
             label_counter: 0,
+            branch_counter: 0,
+            branch_sites: Vec::new(),
+            long_branches,
+            layout_stats: LayoutStats::default(),
             errors: Vec::new(),
         })
     }
@@ -238,7 +484,15 @@ impl Emitter {
             function.name, function.name
         ));
         self.parameter_prologue(function);
-        for block in &function.blocks {
+        let analysis = nesc_opt::analyze_control_flow(function);
+        let order = layout::block_order(function);
+        self.layout_stats.blocks_placed = self
+            .layout_stats
+            .blocks_placed
+            .saturating_add(order.len() as u32);
+        for (position, block_id) in order.iter().copied().enumerate() {
+            let block = &function.blocks[block_id.0 as usize];
+            let next = order.get(position + 1).copied();
             let block_symbol = self.block_symbols[&(function.id.0, block.id.0)];
             self.define(block_symbol);
             self.assembly
@@ -247,7 +501,7 @@ impl Emitter {
                 self.instruction(function, instruction);
             }
             if let Some(terminator) = &block.terminator {
-                self.terminator(function, terminator);
+                self.terminator(function, block.id, terminator, next, &analysis);
             }
         }
     }
@@ -944,6 +1198,8 @@ impl Emitter {
             );
         let constant = self.constants.get(&(function.id.0, right.0)).copied();
         let bit_width = destination.size * 8;
+        let helper_name = arithmetic_helper_name(operator, signed, bit_width)
+            .expect("arithmetic operator has a runtime helper");
 
         if matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder)
             && constant == Some(0)
@@ -964,33 +1220,22 @@ impl Emitter {
         }
 
         if let Some(value) = constant
-            && self.constant_arithmetic(
+            && self.constant_arithmetic(ConstantArithmetic {
                 operator,
                 signed,
-                value,
-                left_location,
+                constant: value,
+                source: left_location,
+                right: right_location,
                 destination,
                 bit_width,
-            )
+                helper_name: &helper_name,
+                function_name: &function.name,
+            })
         {
             return;
         }
 
-        let bits = destination.size * 8;
-        let name = match operator {
-            BinaryOperator::Multiply => format!("__nesc_mul_{bits}"),
-            BinaryOperator::Divide => {
-                format!("__nesc_{}div_{bits}", if signed { "s" } else { "u" })
-            }
-            BinaryOperator::Remainder => {
-                format!("__nesc_{}rem_{bits}", if signed { "s" } else { "u" })
-            }
-            BinaryOperator::ShiftLeft => format!("__nesc_shl_{bits}"),
-            BinaryOperator::ShiftRight if signed => format!("__nesc_ashr_{bits}"),
-            BinaryOperator::ShiftRight => format!("__nesc_lshr_{bits}"),
-            _ => unreachable!("arithmetic helper operator"),
-        };
-        let symbol = self.helper_symbol(&name);
+        let symbol = self.helper_symbol(&helper_name);
         self.emit_call(
             &[left_location, right_location],
             Some(destination),
@@ -999,56 +1244,126 @@ impl Emitter {
         );
     }
 
-    fn constant_arithmetic(
-        &mut self,
-        operator: BinaryOperator,
-        signed: bool,
-        constant: u64,
-        source: Location,
-        destination: Location,
-        bit_width: u16,
-    ) -> bool {
-        match operator {
-            BinaryOperator::Multiply if constant == 0 => {
-                self.write_constant(destination, 0);
+    fn constant_arithmetic(&mut self, arithmetic: ConstantArithmetic<'_>) -> bool {
+        match arithmetic.operator {
+            BinaryOperator::Multiply if arithmetic.constant == 0 => {
+                self.write_constant(arithmetic.destination, 0);
                 true
             }
-            BinaryOperator::Multiply if constant.is_power_of_two() => {
+            BinaryOperator::Multiply if arithmetic.constant.is_power_of_two() => {
+                if !self.prefer_inline_shift(
+                    &arithmetic,
+                    arithmetic.constant.trailing_zeros() as u16,
+                    BinaryOperator::ShiftLeft,
+                    false,
+                ) {
+                    return false;
+                }
                 self.inline_shift(
-                    source,
-                    destination,
-                    constant.trailing_zeros() as u16,
+                    arithmetic.source,
+                    arithmetic.destination,
+                    arithmetic.constant.trailing_zeros() as u16,
                     BinaryOperator::ShiftLeft,
                     false,
                 );
                 true
             }
-            BinaryOperator::Divide if !signed && constant.is_power_of_two() => {
+            BinaryOperator::Divide
+                if !arithmetic.signed && arithmetic.constant.is_power_of_two() =>
+            {
+                if !self.prefer_inline_shift(
+                    &arithmetic,
+                    arithmetic.constant.trailing_zeros() as u16,
+                    BinaryOperator::ShiftRight,
+                    false,
+                ) {
+                    return false;
+                }
                 self.inline_shift(
-                    source,
-                    destination,
-                    constant.trailing_zeros() as u16,
+                    arithmetic.source,
+                    arithmetic.destination,
+                    arithmetic.constant.trailing_zeros() as u16,
                     BinaryOperator::ShiftRight,
                     false,
                 );
                 true
             }
-            BinaryOperator::Remainder if !signed && constant.is_power_of_two() => {
-                let mask = constant - 1;
-                for offset in 0..destination.size {
-                    self.lda_location(source, offset);
+            BinaryOperator::Remainder
+                if !arithmetic.signed && arithmetic.constant.is_power_of_two() =>
+            {
+                let mask = arithmetic.constant - 1;
+                for offset in 0..arithmetic.destination.size {
+                    self.lda_location(arithmetic.source, offset);
                     self.immediate(0x29, "and", (mask >> (u32::from(offset) * 8)) as u8);
-                    self.sta_location(destination, offset);
+                    self.sta_location(arithmetic.destination, offset);
                 }
                 true
             }
             BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
-                debug_assert!(constant < u64::from(bit_width));
-                self.inline_shift(source, destination, constant as u16, operator, signed);
+                debug_assert!(arithmetic.constant < u64::from(arithmetic.bit_width));
+                if !self.prefer_inline_shift(
+                    &arithmetic,
+                    arithmetic.constant as u16,
+                    arithmetic.operator,
+                    arithmetic.signed,
+                ) {
+                    return false;
+                }
+                self.inline_shift(
+                    arithmetic.source,
+                    arithmetic.destination,
+                    arithmetic.constant as u16,
+                    arithmetic.operator,
+                    arithmetic.signed,
+                );
                 true
             }
             _ => false,
         }
+    }
+
+    fn prefer_inline_shift(
+        &mut self,
+        arithmetic: &ConstantArithmetic<'_>,
+        count: u16,
+        shift_operator: BinaryOperator,
+        signed: bool,
+    ) -> bool {
+        if !self.unavoidable_helpers.contains(arithmetic.helper_name) {
+            return true;
+        }
+        let inline = inline_shift_cost(
+            arithmetic.source,
+            arithmetic.destination,
+            count,
+            shift_operator,
+            signed,
+        );
+        let helper = helper_call_cost(
+            arithmetic.source,
+            arithmetic.right,
+            arithmetic.destination,
+            arithmetic.operator,
+            count,
+        );
+        let use_helper = self.goal.prefers(helper, inline);
+        self.optimization_report.push_str(&format!(
+            "{}: {:?} by {} ({} already linked): selected {}; inline {} bytes/{} cycles/zp {}/stack {}; helper {} bytes/{} cycles/zp {}/stack {}\n",
+            arithmetic.function_name,
+            arithmetic.operator,
+            arithmetic.constant,
+            arithmetic.helper_name,
+            if use_helper { "helper" } else { "inline" },
+            inline.rom_bytes(),
+            inline.worst_case_cycles(),
+            inline.zero_page_bytes,
+            inline.stack_bytes,
+            helper.rom_bytes(),
+            helper.worst_case_cycles(),
+            helper.zero_page_bytes,
+            helper.stack_bytes,
+        ));
+        !use_helper
     }
 
     fn inline_shift(
@@ -1086,22 +1401,78 @@ impl Emitter {
         }
     }
 
-    fn terminator(&mut self, function: &Function, terminator: &Terminator) {
+    fn terminator(
+        &mut self,
+        function: &Function,
+        block: BlockId,
+        terminator: &Terminator,
+        next: Option<BlockId>,
+        analysis: &nesc_opt::ControlFlowAnalysis,
+    ) {
         match terminator {
             Terminator::Jump(block) => {
-                let symbol = self.block_symbol(function, *block);
-                self.absolute_symbol(0x4c, "jmp", symbol);
+                if next == Some(*block) {
+                    self.layout_stats.fallthrough_jumps =
+                        self.layout_stats.fallthrough_jumps.saturating_add(1);
+                    self.layout_stats.bytes_saved = self.layout_stats.bytes_saved.saturating_add(3);
+                } else {
+                    let symbol = self.block_symbol(function, *block);
+                    self.absolute_symbol(0x4c, "jmp", symbol);
+                }
             }
             Terminator::Branch {
                 condition,
                 then_block,
                 else_block,
             } => {
+                if then_block == else_block {
+                    if next == Some(*then_block) {
+                        self.layout_stats.fallthrough_jumps =
+                            self.layout_stats.fallthrough_jumps.saturating_add(1);
+                        self.layout_stats.bytes_saved =
+                            self.layout_stats.bytes_saved.saturating_add(5);
+                    } else {
+                        let symbol = self.block_symbol(function, *then_block);
+                        self.absolute_symbol(0x4c, "jmp", symbol);
+                        self.layout_stats.bytes_saved =
+                            self.layout_stats.bytes_saved.saturating_add(2);
+                    }
+                    return;
+                }
                 self.reduce_location(self.value_location(function, *condition));
-                let then_symbol = self.block_symbol(function, *then_block);
-                self.relative_symbol(0xd0, "bne", then_symbol);
-                let else_symbol = self.block_symbol(function, *else_block);
-                self.absolute_symbol(0x4c, "jmp", else_symbol);
+                let source_frequency = analysis.block_frequency(block);
+                if next == Some(*then_block) {
+                    self.layout_stats.conditional_fallthroughs =
+                        self.layout_stats.conditional_fallthroughs.saturating_add(1);
+                    self.layout_stats.bytes_saved = self.layout_stats.bytes_saved.saturating_add(3);
+                    self.layout_stats.inverted_branches =
+                        self.layout_stats.inverted_branches.saturating_add(1);
+                    self.record_branch_cost(
+                        source_frequency,
+                        analysis.block_frequency(*else_block),
+                    );
+                    let else_symbol = self.block_symbol(function, *else_block);
+                    self.relative_symbol(0xf0, "beq", else_symbol);
+                } else if next == Some(*else_block) {
+                    self.layout_stats.conditional_fallthroughs =
+                        self.layout_stats.conditional_fallthroughs.saturating_add(1);
+                    self.layout_stats.bytes_saved = self.layout_stats.bytes_saved.saturating_add(3);
+                    self.record_branch_cost(
+                        source_frequency,
+                        analysis.block_frequency(*then_block),
+                    );
+                    let then_symbol = self.block_symbol(function, *then_block);
+                    self.relative_symbol(0xd0, "bne", then_symbol);
+                } else {
+                    self.record_branch_cost(
+                        source_frequency,
+                        analysis.block_frequency(*then_block),
+                    );
+                    let then_symbol = self.block_symbol(function, *then_block);
+                    self.relative_symbol(0xd0, "bne", then_symbol);
+                    let else_symbol = self.block_symbol(function, *else_block);
+                    self.absolute_symbol(0x4c, "jmp", else_symbol);
+                }
             }
             Terminator::Return(value) => {
                 if let Some(value) = value {
@@ -1413,6 +1784,25 @@ impl Emitter {
     }
 
     fn relative_symbol(&mut self, opcode: u8, mnemonic: &str, symbol: SymbolId) {
+        let branch = self.branch_counter;
+        self.branch_counter = self.branch_counter.saturating_add(1);
+        if self.long_branches.contains(&branch) {
+            let Some((inverse_opcode, inverse_mnemonic)) = inverse_branch(opcode) else {
+                self.errors.push(CodegenError {
+                    message: format!("cannot relax unsupported branch opcode ${opcode:02X}"),
+                    span: None,
+                });
+                return;
+            };
+            let skip_label = format!(".__nesc_relax_{branch}");
+            self.emit_bytes(
+                &[inverse_opcode, 3],
+                &format!("{inverse_mnemonic} {skip_label}"),
+            );
+            self.absolute_symbol(0x4c, "jmp", symbol);
+            self.assembly.push_str(&format!("{skip_label}:\n"));
+            return;
+        }
         self.emit_byte(
             opcode,
             &format!("{mnemonic} {}", self.object.symbols[symbol.0 as usize].name),
@@ -1426,6 +1816,66 @@ impl Emitter {
             symbol,
             addend: 0,
         });
+        self.branch_sites.push(BranchSite {
+            id: branch,
+            section: self.code,
+            operand_offset: offset as u32,
+            symbol,
+        });
+    }
+
+    fn record_branch_cost(&mut self, source_frequency: u32, target_frequency: u32) {
+        let taken_frequency = source_frequency.min(target_frequency);
+        self.layout_stats.weighted_branch_base_cycles = self
+            .layout_stats
+            .weighted_branch_base_cycles
+            .saturating_add(u64::from(source_frequency).saturating_mul(2));
+        self.layout_stats.weighted_branch_taken_cycles = self
+            .layout_stats
+            .weighted_branch_taken_cycles
+            .saturating_add(u64::from(taken_frequency));
+        self.layout_stats.weighted_page_cross_cycles = self
+            .layout_stats
+            .weighted_page_cross_cycles
+            .saturating_add(u64::from(taken_frequency));
+    }
+
+    fn out_of_range_branches(&self) -> Result<BTreeSet<u32>, Vec<CodegenError>> {
+        let mut overflowing = BTreeSet::new();
+        for site in &self.branch_sites {
+            let symbol = &self.object.symbols[site.symbol.0 as usize];
+            if symbol.section != Some(site.section) {
+                return Err(vec![CodegenError {
+                    message: format!("relative branch to `{}` crosses code sections", symbol.name),
+                    span: None,
+                }]);
+            }
+            let displacement = i64::from(symbol.offset)
+                .saturating_sub(i64::from(site.operand_offset).saturating_add(1));
+            if i8::try_from(displacement).is_err() {
+                overflowing.insert(site.id);
+            }
+        }
+        Ok(overflowing)
+    }
+
+    fn finish_layout_report(&mut self) {
+        let relaxation_bytes = u32::try_from(self.long_branches.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(3);
+        self.optimization_report.push_str(&format!(
+            "Control-flow blocks placed: {}\nFall-through jumps removed: {}\nConditional fall-throughs: {}\nBranches inverted: {}\nBranches relaxed: {}\nLayout bytes saved before relaxation: {}\nRelaxation bytes added: {}\nWeighted branch base cycles: {}\nWeighted taken-branch cycles: {}\nWeighted page-cross risk cycles: {}\n",
+            self.layout_stats.blocks_placed,
+            self.layout_stats.fallthrough_jumps,
+            self.layout_stats.conditional_fallthroughs,
+            self.layout_stats.inverted_branches,
+            self.long_branches.len(),
+            self.layout_stats.bytes_saved,
+            relaxation_bytes,
+            self.layout_stats.weighted_branch_base_cycles,
+            self.layout_stats.weighted_branch_taken_cycles,
+            self.layout_stats.weighted_page_cross_cycles,
+        ));
     }
 
     fn emit_byte(&mut self, byte: u8, assembly: &str) {
@@ -1464,6 +1914,20 @@ impl Emitter {
     }
 }
 
+fn inverse_branch(opcode: u8) -> Option<(u8, &'static str)> {
+    match opcode {
+        0x10 => Some((0x30, "bmi")),
+        0x30 => Some((0x10, "bpl")),
+        0x50 => Some((0x70, "bvs")),
+        0x70 => Some((0x50, "bvc")),
+        0x90 => Some((0xb0, "bcs")),
+        0xb0 => Some((0x90, "bcc")),
+        0xd0 => Some((0xf0, "beq")),
+        0xf0 => Some((0xd0, "bne")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nesc_mir::{
@@ -1473,7 +1937,7 @@ mod tests {
         Terminator, Type, TypeKind, ValueId,
     };
 
-    use super::generate;
+    use super::{BackendConfig, CodegenGoal, generate, generate_with_config};
 
     #[test]
     fn emits_constant_return_and_function_symbol() {
@@ -1669,6 +2133,285 @@ mod tests {
                 .symbols
                 .iter()
                 .any(|symbol| { symbol.name == "__nesc_mul_8" && symbol.section.is_none() })
+        );
+    }
+
+    #[test]
+    fn selects_shared_helper_or_inline_shift_from_codegen_goal() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "multiply".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: ty.clone(),
+                parameters: vec![LocalId(0), LocalId(1)],
+                locals: vec![
+                    Local {
+                        id: LocalId(0),
+                        name: "left".to_owned(),
+                        ty: ty.clone(),
+                        parameter: true,
+                    },
+                    Local {
+                        id: LocalId(1),
+                        name: "right".to_owned(),
+                        ty: ty.clone(),
+                        parameter: true,
+                    },
+                ],
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::LoadLocal(LocalId(0)),
+                            effect: Effect::Read,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(1)),
+                            kind: InstructionKind::LoadLocal(LocalId(1)),
+                            effect: Effect::Read,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(2)),
+                            kind: InstructionKind::Binary {
+                                operator: BinaryOperator::Multiply,
+                                left: ValueId(0),
+                                right: ValueId(1),
+                            },
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(3)),
+                            kind: InstructionKind::Constant(8),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: Some(ValueId(4)),
+                            kind: InstructionKind::Binary {
+                                operator: BinaryOperator::Multiply,
+                                left: ValueId(0),
+                                right: ValueId(3),
+                            },
+                            effect: Effect::Pure,
+                            span,
+                        },
+                    ],
+                    terminator: Some(Terminator::Return(Some(ValueId(4)))),
+                }],
+                value_types: vec![ty.clone(), ty.clone(), ty.clone(), ty.clone(), ty],
+            }],
+        };
+        let min_size = generate_with_config(
+            &module,
+            &BackendConfig {
+                goal: CodegenGoal::MinSize,
+                ..BackendConfig::default()
+            },
+        )
+        .expect("minimum-size code generation");
+        let cycles = generate_with_config(
+            &module,
+            &BackendConfig {
+                goal: CodegenGoal::Cycles,
+                ..BackendConfig::default()
+            },
+        )
+        .expect("cycle-oriented code generation");
+
+        assert_eq!(min_size.assembly.matches("jsr __nesc_mul_8").count(), 2);
+        assert_eq!(cycles.assembly.matches("jsr __nesc_mul_8").count(), 1);
+        assert_eq!(cycles.assembly.matches("asl $").count(), 3);
+        assert!(min_size.optimization_report.contains("selected helper"));
+        assert!(cycles.optimization_report.contains("selected inline"));
+    }
+
+    #[test]
+    fn places_a_hot_true_edge_as_an_inverted_fallthrough() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let void = Type::scalar(TypeKind::Void);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "hot_layout".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: void,
+                parameters: vec![LocalId(0)],
+                locals: vec![Local {
+                    id: LocalId(0),
+                    name: "condition".to_owned(),
+                    ty: byte.clone(),
+                    parameter: true,
+                }],
+                entry: Some(BlockId(0)),
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::LoadLocal(LocalId(0)),
+                            effect: Effect::Read,
+                            span,
+                        }],
+                        terminator: Some(Terminator::Branch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(3),
+                        }),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Jump(BlockId(2))),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Branch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(4),
+                        }),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                ],
+                value_types: vec![byte],
+            }],
+        };
+
+        let generated = generate(&module).expect("layout code generation");
+        let block1 = generated
+            .assembly
+            .find("hot_layout.block1:")
+            .expect("hot block label");
+        let block3 = generated
+            .assembly
+            .find("hot_layout.block3:")
+            .expect("cold block label");
+
+        assert!(block1 < block3);
+        assert!(generated.assembly.contains("beq hot_layout.block3"));
+        assert!(!generated.assembly.contains("jmp hot_layout.block2"));
+        assert!(
+            generated
+                .optimization_report
+                .contains("Branches inverted: 1")
+        );
+        assert!(
+            generated
+                .optimization_report
+                .contains("Fall-through jumps removed: 1")
+        );
+    }
+
+    #[test]
+    fn relaxes_an_out_of_range_conditional_branch() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let void = Type::scalar(TypeKind::Void);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "long_branch".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: void,
+                parameters: vec![LocalId(0)],
+                locals: vec![Local {
+                    id: LocalId(0),
+                    name: "condition".to_owned(),
+                    ty: byte.clone(),
+                    parameter: true,
+                }],
+                entry: Some(BlockId(0)),
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::LoadLocal(LocalId(0)),
+                            effect: Effect::Read,
+                            span,
+                        }],
+                        terminator: Some(Terminator::Branch {
+                            condition: ValueId(0),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        }),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: vec![Instruction {
+                            result: None,
+                            kind: InstructionKind::InlineAssembly(InlineAssembly {
+                                template: "nop\n".repeat(140),
+                                inputs: Vec::new(),
+                                outputs: Vec::new(),
+                                clobbers: AssemblyClobbers::default(),
+                                bank_effect: false,
+                                calls: Vec::new(),
+                                stack_bytes: 0,
+                            }),
+                            effect: Effect::Volatile,
+                            span,
+                        }],
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                ],
+                value_types: vec![byte],
+            }],
+        };
+
+        let generated = generate(&module).expect("relaxed code generation");
+        let target = generated
+            .object
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "long_branch.block2")
+            .expect("branch target");
+
+        assert!(
+            generated
+                .object
+                .relocations
+                .iter()
+                .any(|relocation| relocation.symbol == target.id
+                    && relocation.kind == nesc_object::RelocationKind::Absolute16)
+        );
+        assert!(!generated.object.relocations.iter().any(|relocation| {
+            relocation.symbol == target.id
+                && relocation.kind == nesc_object::RelocationKind::Relative8
+        }));
+        assert!(generated.assembly.contains("bne .__nesc_relax_"));
+        assert!(generated.assembly.contains("jmp long_branch.block2"));
+        assert!(
+            generated
+                .optimization_report
+                .contains("Branches relaxed: 1")
         );
     }
 }

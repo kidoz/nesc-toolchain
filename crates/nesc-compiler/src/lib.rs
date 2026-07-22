@@ -87,6 +87,8 @@ pub struct BuildArtifacts {
     pub zero_page: String,
     /// Static hardware-stack usage report.
     pub stack: String,
+    /// MIR transformation counts and backend sequence decisions.
+    pub optimization: String,
     /// Resolved global addresses for tooling and boot verification.
     pub symbol_addresses: BTreeMap<String, u16>,
 }
@@ -159,11 +161,15 @@ fn check_project_with_mode(
                 })
                 .collect::<Vec<_>>()
         })?;
-    let optimization = if project.manifest().compiler.optimization == Optimization::O0 {
-        nesc_opt::OptimizationReport::default()
-    } else {
-        nesc_opt::optimize(&mut mir)
+    let profile = match project.manifest().compiler.optimization {
+        Optimization::O0 => nesc_opt::OptimizationProfile::O0,
+        Optimization::O1 => nesc_opt::OptimizationProfile::O1,
+        Optimization::O2 => nesc_opt::OptimizationProfile::O2,
+        Optimization::Size => nesc_opt::OptimizationProfile::Size,
+        Optimization::MinSize => nesc_opt::OptimizationProfile::MinSize,
+        Optimization::Cycles => nesc_opt::OptimizationProfile::Cycles,
     };
+    let optimization = nesc_opt::optimize_with_profile(&mut mir, profile);
     nesc_mir::verify(&mir).map_err(|errors| {
         errors
             .into_iter()
@@ -590,6 +596,18 @@ fn build_checked_project(
         source_map,
         zero_page: generated.zero_page_report,
         stack: generated.stack_report,
+        optimization: format!(
+            "Optimization: {}\nFunctions analyzed: {}\nNatural loops: {}\nMaximum loop depth: {}\nConstants folded: {}\nConstants propagated: {}\nBranches simplified: {}\nInstructions removed: {}\n\n{}",
+            checked.optimization.profile.name(),
+            checked.optimization.functions_analyzed,
+            checked.optimization.natural_loops,
+            checked.optimization.maximum_loop_depth,
+            checked.optimization.constants_folded,
+            checked.optimization.constants_propagated,
+            checked.optimization.branches_simplified,
+            checked.optimization.instructions_removed,
+            generated.optimization_report,
+        ),
         symbol_addresses: linked.symbols,
     })
 }
@@ -629,6 +647,14 @@ fn backend_config(
             .collect()
     };
     nesc_codegen_6502::BackendConfig {
+        goal: match project.manifest().compiler.optimization {
+            Optimization::Size => nesc_codegen_6502::CodegenGoal::Size,
+            Optimization::MinSize => nesc_codegen_6502::CodegenGoal::MinSize,
+            Optimization::Cycles => nesc_codegen_6502::CodegenGoal::Cycles,
+            Optimization::O0 | Optimization::O1 | Optimization::O2 => {
+                nesc_codegen_6502::CodegenGoal::Balanced
+            }
+        },
         zero_page_available: ranges(&zero_page.available),
         zero_page_reserved: ranges(&zero_page.reserved),
         zero_page_strategy: match zero_page.strategy {
@@ -1176,6 +1202,158 @@ NES_MAIN int main(void) {
             )
             .unwrap_or_else(|error| panic!("{optimization} arithmetic boot oracle: {error}"));
             assert_eq!(boot.background_color, 0x2a);
+        }
+    }
+
+    #[test]
+    fn preserves_shared_helper_arithmetic_across_optimization_settings() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("arithmetic-costs");
+        create_project("arithmetic-costs", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+u8 mixed_product(u8 value, u8 multiplier) {
+    return (value * multiplier) + (value * 8u8);
+}
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    nes_set_background_color(mixed_product(3u8, 2u8));
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("arithmetic cost source");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+
+        for optimization in ["0", "1", "2", "size", "min-size", "cycles"] {
+            fs::write(
+                &manifest_path,
+                manifest.replace(
+                    "optimization = \"size\"",
+                    &format!("optimization = \"{optimization}\""),
+                ),
+            )
+            .expect("optimization manifest");
+            let project = Project::load(&manifest_path).expect("manifest");
+            let artifacts = build_project(&project, &CompilerConfig::bundled_sdk())
+                .unwrap_or_else(|errors| panic!("{optimization} build: {errors:#?}"));
+            let expected_goal = match optimization {
+                "size" => "size",
+                "min-size" => "min-size",
+                "cycles" => "cycles",
+                _ => "balanced",
+            };
+            assert!(
+                artifacts
+                    .optimization
+                    .contains(&format!("Optimization: {optimization}"))
+            );
+            assert!(
+                artifacts
+                    .optimization
+                    .contains(&format!("Code generation goal: {expected_goal}"))
+            );
+            if optimization == "min-size" {
+                assert!(artifacts.optimization.contains("selected helper"));
+                assert_eq!(artifacts.assembly.matches("jsr __nesc_mul_16").count(), 2);
+            }
+            if optimization == "cycles" {
+                assert!(artifacts.optimization.contains("selected inline"));
+                assert_eq!(artifacts.assembly.matches("jsr __nesc_mul_16").count(), 1);
+            }
+            let boot = nesc_emulator::verify_compiler_boot(
+                &artifacts.rom,
+                &artifacts.symbol_addresses,
+                0x1e,
+                200_000,
+            )
+            .unwrap_or_else(|error| panic!("{optimization} cost-model boot oracle: {error}"));
+            assert_eq!(boot.background_color, 0x1e);
+        }
+    }
+
+    #[test]
+    fn preserves_inter_block_constants_and_loops_across_optimization_settings() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("control-flow-costs");
+        create_project("control-flow-costs", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+u8 calculate_color(u8 condition) {
+    u8 stable = 7u8;
+    if (condition) {
+        stable = 7u8;
+    } else {
+        stable = 7u8;
+    }
+    u8 total = 0u8;
+    u8 index = 0u8;
+    while (index < 3u8) {
+        total = total + stable;
+        index = index + 1u8;
+    }
+    return total;
+}
+
+NES_MAIN int main(void) {
+    nes_wait_vblank();
+    nes_set_background_color(calculate_color(nes_read_controller(0u8)));
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("control-flow cost source");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+
+        for optimization in ["0", "1", "2", "size", "min-size", "cycles"] {
+            fs::write(
+                &manifest_path,
+                manifest.replace(
+                    "optimization = \"size\"",
+                    &format!("optimization = \"{optimization}\""),
+                ),
+            )
+            .expect("optimization manifest");
+            let project = Project::load(&manifest_path).expect("manifest");
+            let artifacts = build_project(&project, &CompilerConfig::bundled_sdk())
+                .unwrap_or_else(|errors| panic!("{optimization} build: {errors:#?}"));
+            assert!(artifacts.optimization.contains("Natural loops: 2"));
+            assert!(artifacts.optimization.contains("Maximum loop depth: 1"));
+            assert!(
+                artifacts
+                    .optimization
+                    .contains("Control-flow blocks placed: ")
+            );
+            assert!(
+                artifacts
+                    .optimization
+                    .contains("Weighted page-cross risk cycles: ")
+            );
+            assert!(artifacts.zero_page.contains("(weight "));
+            if matches!(optimization, "2" | "size" | "min-size" | "cycles") {
+                let propagated = artifacts
+                    .optimization
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Constants propagated: "))
+                    .and_then(|count| count.parse::<usize>().ok())
+                    .expect("constant propagation count");
+                assert!(propagated > 0, "{optimization} propagation report");
+            }
+            let boot = nesc_emulator::verify_compiler_boot(
+                &artifacts.rom,
+                &artifacts.symbol_addresses,
+                0x15,
+                200_000,
+            )
+            .unwrap_or_else(|error| panic!("{optimization} CFG boot oracle: {error}"));
+            assert_eq!(boot.background_color, 0x15);
         }
     }
 
