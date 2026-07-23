@@ -1671,6 +1671,88 @@ NES_TEST("input edge detection computes pressed, released, and held") {
 }
 
 #[test]
+fn header_only_sdk_modules_pass_their_tests() {
+    // Proves the BC-M2 header-only SDK modules: tile-grid collision
+    // (collision.h), nametable/palette address math (nametable.h), and the
+    // vblank update buffer (update.h) compile into a project and behave per
+    // their contracts under `nesc test`.
+    let temporary = tempdir().expect("temporary directory");
+    let created = nesc()
+        .current_dir(temporary.path())
+        .args(["new", "sdk-modules"])
+        .output()
+        .expect("run nesc new");
+    assert!(created.status.success());
+    let project = temporary.path().join("sdk-modules");
+    fs::write(
+        project.join("src/main.c"),
+        r#"#include <nes.h>
+#include <collision.h>
+#include <metasprite.h>
+#include <nametable.h>
+#include <update.h>
+
+NES_TEST("collision grid queries") {
+    nes_collision_clear(0u8);
+    nes_collision_set(2u8, 1u8, 3u8);
+    NES_ASSERT_EQ(nes_collision_tile(2u8, 1u8), 3u8);
+    NES_ASSERT_EQ(nes_collision_at(24u8, 8u8), 0u8);
+    NES_ASSERT_EQ(nes_collision_at(23u8, 15u8), 3u8);
+    NES_ASSERT_EQ(nes_collision_at(16u8, 8u8), 3u8);
+    NES_ASSERT_EQ(nes_collision_box(20u8, 4u8, 8u8, 8u8), 3u8);
+    NES_ASSERT_EQ(nes_collision_box(32u8, 32u8, 16u8, 16u8), 0u8);
+    nes_collision_set(4u8, 4u8, 1u8);
+    nes_collision_set(5u8, 4u8, 2u8);
+    NES_ASSERT_EQ(nes_collision_box(32u8, 32u8, 16u8, 8u8), 3u8);
+}
+
+NES_TEST("nametable address math") {
+    NES_ASSERT_EQ(nes_nametable_address(0u8, 0u8), 0x2000u16);
+    NES_ASSERT_EQ(nes_nametable_address(31u8, 0u8), 0x201Fu16);
+    NES_ASSERT_EQ(nes_nametable_address(0u8, 1u8), 0x2020u16);
+    NES_ASSERT_EQ(nes_nametable_address(5u8, 29u8), 0x23A5u16);
+}
+
+NES_TEST("update buffer queues and flushes") {
+    nes_update_reset();
+    NES_ASSERT_EQ(nes_update_pending(), 0u8);
+    nes_update_queue(0x2041u16, 7u8);
+    nes_update_queue(0x23C0u16, 0x55u8);
+    NES_ASSERT_EQ(nes_update_pending(), 2u8);
+    NES_ASSERT_EQ(__nes_update_high[0u8], 0x20u8);
+    NES_ASSERT_EQ(__nes_update_low[0u8], 0x41u8);
+    NES_ASSERT_EQ(__nes_update_value[1u8], 0x55u8);
+    nes_update_flush();
+    NES_ASSERT_EQ(nes_update_pending(), 0u8);
+}
+
+NES_TEST("update buffer drops overflow") {
+    u8 i;
+    nes_update_reset();
+    for (i = 0u8; i < 20u8; i++) {
+        nes_update_queue(0x2000u16 + (u16)i, i);
+    }
+    NES_ASSERT_EQ(nes_update_pending(), 16u8);
+}
+"#,
+    )
+    .expect("write SDK module test source");
+
+    let tested = nesc()
+        .current_dir(&project)
+        .arg("test")
+        .output()
+        .expect("run project tests");
+    let stdout = String::from_utf8_lossy(&tested.stdout);
+    let stderr = String::from_utf8_lossy(&tested.stderr);
+    assert!(tested.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("test result: ok. 4 passed; 0 failed"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn header_only_prng_is_deterministic() {
     // Proves the header-only NesC SDK path: a static-function PRNG in
     // `sdk/include/random.h` compiles into the project and produces a

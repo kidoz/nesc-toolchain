@@ -1869,6 +1869,78 @@ NES_MAIN int main(void) {
     }
 
     #[test]
+    fn renders_metasprite_and_background_through_sdk_helpers() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("sdk-render");
+        create_project("sdk-render", &project_path).expect("project");
+
+        // Tiles 1-5 are solid color 1; tile 0 stays blank.
+        let mut chr = vec![0u8; 6 * 16];
+        for tile in 1..=5 {
+            chr[tile * 16..tile * 16 + 8].fill(0xff);
+        }
+        fs::create_dir_all(project_path.join("assets")).expect("assets directory");
+        fs::write(project_path.join("assets/tiles.chr"), &chr).expect("CHR asset");
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+        fs::write(
+            &manifest_path,
+            format!("{manifest}\n[assets]\nchr = \"assets/tiles.chr\"\n"),
+        )
+        .expect("manifest with CHR asset");
+
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+#include <metasprite.h>
+#include <nametable.h>
+
+NES_MAIN int main(void) {
+    nes_metasprite_draw(0u8, 0x40u8, 0x40u8, 1u8, 0u8);
+    nes_wait_vblank();
+    nes_set_palette_color(1u8, 0x21u8);
+    nes_set_palette_color(17u8, 0x30u8);
+    nes_set_tile(4u8, 4u8, 5u8);
+    nes_oam_dma();
+    nes_set_ppu_address(0x0000u16);
+    nes_enable_rendering();
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("SDK render source");
+
+        let project = Project::load(&manifest_path).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        let mut machine = nesc_emulator::Machine::from_rom_bytes(
+            &artifacts.rom,
+            nesc_emulator::EmulatorConfig::default(),
+        )
+        .expect("SDK render machine");
+        machine.reset().expect("reset");
+        machine
+            .run_frames(
+                5,
+                nesc_emulator::RunLimits {
+                    instruction_limit: 2_000_000,
+                    cycle_limit: 2_000_000,
+                },
+            )
+            .expect("rendered frames");
+        let framebuffer = machine.framebuffer();
+        let sprite_pixels = framebuffer.iter().filter(|pixel| **pixel == 0x30).count();
+        let background_pixels = framebuffer.iter().filter(|pixel| **pixel == 0x21).count();
+        assert_eq!(
+            sprite_pixels, 256,
+            "expected the full 16x16 metasprite to render"
+        );
+        assert_eq!(
+            background_pixels, 64,
+            "expected the background tile written through nes_set_tile to render"
+        );
+    }
+
+    #[test]
     fn stages_sprites_in_shadow_oam_and_dmas_them_into_sprite_memory() {
         let temporary = tempdir().expect("temporary directory");
         let project_path = temporary.path().join("sprite-dma");
