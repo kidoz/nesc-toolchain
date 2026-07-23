@@ -1,0 +1,35 @@
+[package]
+name = "t70"
+version = "0.1.0"
+
+[build]
+entry = "src/main.c"
+assembly = []
+region = "ntsc"
+format = "nes2"
+
+[cartridge]
+mapper = 0
+submapper = 0
+mirroring = "horizontal"
+prg-rom-kib = 32
+chr-rom-kib = 8
+battery = false
+
+[compiler]
+optimization = "size"
+signed-overflow = "wrap"
+bounds-checks = "elide-proven"
+stack-limit = 192
+
+[memory.zero-page]
+available = ["0x00..0xEF"]
+reserved = ["0xF0..0xFF"]
+strategy = "frequency"
+
+[debug]
+symbols = true
+source-map = true
+
+[assets]
+chr = "assets/tiles.chr"

@@ -1987,6 +1987,80 @@ NES_MAIN int main(void) {
     }
 
     #[test]
+    fn t70_example_renders_stage_and_destroys_bricks_deterministically() {
+        // The checked-in `examples/t70` playable slice is the end-to-end
+        // regression anchor: PRG-ROM stage tables (T3), embedded CHR tiles,
+        // and every SDK module drive a scripted playthrough whose frames are
+        // pinned by a golden checksum.
+        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/t70/NesC.toml")
+            .canonicalize()
+            .expect("t70 example manifest");
+        let project = Project::load(&manifest_path).expect("t70 manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+
+        let limits = nesc_emulator::RunLimits {
+            instruction_limit: 10_000_000,
+            cycle_limit: 10_000_000,
+        };
+        let mut machine = nesc_emulator::Machine::from_rom_bytes(
+            &artifacts.rom,
+            nesc_emulator::EmulatorConfig::default(),
+        )
+        .expect("t70 machine");
+        machine.reset().expect("reset");
+        machine.run_frames(40, limits).expect("boot frames");
+
+        // Brick wall cell (5,7) occupies pixels x 80..96, y 112..128 and
+        // renders in the brick color; the tank body renders green.
+        let brick_pixels = |machine: &nesc_emulator::Machine| {
+            let framebuffer = machine.framebuffer();
+            (112..128)
+                .flat_map(|y| (80..96).map(move |x| framebuffer[y * 256 + x]))
+                .filter(|pixel| *pixel == 0x16)
+                .count()
+        };
+        let tank_pixels = machine
+            .framebuffer()
+            .iter()
+            .filter(|pixel| **pixel == 0x1a)
+            .count();
+        assert!(tank_pixels > 100, "tank body missing: {tank_pixels}");
+        // 4 brick tiles x 48 brick-colored pixels (2 of 8 rows are mortar).
+        assert_eq!(brick_pixels(&machine), 192, "brick wall cell missing");
+        assert_eq!(
+            machine.framebuffer_checksum(),
+            24_889_159_808,
+            "golden stage frame diverged"
+        );
+
+        // Drive right until the wall blocks the tank, fire, and let the
+        // shell destroy brick cell (5,7).
+        machine.set_controller(0, 0x01).expect("hold right");
+        machine.run_frames(24, limits).expect("drive frames");
+        machine.set_controller(0, 0x80).expect("press A");
+        machine.run_frames(2, limits).expect("fire frames");
+        machine.set_controller(0, 0x00).expect("release");
+        machine.run_frames(12, limits).expect("shell frames");
+
+        assert_eq!(
+            brick_pixels(&machine),
+            0,
+            "brick cell should be destroyed on screen"
+        );
+        assert_eq!(
+            machine.ram()[0x0203],
+            64,
+            "tank should be blocked flush against the wall"
+        );
+        assert_eq!(
+            machine.framebuffer_checksum(),
+            24_848_210_752,
+            "golden post-playthrough frame diverged"
+        );
+    }
+
+    #[test]
     fn stages_sprites_in_shadow_oam_and_dmas_them_into_sprite_memory() {
         let temporary = tempdir().expect("temporary directory");
         let project_path = temporary.path().join("sprite-dma");
