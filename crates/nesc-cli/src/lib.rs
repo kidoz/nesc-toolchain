@@ -1,5 +1,6 @@
 //! Command-line parsing and initial project workflows.
 
+mod asset;
 mod nesc_verification;
 
 use std::ffi::OsString;
@@ -35,7 +36,24 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum AssetCommand {
+    /// Convert an indexed PNG into raw planar 2bpp CHR tile data.
+    Chr {
+        /// Indexed (palette) PNG whose pixel indices are NES colors 0-3.
+        input: PathBuf,
+        /// Output `.chr` file path.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
+    /// Convert game assets into cartridge data.
+    Asset {
+        #[command(subcommand)]
+        command: AssetCommand,
+    },
     /// Create a new NesC project.
     New {
         /// Project/package name.
@@ -381,6 +399,9 @@ fn execute(command: Command) -> Result<String, Vec<Diagnostic>> {
                 target.display()
             ))
         }
+        Command::Asset {
+            command: AssetCommand::Chr { input, out },
+        } => import_chr(&input, &out),
         Command::Inspect { rom } => inspect_rom(&rom),
         Command::Disassemble {
             rom,
@@ -968,6 +989,44 @@ fn write_artifacts(
         })?;
     }
     Ok(())
+}
+
+fn import_chr(input: &Path, out: &Path) -> Result<String, Vec<Diagnostic>> {
+    let bytes = fs::read(input).map_err(|error| {
+        vec![Diagnostic::error(
+            "E5000",
+            format!("could not read PNG `{}`: {error}", input.display()),
+        )]
+    })?;
+    let image = asset::decode_indexed_png(&bytes).map_err(|error| {
+        vec![
+            Diagnostic::error("E5001", format!("`{}`: {error}", input.display())).with_help(
+                "export an indexed (palette) PNG whose palette slots 0-3 are the NES \
+                 pattern colors",
+            ),
+        ]
+    })?;
+    let chr = asset::image_to_chr(&image).map_err(|error| {
+        vec![Diagnostic::error(
+            "E5002",
+            format!("`{}`: {error}", input.display()),
+        )]
+    })?;
+    fs::write(out, &chr).map_err(|error| {
+        vec![Diagnostic::error(
+            "E5000",
+            format!("could not write CHR `{}`: {error}", out.display()),
+        )]
+    })?;
+    Ok(format!(
+        "Converted {}x{} `{}` into {} tiles ({} CHR bytes) at `{}`",
+        image.width,
+        image.height,
+        input.display(),
+        chr.len() / 16,
+        chr.len(),
+        out.display()
+    ))
 }
 
 fn inspect_rom(path: &Path) -> Result<String, Vec<Diagnostic>> {

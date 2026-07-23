@@ -1671,6 +1671,60 @@ NES_TEST("input edge detection computes pressed, released, and held") {
 }
 
 #[test]
+fn asset_chr_round_trips_the_t70_tile_sheet() {
+    // The T-70 example's PNG art source must convert into exactly the
+    // committed CHR sheet the game embeds.
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let temporary = tempdir().expect("temporary directory");
+    let out = temporary.path().join("tiles.chr");
+    let converted = nesc()
+        .args([
+            "asset",
+            "chr",
+            repo.join("examples/t70/assets/tiles.png").to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nesc asset chr");
+    let stdout = String::from_utf8_lossy(&converted.stdout);
+    let stderr = String::from_utf8_lossy(&converted.stderr);
+    assert!(
+        converted.status.success(),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("20 tiles (320 CHR bytes)"), "{stdout}");
+    let expected = fs::read(repo.join("examples/t70/assets/tiles.chr")).expect("committed CHR");
+    let actual = fs::read(&out).expect("converted CHR");
+    assert_eq!(actual, expected, "PNG source diverged from committed CHR");
+}
+
+#[test]
+fn asset_chr_rejects_invalid_tile_sources() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let temporary = tempdir().expect("temporary directory");
+    let out = temporary.path().join("out.chr");
+    let run = |name: &str| {
+        let output = nesc()
+            .args([
+                "asset",
+                "chr",
+                fixtures.join(name).to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run nesc asset chr");
+        assert!(!output.status.success(), "`{name}` should fail");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    assert!(run("bad-index.png").contains("indices 0-3"));
+    assert!(run("odd-size.png").contains("multiples of 8"));
+    assert!(run("rgb.png").contains("indexed"));
+}
+
+#[test]
 fn header_only_sdk_modules_pass_their_tests() {
     // Proves the BC-M2 header-only SDK modules: tile-grid collision
     // (collision.h), nametable/palette address math (nametable.h), and the
