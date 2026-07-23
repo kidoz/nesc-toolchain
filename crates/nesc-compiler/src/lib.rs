@@ -2056,10 +2056,10 @@ NES_MAIN int main(void) {
         )
         .expect("machine");
         machine.reset().expect("reset");
-        // The emulator returns serial bits low-to-high; `nes_read_controller`
-        // assembles them MSB-first, so pressing the first two buttons (0x03)
-        // yields `NES_BUTTON_A | NES_BUTTON_B` (0xC0).
-        machine.set_controller(0, 0x03).expect("controller");
+        // `set_controller` and `nes_read_controller` share the `NES_BUTTON_*`
+        // layout: the emulator serializes A (bit 7) first and the runtime
+        // reassembles it MSB-first, so masks round-trip unchanged.
+        machine.set_controller(0, 0xc0).expect("controller");
         for _ in 0..200_000 {
             if machine.oam()[1] != 0 {
                 break;

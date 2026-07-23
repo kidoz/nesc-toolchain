@@ -2160,9 +2160,12 @@ impl Machine {
         if self.controller_strobe {
             self.controller_shift[port] = self.controller_state[port];
         }
-        let value = self.controller_shift[port] & 1;
+        // Hardware reports button A on the first serial read; controller
+        // masks use the `NES_BUTTON_*` layout with A in bit 7, so the shift
+        // register empties high bit first and refills with 1s.
+        let value = (self.controller_shift[port] >> 7) & 1;
         if !self.controller_strobe {
-            self.controller_shift[port] = (self.controller_shift[port] >> 1) | 0x80;
+            self.controller_shift[port] = (self.controller_shift[port] << 1) | 1;
         }
         value | 0x40
     }
