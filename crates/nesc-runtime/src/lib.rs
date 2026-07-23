@@ -76,6 +76,8 @@ fn build_selected(
     emitter.enable_rendering();
     emitter.disable_rendering();
     emitter.background_color();
+    emitter.ppu_address();
+    emitter.ppu_data();
     emitter.controller();
     emitter.oam_dma();
     emitter.sprite_position();
@@ -186,6 +188,22 @@ impl RuntimeEmitter {
         self.emit(&[0xa9, 0x00], "lda #$00");
         self.emit(&[0x8d, 0x06, 0x20], "sta $2006");
         self.emit(&[0x68], "pla");
+        self.emit(&[0x8d, 0x07, 0x20], "sta $2007");
+        self.emit(&[0x60], "rts");
+    }
+
+    fn ppu_address(&mut self) {
+        // nescall: little-endian u16 lands with the low byte in A and the
+        // high byte in X. PPUADDR latches the high byte first.
+        self.define("nes_set_ppu_address");
+        self.emit(&[0x8e, 0x06, 0x20], "stx $2006 ; high byte");
+        self.emit(&[0x8d, 0x06, 0x20], "sta $2006 ; low byte");
+        self.emit(&[0x60], "rts");
+    }
+
+    fn ppu_data(&mut self) {
+        // nescall: value arrives in A.
+        self.define("nes_write_ppu_data");
         self.emit(&[0x8d, 0x07, 0x20], "sta $2007");
         self.emit(&[0x60], "rts");
     }

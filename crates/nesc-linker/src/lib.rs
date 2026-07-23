@@ -67,6 +67,14 @@ pub struct RecoveredImage {
     pub cartridge: Rom,
 }
 
+/// Builds the CHR-ROM image: the embedded payload at PPU $0000 with a
+/// zero-filled tail up to the declared capacity.
+fn chr_image(capacity: usize, chr: &[u8]) -> Vec<u8> {
+    let mut image = vec![0; capacity];
+    image[..chr.len()].copy_from_slice(chr);
+    image
+}
+
 /// Link or relocation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkError(pub String);
@@ -89,9 +97,32 @@ impl Error for LinkError {}
 /// Returns deterministic failures for invalid objects, duplicate or missing
 /// symbols, overflowing sections, branch range, or invalid vectors.
 pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
+    link_with_chr(objects, config, &[])
+}
+
+/// Links objects and embeds a CHR-ROM payload at PPU $0000.
+///
+/// The payload must fit the declared CHR-ROM capacity; the remaining bytes
+/// stay zero.
+///
+/// # Errors
+///
+/// Returns the same failures as [`link`], plus an oversized CHR payload.
+pub fn link_with_chr(
+    objects: &[Object],
+    config: LinkConfig,
+    chr: &[u8],
+) -> Result<LinkedImage, Vec<LinkError>> {
+    if chr.len() > config.chr_rom_len {
+        return Err(vec![LinkError(format!(
+            "CHR payload is {} bytes, but the cartridge declares {} CHR-ROM bytes",
+            chr.len(),
+            config.chr_rom_len
+        ))]);
+    }
     match (config.mapper, config.submapper) {
-        (0 | 3, 0) => link_fixed_prg(objects, config),
-        (2, 0) => link_uxrom(objects, config),
+        (0 | 3, 0) => link_fixed_prg(objects, config, chr),
+        (2, 0) => link_uxrom(objects, config, chr),
         (0, submapper) | (2, submapper) | (3, submapper) => Err(vec![LinkError(format!(
             "Mapper {} requires submapper 0, not {submapper}",
             config.mapper
@@ -102,7 +133,11 @@ pub fn link(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<L
     }
 }
 
-fn link_fixed_prg(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
+fn link_fixed_prg(
+    objects: &[Object],
+    config: LinkConfig,
+    chr: &[u8],
+) -> Result<LinkedImage, Vec<LinkError>> {
     if !matches!(config.prg_rom_len, 0x4000 | 0x8000) {
         return Err(vec![LinkError(format!(
             "Mapper {} PRG-ROM must be 16 or 32 KiB",
@@ -334,7 +369,7 @@ fn link_fixed_prg(objects: &[Object], config: LinkConfig) -> Result<LinkedImage,
         },
         trainer: None,
         prg_rom: prg.clone(),
-        chr_rom: vec![0; config.chr_rom_len],
+        chr_rom: chr_image(config.chr_rom_len, chr),
     };
     let rom = nesc_rom::build(&cartridge).map_err(|error| vec![LinkError(error.to_string())])?;
     nesc_rom::parse(&rom).map_err(|error| vec![LinkError(error.to_string())])?;
@@ -354,7 +389,11 @@ struct UxromPlacement {
     bank: u16,
 }
 
-fn link_uxrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec<LinkError>> {
+fn link_uxrom(
+    objects: &[Object],
+    config: LinkConfig,
+    chr: &[u8],
+) -> Result<LinkedImage, Vec<LinkError>> {
     if config.prg_rom_len < 0x8000 || config.prg_rom_len % 0x4000 != 0 {
         return Err(vec![LinkError(
             "Mapper 2 PRG-ROM must contain at least two complete 16 KiB banks".to_owned(),
@@ -641,7 +680,7 @@ fn link_uxrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec
         },
         trainer: None,
         prg_rom: prg.clone(),
-        chr_rom: vec![0; config.chr_rom_len],
+        chr_rom: chr_image(config.chr_rom_len, chr),
     };
     let rom = nesc_rom::build(&cartridge).map_err(|error| vec![LinkError(error.to_string())])?;
     nesc_rom::parse(&rom).map_err(|error| vec![LinkError(error.to_string())])?;
@@ -792,7 +831,7 @@ mod tests {
     };
     use nesc_rom::{Format, Mirroring, Region};
 
-    use super::{LinkConfig, RecoveryLinkInput, link, relink_nrom, relink_recovery};
+    use super::{LinkConfig, RecoveryLinkInput, link, link_with_chr, relink_nrom, relink_recovery};
 
     #[test]
     fn resolves_vectors_in_nrom() {
@@ -822,6 +861,40 @@ mod tests {
         let reset = u16::from_le_bytes([linked.prg_rom[0x7ffc], linked.prg_rom[0x7ffd]]);
         assert_eq!(reset, linked.symbols["__nesc_reset"]);
         assert!(linked.symbols["main"] > reset);
+    }
+
+    #[test]
+    fn embeds_chr_payload_with_zero_filled_tail() {
+        let runtime = nesc_runtime::build();
+        let mut program = Object::default();
+        let code = program
+            .add_section(".text", SectionKind::Code, 1)
+            .expect("section");
+        program.section_bytes_mut(code).unwrap().push(0x60);
+        program
+            .add_symbol("main", Some(code), 0, SymbolKind::Function, Binding::Global)
+            .unwrap();
+        let config = LinkConfig {
+            mapper: 0,
+            submapper: 0,
+            format: Format::Nes2,
+            prg_rom_len: 0x8000,
+            chr_rom_len: 0x2000,
+            mirroring: Mirroring::Horizontal,
+            battery: false,
+            region: Region::Ntsc,
+        };
+        let payload = [0x11u8, 0x22, 0x33, 0x44];
+        let linked = link_with_chr(&[runtime.object.clone(), program.clone()], config, &payload)
+            .expect("CHR link");
+        let parsed = nesc_rom::parse(&linked.rom).expect("valid CHR ROM");
+        assert_eq!(&parsed.chr_rom[..4], &payload);
+        assert!(parsed.chr_rom[4..].iter().all(|byte| *byte == 0));
+
+        let oversized = vec![0u8; 0x2001];
+        let error = link_with_chr(&[runtime.object, program], config, &oversized)
+            .expect_err("oversized CHR payload");
+        assert!(error[0].0.contains("CHR payload"));
     }
 
     #[test]

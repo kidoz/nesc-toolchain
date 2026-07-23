@@ -140,6 +140,43 @@ mod tests {
     }
 
     #[test]
+    fn validates_chr_asset_manifest_rules() {
+        let temporary = tempdir().expect("temporary directory");
+        let destination = temporary.path().join("demo");
+        create_project("demo", &destination).expect("project generation");
+        let manifest_path = destination.join("NesC.toml");
+        let base = std::fs::read_to_string(&manifest_path).expect("manifest source");
+
+        std::fs::write(
+            &manifest_path,
+            format!("{base}\n[assets]\nchr = \"assets/tiles.chr\"\n"),
+        )
+        .expect("manifest with CHR asset");
+        let project = Project::load(&manifest_path).expect("valid CHR manifest");
+        assert_eq!(
+            project.manifest().assets.chr.as_deref(),
+            Some(std::path::Path::new("assets/tiles.chr"))
+        );
+
+        let chr_ram = base.replace("chr-rom-kib = 8", "chr-rom-kib = 0");
+        std::fs::write(
+            &manifest_path,
+            format!("{chr_ram}\n[assets]\nchr = \"tiles.chr\"\n"),
+        )
+        .expect("CHR-RAM manifest");
+        let errors = Project::load(&manifest_path).expect_err("CHR-RAM with assets.chr rejected");
+        assert!(errors.iter().any(|error| error.code() == "E0113"));
+
+        std::fs::write(
+            &manifest_path,
+            format!("{base}\n[assets]\nchr = \"../tiles.chr\"\n"),
+        )
+        .expect("escaping manifest");
+        let errors = Project::load(&manifest_path).expect_err("escaping CHR path rejected");
+        assert!(errors.iter().any(|error| error.code() == "E0113"));
+    }
+
+    #[test]
     fn does_not_overwrite_existing_destination() {
         let temporary = tempdir().expect("temporary directory");
         let error = create_project("demo", temporary.path()).expect_err("existing path rejected");

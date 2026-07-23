@@ -21,6 +21,19 @@ pub struct Manifest {
     /// Debug artifact settings.
     #[serde(default)]
     pub debug: Debug,
+    /// Embedded cartridge assets.
+    #[serde(default)]
+    pub assets: Assets,
+}
+
+/// Embedded cartridge asset inputs.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Assets {
+    /// Raw planar 2bpp CHR tile data placed at PPU $0000, relative to the
+    /// project root; shorter files zero-pad to the CHR-ROM capacity.
+    #[serde(default)]
+    pub chr: Option<PathBuf>,
 }
 
 /// Package identity fields.
@@ -353,6 +366,29 @@ fn validate_manifest(document: &ManifestDocument) -> Vec<Diagnostic> {
                 "assembly",
                 "duplicate assembly source",
             ));
+        }
+    }
+
+    if let Some(chr) = &manifest.assets.chr {
+        if !safe_relative_path(chr) {
+            diagnostics.push(document.field_error(
+                "E0113",
+                format!("CHR asset `{}` must be a safe relative path", chr.display()),
+                "chr",
+                "absolute paths and parent-directory traversal are not allowed",
+            ));
+        }
+        if manifest.cartridge.chr_rom_kib == 0 {
+            diagnostics.push(
+                document
+                    .field_error(
+                        "E0113",
+                        "`assets.chr` requires CHR-ROM capacity",
+                        "chr",
+                        "CHR-RAM cartridges upload tiles at runtime instead",
+                    )
+                    .with_help("set `cartridge.chr-rom-kib` to the CHR-ROM size in KiB"),
+            );
         }
     }
 

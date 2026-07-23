@@ -509,6 +509,7 @@ fn build_checked_project(
         nesc_runtime::build_for(&required_helpers)
     };
     let link_config = linker_config(project)?;
+    let chr = load_chr_asset(project)?;
     let mut objects = Vec::with_capacity(checked.assembly.len() + 2);
     objects.push(runtime.object.clone());
     objects.extend(
@@ -518,7 +519,7 @@ fn build_checked_project(
             .map(|assembly| assembly.module.object.clone()),
     );
     objects.push(generated.object.clone());
-    let linked = nesc_linker::link(&objects, link_config).map_err(|errors| {
+    let linked = nesc_linker::link_with_chr(&objects, link_config, &chr).map_err(|errors| {
         errors
             .into_iter()
             .map(|error| Diagnostic::error("E3001", error.to_string()))
@@ -666,6 +667,41 @@ fn backend_config(
         stack_limit: project.manifest().compiler.stack_limit,
         external_stack_bytes,
     }
+}
+
+/// Loads the raw planar 2bpp CHR payload declared by `assets.chr`.
+///
+/// Returns an empty payload when the manifest declares no CHR asset.
+fn load_chr_asset(project: &Project) -> Result<Vec<u8>, Vec<Diagnostic>> {
+    let Some(path) = &project.manifest().assets.chr else {
+        return Ok(Vec::new());
+    };
+    let full_path = project.root().join(path);
+    let bytes = std::fs::read(&full_path).map_err(|error| {
+        vec![
+            Diagnostic::error(
+                "E3003",
+                format!("cannot read CHR asset `{}`: {error}", full_path.display()),
+            )
+            .with_help("check the `assets.chr` path in NesC.toml"),
+        ]
+    })?;
+    let capacity = project.manifest().cartridge.chr_rom_kib as usize * 1024;
+    if bytes.is_empty() || bytes.len() % 16 != 0 || bytes.len() > capacity {
+        return Err(vec![
+            Diagnostic::error(
+                "E3004",
+                format!(
+                    "CHR asset `{}` is {} bytes; expected non-empty whole 16-byte tiles \
+                     within the {capacity}-byte CHR-ROM capacity",
+                    path.display(),
+                    bytes.len()
+                ),
+            )
+            .with_help("pad or trim the tile data, or raise `cartridge.chr-rom-kib`"),
+        ]);
+    }
+    Ok(bytes)
 }
 
 fn linker_config(project: &Project) -> Result<nesc_linker::LinkConfig, Vec<Diagnostic>> {
@@ -1759,6 +1795,77 @@ NES_TEST("rom table sum") {
                 test.definition.name
             );
         }
+    }
+
+    #[test]
+    fn builds_and_renders_embedded_chr_tiles() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("chr-demo");
+        create_project("chr-demo", &project_path).expect("project");
+
+        // Tile 0 stays blank; tile 1 is solid color 1 (plane 0 all ones).
+        let mut chr = vec![0u8; 32];
+        chr[16..24].fill(0xff);
+        fs::create_dir_all(project_path.join("assets")).expect("assets directory");
+        fs::write(project_path.join("assets/tiles.chr"), &chr).expect("CHR asset");
+
+        let manifest_path = project_path.join("NesC.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest source");
+        fs::write(
+            &manifest_path,
+            format!("{manifest}\n[assets]\nchr = \"assets/tiles.chr\"\n"),
+        )
+        .expect("manifest with CHR asset");
+
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+NES_MAIN int main(void) {
+    nes_set_sprite_position(0u8, 0x40u8, 0x30u8);
+    nes_set_sprite_tile(0u8, 1u8);
+    nes_set_sprite_attributes(0u8, 0u8);
+    nes_wait_vblank();
+    nes_set_ppu_address(0x3F11u16);
+    nes_write_ppu_data(0x30u8);
+    nes_oam_dma();
+    nes_enable_rendering();
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("CHR demo source");
+
+        let project = Project::load(&manifest_path).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        let rom = nesc_rom::parse(&artifacts.rom).expect("parse generated ROM");
+        assert_eq!(&rom.chr_rom[..32], &chr[..]);
+        assert!(rom.chr_rom[32..].iter().all(|byte| *byte == 0));
+
+        let mut machine = nesc_emulator::Machine::from_rom_bytes(
+            &artifacts.rom,
+            nesc_emulator::EmulatorConfig::default(),
+        )
+        .expect("CHR machine");
+        machine.reset().expect("reset");
+        machine
+            .run_frames(
+                5,
+                nesc_emulator::RunLimits {
+                    instruction_limit: 2_000_000,
+                    cycle_limit: 2_000_000,
+                },
+            )
+            .expect("rendered frames");
+        let sprite_pixels = machine
+            .framebuffer()
+            .iter()
+            .filter(|pixel| **pixel == 0x30)
+            .count();
+        assert_eq!(
+            sprite_pixels, 64,
+            "expected the full 8x8 embedded tile to render"
+        );
     }
 
     #[test]
