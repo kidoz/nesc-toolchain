@@ -105,6 +105,8 @@ pub(crate) struct Allocation {
     pub entries: Vec<AllocationEntry>,
     pub zero_page_used: usize,
     pub zero_page_free: usize,
+    pub overlay_slots: usize,
+    pub overlay_bytes_saved: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -133,7 +135,6 @@ struct FunctionStorageAnalysis {
 }
 
 struct StorageSlot {
-    function: Option<FunctionId>,
     size: u16,
     access_weight: u32,
     occupants: Vec<Request>,
@@ -165,6 +166,7 @@ pub(crate) fn allocate(
         .filter(|function| !function.blocks.is_empty())
         .map(|function| (function.id, analyze_function_storage(function)))
         .collect::<HashMap<_, _>>();
+    let function_interferences = analyze_function_interferences(module);
     let mut requests = Vec::new();
     for (index, ty) in module.globals.iter().enumerate() {
         // Globals with folded constant payloads live in PRG-ROM and never
@@ -212,7 +214,24 @@ pub(crate) fn allocate(
             });
         }
     }
-    let slots = form_storage_slots(requests, &storage_analyses, config.zero_page_strategy);
+    let slots = form_storage_slots(
+        requests,
+        &storage_analyses,
+        &function_interferences,
+        config.zero_page_strategy,
+    );
+    let overlay_slots = slots
+        .iter()
+        .filter(|slot| slot_functions(slot).len() > 1)
+        .count();
+    let overlay_bytes_saved = slots.iter().fold(0_usize, |saved, slot| {
+        saved.saturating_add(
+            slot_functions(slot)
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(usize::from(slot.size)),
+        )
+    });
 
     let mut available = [false; 256];
     for range in &config.zero_page_available {
@@ -319,19 +338,19 @@ pub(crate) fn allocate(
         entries,
         zero_page_used,
         zero_page_free: total_available.saturating_sub(zero_page_used),
+        overlay_slots,
+        overlay_bytes_saved,
     })
 }
 
 fn form_storage_slots(
     mut requests: Vec<Request>,
     analyses: &HashMap<FunctionId, FunctionStorageAnalysis>,
+    function_interferences: &HashMap<FunctionId, BTreeSet<FunctionId>>,
     strategy: ZeroPageStrategy,
 ) -> Vec<StorageSlot> {
     requests.sort_by_key(|request| {
-        let degree = request_function(request.key)
-            .and_then(|function| analyses.get(&function))
-            .and_then(|analysis| analysis.interferences.get(&request.key))
-            .map_or(0, BTreeSet::len);
+        let degree = request_interference_degree(request, analyses, function_interferences);
         (
             Reverse(degree),
             Reverse(spill_cost(request.accesses, request.size, strategy)),
@@ -340,20 +359,17 @@ fn form_storage_slots(
 
     let mut slots = Vec::<StorageSlot>::new();
     for request in requests {
-        let function = request_function(request.key);
-        let analysis = function.and_then(|function| analyses.get(&function));
-        let reusable = analysis.is_some_and(|analysis| analysis.reusable.contains(&request.key));
+        let reusable = request_reusable(request.key, analyses);
         let reusable_slot = if reusable {
             slots.iter().position(|slot| {
-                slot.function == function
-                    && slot.size == request.size
+                slot.size == request.size
                     && slot.occupants.iter().all(|occupant| {
-                        !analysis.is_some_and(|analysis| {
-                            analysis
-                                .interferences
-                                .get(&request.key)
-                                .is_some_and(|neighbors| neighbors.contains(&occupant.key))
-                        })
+                        requests_can_share(
+                            request.key,
+                            occupant.key,
+                            analyses,
+                            function_interferences,
+                        )
                     })
             })
         } else {
@@ -365,7 +381,6 @@ fn form_storage_slots(
             slot.occupants.push(request);
         } else {
             slots.push(StorageSlot {
-                function: reusable.then_some(function).flatten(),
                 size: request.size,
                 access_weight: request.accesses,
                 occupants: vec![request],
@@ -374,6 +389,69 @@ fn form_storage_slots(
     }
     slots.sort_by_key(|slot| Reverse(spill_cost(slot.access_weight, slot.size, strategy)));
     slots
+}
+
+fn request_reusable(
+    key: RequestKey,
+    analyses: &HashMap<FunctionId, FunctionStorageAnalysis>,
+) -> bool {
+    request_function(key)
+        .and_then(|function| analyses.get(&function))
+        .is_some_and(|analysis| analysis.reusable.contains(&key))
+}
+
+fn requests_can_share(
+    left: RequestKey,
+    right: RequestKey,
+    analyses: &HashMap<FunctionId, FunctionStorageAnalysis>,
+    function_interferences: &HashMap<FunctionId, BTreeSet<FunctionId>>,
+) -> bool {
+    if !request_reusable(right, analyses) {
+        return false;
+    }
+    let (Some(left_function), Some(right_function)) =
+        (request_function(left), request_function(right))
+    else {
+        return false;
+    };
+    if left_function == right_function {
+        return !analyses
+            .get(&left_function)
+            .and_then(|analysis| analysis.interferences.get(&left))
+            .is_some_and(|neighbors| neighbors.contains(&right));
+    }
+    !function_interferences
+        .get(&left_function)
+        .is_some_and(|neighbors| neighbors.contains(&right_function))
+}
+
+fn request_interference_degree(
+    request: &Request,
+    analyses: &HashMap<FunctionId, FunctionStorageAnalysis>,
+    function_interferences: &HashMap<FunctionId, BTreeSet<FunctionId>>,
+) -> usize {
+    let Some(function) = request_function(request.key) else {
+        return 0;
+    };
+    let local = analyses
+        .get(&function)
+        .and_then(|analysis| analysis.interferences.get(&request.key))
+        .map_or(0, BTreeSet::len);
+    let cross_function = function_interferences
+        .get(&function)
+        .into_iter()
+        .flatten()
+        .filter_map(|other| analyses.get(other))
+        .map(|analysis| analysis.reusable.len())
+        .sum::<usize>();
+    local.saturating_add(cross_function)
+}
+
+fn slot_functions(slot: &StorageSlot) -> BTreeSet<FunctionId> {
+    slot.occupants
+        .iter()
+        .filter_map(|request| request_function(request.key))
+        .collect()
 }
 
 fn spill_cost(access_weight: u32, size: u16, strategy: ZeroPageStrategy) -> u64 {
@@ -387,6 +465,126 @@ fn request_function(key: RequestKey) -> Option<FunctionId> {
     match key {
         RequestKey::Local(function, _) | RequestKey::Value(function, _) => Some(function),
         RequestKey::Global(_) => None,
+    }
+}
+
+fn analyze_function_interferences(module: &Module) -> HashMap<FunctionId, BTreeSet<FunctionId>> {
+    let defined = module
+        .functions
+        .iter()
+        .filter(|function| !function.blocks.is_empty())
+        .map(|function| function.id)
+        .collect::<BTreeSet<_>>();
+    let mut calls = defined
+        .iter()
+        .copied()
+        .map(|function| (function, BTreeSet::new()))
+        .collect::<HashMap<_, _>>();
+    for function in module
+        .functions
+        .iter()
+        .filter(|function| defined.contains(&function.id))
+    {
+        let callees = calls
+            .get_mut(&function.id)
+            .expect("defined function has a call-graph entry");
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            match &instruction.kind {
+                InstructionKind::Call {
+                    function: callee, ..
+                } => {
+                    if defined.contains(callee) {
+                        callees.insert(*callee);
+                    }
+                }
+                InstructionKind::InlineAssembly(assembly) => {
+                    callees.extend(
+                        assembly
+                            .calls
+                            .iter()
+                            .filter(|callee| defined.contains(callee))
+                            .copied(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let reachability = defined
+        .iter()
+        .copied()
+        .map(|function| (function, reachable_functions(function, &calls)))
+        .collect::<HashMap<_, _>>();
+    let mut interferences = defined
+        .iter()
+        .copied()
+        .map(|function| (function, BTreeSet::new()))
+        .collect::<HashMap<_, _>>();
+    for (caller, callees) in &reachability {
+        for callee in callees {
+            connect_functions(&mut interferences, *caller, *callee);
+        }
+    }
+
+    let interrupt_functions = module
+        .functions
+        .iter()
+        .filter(|function| {
+            defined.contains(&function.id)
+                && matches!(
+                    function.name.as_str(),
+                    "nmi" | "irq" | "__nesc_nmi" | "__nesc_irq"
+                )
+        })
+        .flat_map(|function| {
+            std::iter::once(function.id).chain(
+                reachability
+                    .get(&function.id)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    for interrupt_function in interrupt_functions {
+        for function in &defined {
+            connect_functions(&mut interferences, interrupt_function, *function);
+        }
+    }
+    interferences
+}
+
+fn reachable_functions(
+    function: FunctionId,
+    calls: &HashMap<FunctionId, BTreeSet<FunctionId>>,
+) -> BTreeSet<FunctionId> {
+    let mut reachable = BTreeSet::new();
+    let mut pending = calls.get(&function).cloned().unwrap_or_default();
+    while let Some(callee) = pending.pop_first() {
+        if !reachable.insert(callee) {
+            continue;
+        }
+        if let Some(nested) = calls.get(&callee) {
+            pending.extend(nested.iter().copied());
+        }
+    }
+    reachable
+}
+
+fn connect_functions(
+    interferences: &mut HashMap<FunctionId, BTreeSet<FunctionId>>,
+    left: FunctionId,
+    right: FunctionId,
+) {
+    if left == right {
+        return;
+    }
+    if let Some(neighbors) = interferences.get_mut(&left) {
+        neighbors.insert(right);
+    }
+    if let Some(neighbors) = interferences.get_mut(&right) {
+        neighbors.insert(left);
     }
 }
 
@@ -802,8 +1000,11 @@ pub(crate) fn render_report(allocation: &Allocation) -> String {
         }
     }
     report.push_str(&format!(
-        "\nUsed: {} bytes\nFree: {} bytes\n",
-        allocation.zero_page_used, allocation.zero_page_free
+        "\nUsed: {} bytes\nFree: {} bytes\nCross-function overlays: {} slots\nStatic RAM saved by overlays: {} bytes\n",
+        allocation.zero_page_used,
+        allocation.zero_page_free,
+        allocation.overlay_slots,
+        allocation.overlay_bytes_saved
     ));
     report
 }
@@ -813,9 +1014,9 @@ mod tests {
     use std::collections::HashMap;
 
     use nesc_mir::{
-        BankPlacement, BasicBlock, BinaryOperator, BlockId, Effect, Function, FunctionId,
-        Instruction, InstructionKind, Local, LocalId, Module, SourceId, SourceSpan, Terminator,
-        Type, TypeKind, ValueId,
+        AssemblyClobbers, BankPlacement, BasicBlock, BinaryOperator, BlockId, Effect, Function,
+        FunctionId, InlineAssembly, Instruction, InstructionKind, Local, LocalId, Module, SourceId,
+        SourceSpan, Terminator, Type, TypeKind, ValueId,
     };
 
     use super::{
@@ -1234,9 +1435,20 @@ mod tests {
             ]
         };
         let analyses = HashMap::new();
+        let function_interferences = HashMap::new();
 
-        let frequency = form_storage_slots(requests(), &analyses, ZeroPageStrategy::Frequency);
-        let cycles = form_storage_slots(requests(), &analyses, ZeroPageStrategy::Cycles);
+        let frequency = form_storage_slots(
+            requests(),
+            &analyses,
+            &function_interferences,
+            ZeroPageStrategy::Frequency,
+        );
+        let cycles = form_storage_slots(
+            requests(),
+            &analyses,
+            &function_interferences,
+            ZeroPageStrategy::Cycles,
+        );
 
         assert!(matches!(
             frequency[0].occupants[0].key,
@@ -1249,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_value_storage_isolated_between_functions() {
+    fn keeps_interrupt_storage_isolated_from_normal_execution() {
         let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let function = |id: u32, name: &str| Function {
@@ -1290,6 +1502,305 @@ mod tests {
         assert_ne!(
             allocation.values[&(FunctionId(0), ValueId(0))].address,
             allocation.values[&(FunctionId(1), ValueId(0))].address
+        );
+    }
+
+    #[test]
+    fn overlays_storage_between_sibling_callees() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let leaf = |id: u32, name: &str| Function {
+            id: FunctionId(id),
+            name: name.to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: ty.clone(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction {
+                    result: Some(ValueId(0)),
+                    kind: InstructionKind::Constant(u64::from(id)),
+                    effect: Effect::Pure,
+                    span,
+                }],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+            value_types: vec![ty.clone()],
+        };
+        let dispatcher = Function {
+            id: FunctionId(0),
+            name: "main".to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: Type::scalar(TypeKind::Void),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: [FunctionId(1), FunctionId(2)]
+                    .map(|function| Instruction {
+                        result: None,
+                        kind: InstructionKind::Call {
+                            function,
+                            arguments: Vec::new(),
+                        },
+                        effect: Effect::Call,
+                        span,
+                    })
+                    .into(),
+                terminator: Some(Terminator::Return(None)),
+            }],
+            value_types: Vec::new(),
+        };
+        let module = Module {
+            globals: Vec::new(),
+            global_data: Vec::new(),
+            functions: vec![dispatcher, leaf(1, "left"), leaf(2, "right")],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("sibling overlay allocation");
+
+        assert_eq!(
+            allocation.values[&(FunctionId(1), ValueId(0))].address,
+            allocation.values[&(FunctionId(2), ValueId(0))].address
+        );
+        assert_eq!(allocation.overlay_slots, 1);
+        assert_eq!(allocation.overlay_bytes_saved, 1);
+        assert!(render_report(&allocation).contains("Cross-function overlays: 1 slots"));
+        assert!(render_report(&allocation).contains("Static RAM saved by overlays: 1 bytes"));
+    }
+
+    #[test]
+    fn keeps_caller_and_callee_storage_distinct() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let caller = Function {
+            id: FunctionId(0),
+            name: "main".to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: ty.clone(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction {
+                        result: Some(ValueId(0)),
+                        kind: InstructionKind::Constant(1),
+                        effect: Effect::Pure,
+                        span,
+                    },
+                    Instruction {
+                        result: None,
+                        kind: InstructionKind::Call {
+                            function: FunctionId(1),
+                            arguments: Vec::new(),
+                        },
+                        effect: Effect::Call,
+                        span,
+                    },
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+            value_types: vec![ty.clone()],
+        };
+        let callee = Function {
+            id: FunctionId(1),
+            name: "callee".to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: ty.clone(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction {
+                    result: Some(ValueId(0)),
+                    kind: InstructionKind::Constant(2),
+                    effect: Effect::Pure,
+                    span,
+                }],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+            value_types: vec![ty],
+        };
+        let module = Module {
+            globals: Vec::new(),
+            global_data: Vec::new(),
+            functions: vec![caller, callee],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("caller-callee allocation");
+
+        assert_ne!(
+            allocation.values[&(FunctionId(0), ValueId(0))].address,
+            allocation.values[&(FunctionId(1), ValueId(0))].address
+        );
+    }
+
+    #[test]
+    fn inline_assembly_calls_prevent_storage_overlays() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let caller = Function {
+            id: FunctionId(0),
+            name: "main".to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: ty.clone(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction {
+                        result: Some(ValueId(0)),
+                        kind: InstructionKind::Constant(1),
+                        effect: Effect::Pure,
+                        span,
+                    },
+                    Instruction {
+                        result: None,
+                        kind: InstructionKind::InlineAssembly(InlineAssembly {
+                            template: "JSR callee".to_owned(),
+                            inputs: Vec::new(),
+                            outputs: Vec::new(),
+                            clobbers: AssemblyClobbers::default(),
+                            bank_effect: false,
+                            calls: vec![FunctionId(1)],
+                            stack_bytes: 0,
+                        }),
+                        effect: Effect::Volatile,
+                        span,
+                    },
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+            value_types: vec![ty.clone()],
+        };
+        let callee = Function {
+            id: FunctionId(1),
+            name: "callee".to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: ty.clone(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction {
+                    result: Some(ValueId(0)),
+                    kind: InstructionKind::Constant(2),
+                    effect: Effect::Pure,
+                    span,
+                }],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+            value_types: vec![ty],
+        };
+        let module = Module {
+            globals: Vec::new(),
+            global_data: Vec::new(),
+            functions: vec![caller, callee],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("inline-assembly call allocation");
+
+        assert_ne!(
+            allocation.values[&(FunctionId(0), ValueId(0))].address,
+            allocation.values[&(FunctionId(1), ValueId(0))].address
+        );
+    }
+
+    #[test]
+    fn isolates_transitive_interrupt_callees() {
+        let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let leaf = |id: u32, name: &str| Function {
+            id: FunctionId(id),
+            name: name.to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: ty.clone(),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction {
+                    result: Some(ValueId(0)),
+                    kind: InstructionKind::Constant(u64::from(id)),
+                    effect: Effect::Pure,
+                    span,
+                }],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+            value_types: vec![ty.clone()],
+        };
+        let nmi = Function {
+            id: FunctionId(1),
+            name: "nmi".to_owned(),
+            placement: BankPlacement::Fixed,
+            return_type: Type::scalar(TypeKind::Void),
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            entry: Some(BlockId(0)),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![Instruction {
+                    result: None,
+                    kind: InstructionKind::Call {
+                        function: FunctionId(2),
+                        arguments: Vec::new(),
+                    },
+                    effect: Effect::Call,
+                    span,
+                }],
+                terminator: Some(Terminator::Return(None)),
+            }],
+            value_types: Vec::new(),
+        };
+        let module = Module {
+            globals: Vec::new(),
+            global_data: Vec::new(),
+            functions: vec![leaf(0, "worker"), nmi, leaf(2, "interrupt_helper")],
+        };
+        let allocation = allocate(
+            &module,
+            &BackendConfig {
+                zero_page_available: Vec::new(),
+                zero_page_reserved: Vec::new(),
+                ..BackendConfig::default()
+            },
+        )
+        .expect("interrupt closure allocation");
+
+        assert_ne!(
+            allocation.values[&(FunctionId(0), ValueId(0))].address,
+            allocation.values[&(FunctionId(2), ValueId(0))].address
         );
     }
 
