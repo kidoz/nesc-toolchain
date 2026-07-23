@@ -1798,6 +1798,52 @@ NES_TEST("rom table sum") {
     }
 
     #[test]
+    fn truncates_implicit_integer_narrowing_at_stores_and_returns() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("narrowing");
+        create_project("narrowing", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"u16 wide_global = 0u16;
+u8 narrow_global = 0u8;
+
+static u8 low_byte(u16 value) {
+    return value;
+}
+
+NES_TEST("implicit narrowing truncates") {
+    u16 wide = 0x1234u16;
+    u8 narrow = wide;
+    NES_ASSERT_EQ(narrow, 0x34u8);
+    narrow = 0u8;
+    narrow = wide;
+    NES_ASSERT_EQ(narrow, 0x34u8);
+    wide_global = 0x0567u16;
+    narrow_global = wide_global;
+    NES_ASSERT_EQ(narrow_global, 0x67u8);
+    NES_ASSERT_EQ(low_byte(0x1298u16), 0x98u8);
+    u8 byte = 0x80u8;
+    u16 widened = byte;
+    NES_ASSERT_EQ(widened, 0x0080u16);
+}
+"#,
+        )
+        .expect("narrowing test source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let tests = build_tests(&project, &CompilerConfig::bundled_sdk()).expect("test builds");
+        let run = nesc_emulator::run_test_rom(
+            &tests[0].artifacts.rom,
+            &tests[0].artifacts.symbol_addresses,
+            nesc_emulator::RunLimits {
+                instruction_limit: 100_000,
+                cycle_limit: 1_000_000,
+            },
+        )
+        .expect("test execution");
+        assert_eq!(run.outcome, nesc_emulator::TestOutcome::Passed);
+    }
+
+    #[test]
     fn builds_and_renders_embedded_chr_tiles() {
         let temporary = tempdir().expect("temporary directory");
         let project_path = temporary.path().join("chr-demo");

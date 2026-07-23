@@ -547,6 +547,7 @@ impl<'a> Builder<'a> {
                 if let Some(initializer) = &variable.initializer
                     && let Some(value) = self.lower_expression(initializer)
                 {
+                    let value = self.convert_stored_value(value, &variable.ty, variable.span);
                     self.emit(
                         None,
                         InstructionKind::StoreLocal { local, value },
@@ -656,9 +657,11 @@ impl<'a> Builder<'a> {
                 }
             }
             Statement::Return { value, .. } => {
-                let value = value
-                    .as_ref()
-                    .and_then(|expression| self.lower_expression(expression));
+                let value = value.as_ref().and_then(|expression| {
+                    let value = self.lower_expression(expression)?;
+                    let return_type = self.function.return_type.clone();
+                    Some(self.convert_stored_value(value, &return_type, expression.span))
+                });
                 self.terminate(Terminator::Return(value));
                 self.current = self.new_block();
             }
@@ -1257,6 +1260,27 @@ impl<'a> Builder<'a> {
         Some(self.scale_value(value, expression.ty.as_ref()?, scale, span))
     }
 
+    /// Converts a value to the width of its integer storage destination, per
+    /// the runtime truncation rule for implicit conversions.
+    fn convert_stored_value(&mut self, value: ValueId, target: &Type, span: SourceSpan) -> ValueId {
+        let source = &self.function.value_types[value.0 as usize];
+        if !source.is_integer() || !target.is_integer() || type_size(source) == type_size(target) {
+            return value;
+        }
+        let mut target = target.clone();
+        target.is_const = false;
+        target.is_volatile = false;
+        self.value_instruction(
+            InstructionKind::Cast {
+                value,
+                target: target.clone(),
+            },
+            Effect::Pure,
+            span,
+            target,
+        )
+    }
+
     fn cast_if_needed(
         &mut self,
         value: ValueId,
@@ -1423,7 +1447,9 @@ impl<'a> Builder<'a> {
 
     fn store_name(&mut self, name: &str, value: ValueId, span: SourceSpan) {
         if let Some(local) = self.local(name) {
-            let effect = if self.function.locals[local.0 as usize].ty.is_volatile {
+            let ty = self.function.locals[local.0 as usize].ty.clone();
+            let value = self.convert_stored_value(value, &ty, span);
+            let effect = if ty.is_volatile {
                 Effect::Volatile
             } else {
                 Effect::Write
@@ -1435,7 +1461,9 @@ impl<'a> Builder<'a> {
                 span,
             );
         } else if let Some(global) = self.hir.global_names.get(name).copied() {
-            let effect = if self.hir.globals[global.0 as usize].variable.ty.is_volatile {
+            let ty = self.hir.globals[global.0 as usize].variable.ty.clone();
+            let value = self.convert_stored_value(value, &ty, span);
+            let effect = if ty.is_volatile {
                 Effect::Volatile
             } else {
                 Effect::Write
