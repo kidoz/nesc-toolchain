@@ -338,6 +338,39 @@ enum CpuRegister {
     Y,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadFlags {
+    Live,
+    Dead,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LoadInstruction {
+    register: CpuRegister,
+    zero_page_opcode: u8,
+    absolute_opcode: u8,
+    mnemonic: &'static str,
+}
+
+const LDA: LoadInstruction = LoadInstruction {
+    register: CpuRegister::A,
+    zero_page_opcode: 0xa5,
+    absolute_opcode: 0xad,
+    mnemonic: "lda",
+};
+const LDX: LoadInstruction = LoadInstruction {
+    register: CpuRegister::X,
+    zero_page_opcode: 0xa6,
+    absolute_opcode: 0xae,
+    mnemonic: "ldx",
+};
+const LDY: LoadInstruction = LoadInstruction {
+    register: CpuRegister::Y,
+    zero_page_opcode: 0xa4,
+    absolute_opcode: 0xac,
+    mnemonic: "ldy",
+};
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum KnownValue {
     #[default]
@@ -403,8 +436,15 @@ impl RegisterState {
 #[derive(Clone, Copy, Debug, Default)]
 struct RegisterReuseStats {
     loads_removed: u32,
+    flag_dead_loads_removed: u32,
     bytes_saved: u32,
     cycles_saved: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FlagOptimizationStats {
+    condition_materializations_removed: u32,
+    redundant_comparisons_removed: u32,
 }
 
 struct Emitter {
@@ -428,6 +468,7 @@ struct Emitter {
     layout_stats: LayoutStats,
     registers: RegisterState,
     register_reuse_stats: RegisterReuseStats,
+    flag_optimization_stats: FlagOptimizationStats,
     errors: Vec<CodegenError>,
 }
 
@@ -441,6 +482,16 @@ struct ConstantArithmetic<'a> {
     bit_width: u16,
     helper_name: &'a str,
     function_name: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FusedComparison {
+    condition: ValueId,
+    operator: BinaryOperator,
+    left: ValueId,
+    right: ValueId,
+    then_block: BlockId,
+    else_block: BlockId,
 }
 
 impl Emitter {
@@ -589,6 +640,7 @@ impl Emitter {
             layout_stats: LayoutStats::default(),
             registers: RegisterState::default(),
             register_reuse_stats: RegisterReuseStats::default(),
+            flag_optimization_stats: FlagOptimizationStats::default(),
             errors: Vec::new(),
         })
     }
@@ -604,6 +656,7 @@ impl Emitter {
         ));
         self.parameter_prologue(function);
         let analysis = nesc_opt::analyze_control_flow(function);
+        let value_use_counts = value_use_counts(function);
         let order = layout::block_order(function);
         self.layout_stats.blocks_placed = self
             .layout_stats
@@ -616,10 +669,17 @@ impl Emitter {
             self.define(block_symbol);
             self.assembly
                 .push_str(&format!("{}.block{}:\n", function.name, block.id.0));
-            for instruction in &block.instructions {
+            let fused_comparison = fused_comparison(block, &value_use_counts);
+            let instruction_count = block
+                .instructions
+                .len()
+                .saturating_sub(usize::from(fused_comparison.is_some()));
+            for instruction in &block.instructions[..instruction_count] {
                 self.instruction(function, instruction);
             }
-            if let Some(terminator) = &block.terminator {
+            if let Some(comparison) = fused_comparison {
+                self.comparison_terminator(function, block.id, comparison, next, &analysis);
+            } else if let Some(terminator) = &block.terminator {
                 self.terminator(function, block.id, terminator, next, &analysis);
             }
         }
@@ -856,7 +916,7 @@ impl Emitter {
             if subtract { "sec" } else { "clc" },
         );
         for byte in 0..destination.size.min(2) {
-            self.lda_location(base, byte);
+            self.lda_location_flags_dead(base, byte);
             let (zero_page, absolute, mnemonic) = if subtract {
                 (0xe5, 0xed, "sbc")
             } else {
@@ -869,9 +929,9 @@ impl Emitter {
 
     fn prepare_indirect_address(&mut self, function: &Function, address: ValueId) {
         let address = self.value_location(function, address);
-        self.lda_location(address, 0);
+        self.lda_location_flags_dead(address, 0);
         self.sta_zero_page(ARGUMENT_SPILL_BASE);
-        self.lda_location(address, 1);
+        self.lda_location_flags_dead(address, 1);
         self.sta_zero_page(ARGUMENT_SPILL_BASE + 1);
     }
 
@@ -882,7 +942,7 @@ impl Emitter {
         let destination = self.value_location(function, result);
         self.prepare_indirect_address(function, address);
         for offset in 0..destination.size {
-            self.ldy_immediate(offset as u8);
+            self.ldy_immediate_flags_dead(offset as u8);
             self.emit_bytes(
                 &[0xb1, ARGUMENT_SPILL_BASE],
                 &format!("lda (${:02x}),y", ARGUMENT_SPILL_BASE),
@@ -908,8 +968,8 @@ impl Emitter {
             if volatile && address_space == AddressSpace::PpuRegister {
                 self.store_ppu_register(source, offset);
             } else {
-                self.ldy_immediate(offset as u8);
-                self.lda_location(source, offset);
+                self.ldy_immediate_flags_dead(offset as u8);
+                self.lda_location_flags_dead(source, offset);
                 self.emit_bytes(
                     &[0x91, ARGUMENT_SPILL_BASE],
                     &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
@@ -922,7 +982,7 @@ impl Emitter {
     fn store_ppu_register(&mut self, source: Location, offset: u16) {
         let done_name = self.fresh_label("ppu_store_done");
         let done_symbol = self.local_symbol(&done_name);
-        self.lda_zero_page(ARGUMENT_SPILL_BASE);
+        self.lda_zero_page_flags_dead(ARGUMENT_SPILL_BASE);
         if offset != 0 {
             self.emit_byte(0x18, "clc");
             self.immediate(0x69, "adc", offset as u8);
@@ -933,14 +993,14 @@ impl Emitter {
             let next_symbol = self.local_symbol(&next_name);
             self.immediate(0xc9, "cmp", (register & 7) as u8);
             self.relative_symbol(0xd0, "bne", next_symbol);
-            self.lda_location(source, offset);
+            self.lda_location_flags_dead(source, offset);
             self.absolute_address(0x8d, "sta", register);
             self.absolute_symbol(0x4c, "jmp", done_symbol);
             self.define(next_symbol);
             self.assembly.push_str(&format!("{next_name}:\n"));
         }
-        self.ldy_immediate(offset as u8);
-        self.lda_location(source, offset);
+        self.ldy_immediate_flags_dead(offset as u8);
+        self.lda_location_flags_dead(source, offset);
         self.emit_bytes(
             &[0x91, ARGUMENT_SPILL_BASE],
             &format!("sta (${:02x}),y", ARGUMENT_SPILL_BASE),
@@ -969,14 +1029,14 @@ impl Emitter {
             self.relative_symbol(0xd0, "bne", trap_symbol);
         }
         if index_location.size > 1 {
-            self.lda_location(index_location, 1);
+            self.lda_location_flags_dead(index_location, 1);
             self.immediate(0xc9, "cmp", (length >> 8) as u8);
             self.relative_symbol(0x90, "bcc", done_symbol);
             self.relative_symbol(0xd0, "bne", trap_symbol);
         } else if length > u32::from(u8::MAX) {
             self.absolute_symbol(0x4c, "jmp", done_symbol);
         }
-        self.lda_location(index_location, 0);
+        self.lda_location_flags_dead(index_location, 0);
         self.immediate(0xc9, "cmp", length as u8);
         self.relative_symbol(0x90, "bcc", done_symbol);
         self.define(trap_symbol);
@@ -997,7 +1057,7 @@ impl Emitter {
                     Some(AbiLocation::X) => self.stx_location(destination, offset),
                     Some(AbiLocation::Y) => self.sty_location(destination, offset),
                     Some(AbiLocation::ZeroPage(address)) => {
-                        self.lda_zero_page(address);
+                        self.lda_zero_page_flags_dead(address);
                         self.sta_location(destination, offset);
                     }
                     None => {
@@ -1024,7 +1084,7 @@ impl Emitter {
             } else {
                 0
             };
-            self.lda_immediate(byte);
+            self.lda_immediate_flags_dead(byte);
             self.sta_location(destination, offset);
         }
     }
@@ -1032,11 +1092,11 @@ impl Emitter {
     fn copy_location(&mut self, source: Location, destination: Location) {
         let copied = source.size.min(destination.size);
         for offset in 0..copied {
-            self.lda_location(source, offset);
+            self.lda_location_flags_dead(source, offset);
             self.sta_location(destination, offset);
         }
         for offset in copied..destination.size {
-            self.lda_immediate(0);
+            self.lda_immediate_flags_dead(0);
             self.sta_location(destination, offset);
         }
     }
@@ -1049,7 +1109,7 @@ impl Emitter {
         let destination = self.value_location(function, result);
         let copied = source.size.min(destination.size);
         for offset in 0..copied {
-            self.lda_location(source, offset);
+            self.lda_location_flags_dead(source, offset);
             self.sta_location(destination, offset);
         }
         if destination.size <= copied {
@@ -1064,7 +1124,7 @@ impl Emitter {
             );
         if !signed {
             for offset in copied..destination.size {
-                self.lda_immediate(0);
+                self.lda_immediate_flags_dead(0);
                 self.sta_location(destination, offset);
             }
             return;
@@ -1133,17 +1193,17 @@ impl Emitter {
             let Some(AbiLocation::ZeroPage(address)) = argument_location(index) else {
                 unreachable!("argument byte count was checked")
             };
-            self.lda_location(*location, *offset);
+            self.lda_location_flags_dead(*location, *offset);
             self.sta_zero_page(address);
         }
         if let Some((location, offset)) = bytes.get(2) {
-            self.ldy_location(*location, *offset);
+            self.ldy_location_flags_dead(*location, *offset);
         }
         if let Some((location, offset)) = bytes.get(1) {
-            self.ldx_location(*location, *offset);
+            self.ldx_location_flags_dead(*location, *offset);
         }
         if let Some((location, offset)) = bytes.first() {
-            self.lda_location(*location, *offset);
+            self.lda_location_flags_dead(*location, *offset);
         }
         self.absolute_symbol(0x20, "jsr", symbol);
 
@@ -1162,7 +1222,7 @@ impl Emitter {
                     self.error("return value is wider than the nescall ABI supports", span);
                     return;
                 };
-                self.lda_zero_page(address);
+                self.lda_zero_page_flags_dead(address);
                 self.sta_location(destination, offset);
             }
         }
@@ -1185,7 +1245,7 @@ impl Emitter {
             UnaryOperator::Negate => {
                 self.emit_byte(0x18, "clc");
                 for offset in 0..destination.size {
-                    self.lda_location(source, offset);
+                    self.lda_location_flags_dead(source, offset);
                     self.immediate(0x49, "eor", 0xff);
                     self.immediate(0x69, "adc", u8::from(offset == 0));
                     self.sta_location(destination, offset);
@@ -1198,7 +1258,7 @@ impl Emitter {
             }
             UnaryOperator::BitwiseNot => {
                 for offset in 0..destination.size {
-                    self.lda_location(source, offset);
+                    self.lda_location_flags_dead(source, offset);
                     self.immediate(0x49, "eor", 0xff);
                     self.sta_location(destination, offset);
                 }
@@ -1230,7 +1290,7 @@ impl Emitter {
             BinaryOperator::Add => {
                 self.emit_byte(0x18, "clc");
                 for offset in 0..destination.size {
-                    self.lda_location(left_location, offset);
+                    self.lda_location_flags_dead(left_location, offset);
                     self.memory_operation(0x65, 0x6d, "adc", right_location, offset);
                     self.sta_location(destination, offset);
                 }
@@ -1238,7 +1298,7 @@ impl Emitter {
             BinaryOperator::Subtract => {
                 self.emit_byte(0x38, "sec");
                 for offset in 0..destination.size {
-                    self.lda_location(left_location, offset);
+                    self.lda_location_flags_dead(left_location, offset);
                     self.memory_operation(0xe5, 0xed, "sbc", right_location, offset);
                     self.sta_location(destination, offset);
                 }
@@ -1251,7 +1311,7 @@ impl Emitter {
                     _ => unreachable!(),
                 };
                 for offset in 0..destination.size {
-                    self.lda_location(left_location, offset);
+                    self.lda_location_flags_dead(left_location, offset);
                     self.memory_operation(zero_page, absolute, mnemonic, right_location, offset);
                     self.sta_location(destination, offset);
                 }
@@ -1450,7 +1510,7 @@ impl Emitter {
             {
                 let mask = arithmetic.constant - 1;
                 for offset in 0..arithmetic.destination.size {
-                    self.lda_location(arithmetic.source, offset);
+                    self.lda_location_flags_dead(arithmetic.source, offset);
                     self.immediate(0x29, "and", (mask >> (u32::from(offset) * 8)) as u8);
                     self.sta_location(arithmetic.destination, offset);
                 }
@@ -1541,7 +1601,7 @@ impl Emitter {
                     }
                 }
                 BinaryOperator::ShiftRight if signed => {
-                    self.lda_location(destination, destination.size - 1);
+                    self.lda_location_flags_dead(destination, destination.size - 1);
                     self.emit_byte(0x0a, "asl a");
                     self.registers.invalidate_register(CpuRegister::A);
                     self.registers.nz_from = Some(CpuRegister::A);
@@ -1557,6 +1617,126 @@ impl Emitter {
                 }
                 _ => unreachable!("shift operator"),
             }
+        }
+    }
+
+    fn comparison_terminator(
+        &mut self,
+        function: &Function,
+        block: BlockId,
+        comparison: FusedComparison,
+        next: Option<BlockId>,
+        analysis: &nesc_opt::ControlFlowAnalysis,
+    ) {
+        self.flag_optimization_stats
+            .condition_materializations_removed = self
+            .flag_optimization_stats
+            .condition_materializations_removed
+            .saturating_add(1);
+        if comparison.then_block == comparison.else_block {
+            self.flag_optimization_stats.redundant_comparisons_removed = self
+                .flag_optimization_stats
+                .redundant_comparisons_removed
+                .saturating_add(1);
+            self.terminator(
+                function,
+                block,
+                &Terminator::Branch {
+                    condition: comparison.condition,
+                    then_block: comparison.then_block,
+                    else_block: comparison.else_block,
+                },
+                next,
+                analysis,
+            );
+            return;
+        }
+
+        self.record_branch_cost(
+            analysis.block_frequency(block),
+            analysis.block_frequency(comparison.then_block),
+        );
+        let left = self.value_location(function, comparison.left);
+        let right = self.value_location(function, comparison.right);
+        match comparison.operator {
+            BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                let (equal_block, mismatch_block) = if comparison.operator == BinaryOperator::Equal
+                {
+                    (comparison.then_block, comparison.else_block)
+                } else {
+                    (comparison.else_block, comparison.then_block)
+                };
+                self.branch_if_equal(
+                    left,
+                    right,
+                    self.block_symbol(function, equal_block),
+                    self.block_symbol(function, mismatch_block),
+                    next == Some(equal_block),
+                );
+                self.record_comparison_fallthrough(next == Some(equal_block));
+            }
+            BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual => {
+                let signed = function.value_types[comparison.left.0 as usize].pointer_depth == 0
+                    && matches!(
+                        function.value_types[comparison.left.0 as usize].kind,
+                        TypeKind::Integer(integer) if integer.is_signed()
+                    );
+                let (lower_left, lower_right, lower_block, not_lower_block) =
+                    match comparison.operator {
+                        BinaryOperator::Less => {
+                            (left, right, comparison.then_block, comparison.else_block)
+                        }
+                        BinaryOperator::LessEqual => {
+                            (right, left, comparison.else_block, comparison.then_block)
+                        }
+                        BinaryOperator::Greater => {
+                            (right, left, comparison.then_block, comparison.else_block)
+                        }
+                        BinaryOperator::GreaterEqual => {
+                            (left, right, comparison.else_block, comparison.then_block)
+                        }
+                        _ => unreachable!("comparison operator was checked"),
+                    };
+                self.branch_if_less(
+                    lower_left,
+                    lower_right,
+                    signed,
+                    self.block_symbol(function, lower_block),
+                    self.block_symbol(function, not_lower_block),
+                    next == Some(not_lower_block),
+                );
+                self.record_comparison_fallthrough(next == Some(not_lower_block));
+            }
+            _ => unreachable!("only comparisons are fused"),
+        }
+    }
+
+    fn branch_if_equal(
+        &mut self,
+        left: Location,
+        right: Location,
+        equal_symbol: SymbolId,
+        mismatch_symbol: SymbolId,
+        equal_fallthrough: bool,
+    ) {
+        for offset in 0..left.size {
+            self.lda_location_flags_dead(left, offset);
+            self.memory_operation(0xc5, 0xcd, "cmp", right, offset);
+            self.relative_symbol(0xd0, "bne", mismatch_symbol);
+        }
+        if !equal_fallthrough {
+            self.absolute_symbol(0x4c, "jmp", equal_symbol);
+        }
+    }
+
+    fn record_comparison_fallthrough(&mut self, fallthrough: bool) {
+        if fallthrough {
+            self.layout_stats.conditional_fallthroughs =
+                self.layout_stats.conditional_fallthroughs.saturating_add(1);
+            self.layout_stats.bytes_saved = self.layout_stats.bytes_saved.saturating_add(3);
         }
     }
 
@@ -1647,16 +1827,16 @@ impl Emitter {
                             });
                             return;
                         };
-                        self.lda_location(source, offset);
+                        self.lda_location_flags_dead(source, offset);
                         self.sta_zero_page(address);
                     }
                     if source.size > 2 {
-                        self.ldy_location(source, 2);
+                        self.ldy_location_flags_dead(source, 2);
                     }
                     if source.size > 1 {
-                        self.ldx_location(source, 1);
+                        self.ldx_location_flags_dead(source, 1);
                     }
-                    self.lda_location(source, 0);
+                    self.lda_location_flags_dead(source, 0);
                 }
                 self.emit_byte(0x60, "rts");
             }
@@ -1680,7 +1860,11 @@ impl Emitter {
     }
 
     fn reduce_location(&mut self, location: Location) {
-        self.lda_location(location, 0);
+        if location.size > 1 {
+            self.lda_location_flags_dead(location, 0);
+        } else {
+            self.lda_location(location, 0);
+        }
         for offset in 1..location.size {
             self.memory_operation(0x05, 0x0d, "ora", location, offset);
         }
@@ -1689,7 +1873,7 @@ impl Emitter {
     fn store_boolean(&mut self, destination: Location) {
         self.sta_location(destination, 0);
         for offset in 1..destination.size {
-            self.lda_immediate(0);
+            self.lda_immediate_flags_dead(0);
             self.sta_location(destination, offset);
         }
     }
@@ -1706,15 +1890,15 @@ impl Emitter {
         let mismatch_symbol = self.local_symbol(&mismatch_name);
         let end_symbol = self.local_symbol(&end_name);
         for offset in 0..left.size {
-            self.lda_location(left, offset);
+            self.lda_location_flags_dead(left, offset);
             self.memory_operation(0xc5, 0xcd, "cmp", right, offset);
             self.relative_symbol(0xd0, "bne", mismatch_symbol);
         }
-        self.lda_immediate(u8::from(equal));
+        self.lda_immediate_flags_dead(u8::from(equal));
         self.absolute_symbol(0x4c, "jmp", end_symbol);
         self.define(mismatch_symbol);
         self.assembly.push_str(&format!("{mismatch_name}:\n"));
-        self.lda_immediate(u8::from(!equal));
+        self.lda_immediate_flags_dead(u8::from(!equal));
         self.define(end_symbol);
         self.assembly.push_str(&format!("{end_name}:\n"));
         self.store_boolean(destination);
@@ -1747,14 +1931,15 @@ impl Emitter {
             signed,
             lower_symbol,
             not_lower_symbol,
+            false,
         );
         self.define(lower_symbol);
         self.assembly.push_str(&format!("{lower_name}:\n"));
-        self.lda_immediate(u8::from(lower_is_true));
+        self.lda_immediate_flags_dead(u8::from(lower_is_true));
         self.absolute_symbol(0x4c, "jmp", end_symbol);
         self.define(not_lower_symbol);
         self.assembly.push_str(&format!("{not_lower_name}:\n"));
-        self.lda_immediate(u8::from(!lower_is_true));
+        self.lda_immediate_flags_dead(u8::from(!lower_is_true));
         self.define(end_symbol);
         self.assembly.push_str(&format!("{end_name}:\n"));
         self.store_boolean(destination);
@@ -1767,16 +1952,17 @@ impl Emitter {
         signed: bool,
         lower_symbol: SymbolId,
         not_lower_symbol: SymbolId,
+        not_lower_fallthrough: bool,
     ) {
         for offset in (0..left.size).rev() {
             if signed && offset == left.size - 1 {
-                self.lda_location(left, offset);
+                self.lda_location_flags_dead(left, offset);
                 self.immediate(0x49, "eor", 0x80);
                 self.sta_zero_page(ARGUMENT_SPILL_BASE);
-                self.lda_location(right, offset);
+                self.lda_location_flags_dead(right, offset);
                 self.immediate(0x49, "eor", 0x80);
                 self.sta_zero_page(ARGUMENT_SPILL_BASE + 1);
-                self.lda_zero_page(ARGUMENT_SPILL_BASE);
+                self.lda_zero_page_flags_dead(ARGUMENT_SPILL_BASE);
                 self.absolute_or_zero_page(
                     0xc5,
                     0xcd,
@@ -1785,13 +1971,15 @@ impl Emitter {
                     true,
                 );
             } else {
-                self.lda_location(left, offset);
+                self.lda_location_flags_dead(left, offset);
                 self.memory_operation(0xc5, 0xcd, "cmp", right, offset);
             }
             self.relative_symbol(0x90, "bcc", lower_symbol);
             self.relative_symbol(0xd0, "bne", not_lower_symbol);
         }
-        self.absolute_symbol(0x4c, "jmp", not_lower_symbol);
+        if !not_lower_fallthrough {
+            self.absolute_symbol(0x4c, "jmp", not_lower_symbol);
+        }
     }
 
     fn block_symbol(&self, function: &Function, block: BlockId) -> SymbolId {
@@ -1841,11 +2029,15 @@ impl Emitter {
     }
 
     fn lda_immediate(&mut self, value: u8) {
-        self.load_immediate(CpuRegister::A, 0xa9, "lda", value);
+        self.load_immediate(CpuRegister::A, 0xa9, "lda", value, LoadFlags::Live);
     }
 
-    fn ldy_immediate(&mut self, value: u8) {
-        self.load_immediate(CpuRegister::Y, 0xa0, "ldy", value);
+    fn lda_immediate_flags_dead(&mut self, value: u8) {
+        self.load_immediate(CpuRegister::A, 0xa9, "lda", value, LoadFlags::Dead);
+    }
+
+    fn ldy_immediate_flags_dead(&mut self, value: u8) {
+        self.load_immediate(CpuRegister::Y, 0xa0, "ldy", value, LoadFlags::Dead);
     }
 
     fn immediate(&mut self, opcode: u8, mnemonic: &str, value: u8) {
@@ -1860,11 +2052,18 @@ impl Emitter {
         }
     }
 
-    fn load_immediate(&mut self, register: CpuRegister, opcode: u8, mnemonic: &str, value: u8) {
+    fn load_immediate(
+        &mut self,
+        register: CpuRegister,
+        opcode: u8,
+        mnemonic: &str,
+        value: u8,
+        flags: LoadFlags,
+    ) {
         if self.registers.get(register).value == KnownValue::Immediate(value)
-            && self.registers.nz_from == Some(register)
+            && (flags == LoadFlags::Dead || self.registers.nz_from == Some(register))
         {
-            self.record_reused_load(2, 2);
+            self.record_reused_load(2, 2, flags);
             return;
         }
         self.emit_bytes(&[opcode, value], &format!("{mnemonic} #${value:02x}"));
@@ -1880,48 +2079,46 @@ impl Emitter {
 
     fn load_location(
         &mut self,
-        register: CpuRegister,
-        zero_page_opcode: u8,
-        absolute_opcode: u8,
-        mnemonic: &str,
+        instruction: LoadInstruction,
         location: Location,
         offset: u16,
+        flags: LoadFlags,
     ) {
         debug_assert!(offset < location.size);
         self.load_address(
-            register,
-            zero_page_opcode,
-            absolute_opcode,
-            mnemonic,
+            instruction,
             location.address + offset,
             location.zero_page,
+            flags,
         );
     }
 
     fn load_address(
         &mut self,
-        register: CpuRegister,
-        zero_page_opcode: u8,
-        absolute_opcode: u8,
-        mnemonic: &str,
+        instruction: LoadInstruction,
         address: u16,
         zero_page: bool,
+        flags: LoadFlags,
     ) {
         if Self::trackable_memory(address)
-            && self.registers.get(register).memory == Some(address)
-            && self.registers.nz_from == Some(register)
+            && self.registers.get(instruction.register).memory == Some(address)
+            && (flags == LoadFlags::Dead || self.registers.nz_from == Some(instruction.register))
         {
-            self.record_reused_load(if zero_page { 2 } else { 3 }, if zero_page { 3 } else { 4 });
+            self.record_reused_load(
+                if zero_page { 2 } else { 3 },
+                if zero_page { 3 } else { 4 },
+                flags,
+            );
             return;
         }
         self.emit_address(
-            zero_page_opcode,
-            absolute_opcode,
-            mnemonic,
+            instruction.zero_page_opcode,
+            instruction.absolute_opcode,
+            instruction.mnemonic,
             address,
             zero_page,
         );
-        self.record_memory_load(register, address);
+        self.record_memory_load(instruction.register, address);
     }
 
     fn store_location(
@@ -1964,7 +2161,11 @@ impl Emitter {
     }
 
     fn lda_location(&mut self, location: Location, offset: u16) {
-        self.load_location(CpuRegister::A, 0xa5, 0xad, "lda", location, offset);
+        self.load_location(LDA, location, offset, LoadFlags::Live);
+    }
+
+    fn lda_location_flags_dead(&mut self, location: Location, offset: u16) {
+        self.load_location(LDA, location, offset, LoadFlags::Dead);
     }
 
     fn sta_location(&mut self, location: Location, offset: u16) {
@@ -2059,7 +2260,11 @@ impl Emitter {
     }
 
     fn ldx_location(&mut self, location: Location, offset: u16) {
-        self.load_location(CpuRegister::X, 0xa6, 0xae, "ldx", location, offset);
+        self.load_location(LDX, location, offset, LoadFlags::Live);
+    }
+
+    fn ldx_location_flags_dead(&mut self, location: Location, offset: u16) {
+        self.load_location(LDX, location, offset, LoadFlags::Dead);
     }
 
     fn stx_location(&mut self, location: Location, offset: u16) {
@@ -2067,15 +2272,19 @@ impl Emitter {
     }
 
     fn ldy_location(&mut self, location: Location, offset: u16) {
-        self.load_location(CpuRegister::Y, 0xa4, 0xac, "ldy", location, offset);
+        self.load_location(LDY, location, offset, LoadFlags::Live);
+    }
+
+    fn ldy_location_flags_dead(&mut self, location: Location, offset: u16) {
+        self.load_location(LDY, location, offset, LoadFlags::Dead);
     }
 
     fn sty_location(&mut self, location: Location, offset: u16) {
         self.store_location(CpuRegister::Y, 0x84, 0x8c, "sty", location, offset);
     }
 
-    fn lda_zero_page(&mut self, address: u8) {
-        self.load_address(CpuRegister::A, 0xa5, 0xad, "lda", u16::from(address), true);
+    fn lda_zero_page_flags_dead(&mut self, address: u8) {
+        self.load_address(LDA, u16::from(address), true, LoadFlags::Dead);
     }
 
     fn sta_zero_page(&mut self, address: u8) {
@@ -2192,9 +2401,15 @@ impl Emitter {
         }
     }
 
-    fn record_reused_load(&mut self, bytes: u32, cycles: u32) {
+    fn record_reused_load(&mut self, bytes: u32, cycles: u32, flags: LoadFlags) {
         self.register_reuse_stats.loads_removed =
             self.register_reuse_stats.loads_removed.saturating_add(1);
+        if flags == LoadFlags::Dead {
+            self.register_reuse_stats.flag_dead_loads_removed = self
+                .register_reuse_stats
+                .flag_dead_loads_removed
+                .saturating_add(1);
+        }
         self.register_reuse_stats.bytes_saved =
             self.register_reuse_stats.bytes_saved.saturating_add(bytes);
         self.register_reuse_stats.cycles_saved = self
@@ -2307,7 +2522,7 @@ impl Emitter {
             .unwrap_or(u32::MAX)
             .saturating_mul(3);
         self.optimization_report.push_str(&format!(
-            "Control-flow blocks placed: {}\nFall-through jumps removed: {}\nConditional fall-throughs: {}\nBranches inverted: {}\nBranches relaxed: {}\nLayout bytes saved before relaxation: {}\nRelaxation bytes added: {}\nWeighted branch base cycles: {}\nWeighted taken-branch cycles: {}\nWeighted page-cross risk cycles: {}\nRegister loads removed: {}\nRegister-forwarding bytes saved: {}\nRegister-forwarding cycles saved: {}\n",
+            "Control-flow blocks placed: {}\nFall-through jumps removed: {}\nConditional fall-throughs: {}\nBranches inverted: {}\nBranches relaxed: {}\nLayout bytes saved before relaxation: {}\nRelaxation bytes added: {}\nWeighted branch base cycles: {}\nWeighted taken-branch cycles: {}\nWeighted page-cross risk cycles: {}\nRegister loads removed: {}\nFlag-dead loads removed: {}\nCondition materializations removed: {}\nRedundant comparisons removed: {}\nRegister-forwarding bytes saved: {}\nRegister-forwarding cycles saved: {}\n",
             self.layout_stats.blocks_placed,
             self.layout_stats.fallthrough_jumps,
             self.layout_stats.conditional_fallthroughs,
@@ -2319,6 +2534,10 @@ impl Emitter {
             self.layout_stats.weighted_branch_taken_cycles,
             self.layout_stats.weighted_page_cross_cycles,
             self.register_reuse_stats.loads_removed,
+            self.register_reuse_stats.flag_dead_loads_removed,
+            self.flag_optimization_stats
+                .condition_materializations_removed,
+            self.flag_optimization_stats.redundant_comparisons_removed,
             self.register_reuse_stats.bytes_saved,
             self.register_reuse_stats.cycles_saved,
         ));
@@ -2358,6 +2577,112 @@ impl Emitter {
             span: Some(span),
         });
     }
+}
+
+fn fused_comparison(
+    block: &nesc_mir::BasicBlock,
+    value_use_counts: &[u32],
+) -> Option<FusedComparison> {
+    let Terminator::Branch {
+        condition,
+        then_block,
+        else_block,
+    } = block.terminator.as_ref()?
+    else {
+        return None;
+    };
+    if value_use_counts.get(condition.0 as usize).copied() != Some(1) {
+        return None;
+    }
+    let instruction = block.instructions.last()?;
+    if instruction.result != Some(*condition) || instruction.effect != nesc_mir::Effect::Pure {
+        return None;
+    }
+    let InstructionKind::Binary {
+        operator,
+        left,
+        right,
+    } = &instruction.kind
+    else {
+        return None;
+    };
+    matches!(
+        *operator,
+        BinaryOperator::Equal
+            | BinaryOperator::NotEqual
+            | BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual
+    )
+    .then_some(FusedComparison {
+        condition: *condition,
+        operator: *operator,
+        left: *left,
+        right: *right,
+        then_block: *then_block,
+        else_block: *else_block,
+    })
+}
+
+fn value_use_counts(function: &Function) -> Vec<u32> {
+    let mut counts = vec![0_u32; function.value_types.len()];
+    let mut record = |value: ValueId| {
+        if let Some(count) = counts.get_mut(value.0 as usize) {
+            *count = count.saturating_add(1);
+        }
+    };
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            match &instruction.kind {
+                InstructionKind::Constant(_)
+                | InstructionKind::LoadLocal(_)
+                | InstructionKind::LoadGlobal(_)
+                | InstructionKind::AddressOfLocal(_)
+                | InstructionKind::AddressOfGlobal(_) => {}
+                InstructionKind::StoreLocal { value, .. }
+                | InstructionKind::StoreGlobal { value, .. }
+                | InstructionKind::Cast { value, .. } => record(*value),
+                InstructionKind::BoundsCheck { index, .. } => record(*index),
+                InstructionKind::PointerOffset { base, offset, .. }
+                | InstructionKind::Binary {
+                    left: base,
+                    right: offset,
+                    ..
+                } => {
+                    record(*base);
+                    record(*offset);
+                }
+                InstructionKind::LoadIndirect { address, .. }
+                | InstructionKind::Unary {
+                    operand: address, ..
+                } => record(*address),
+                InstructionKind::StoreIndirect { address, value, .. } => {
+                    record(*address);
+                    record(*value);
+                }
+                InstructionKind::Call { arguments, .. } => {
+                    for argument in arguments {
+                        record(*argument);
+                    }
+                }
+                InstructionKind::InlineAssembly(assembly) => {
+                    for input in &assembly.inputs {
+                        record(input.value);
+                    }
+                }
+            }
+        }
+        match block.terminator.as_ref() {
+            Some(Terminator::Branch { condition, .. }) => record(*condition),
+            Some(Terminator::Return(Some(value))) => record(*value),
+            Some(Terminator::Jump(_))
+            | Some(Terminator::Return(None))
+            | Some(Terminator::Unreachable)
+            | None => {}
+        }
+    }
+    counts
 }
 
 fn inverse_branch(opcode: u8) -> Option<(u8, &'static str)> {
@@ -2742,6 +3067,189 @@ mod tests {
             generated
                 .optimization_report
                 .contains("Register loads removed: 1")
+        );
+    }
+
+    #[test]
+    fn removes_loads_when_only_dead_flags_would_change() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let void = Type::scalar(TypeKind::Void);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let module = Module {
+            globals: Vec::new(),
+            global_data: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "main".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: void,
+                parameters: Vec::new(),
+                locals: vec![Local {
+                    id: LocalId(0),
+                    name: "sink".to_owned(),
+                    ty: byte.clone(),
+                    parameter: false,
+                }],
+                entry: Some(BlockId(0)),
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        Instruction {
+                            result: Some(ValueId(0)),
+                            kind: InstructionKind::Constant(23),
+                            effect: Effect::Pure,
+                            span,
+                        },
+                        Instruction {
+                            result: None,
+                            kind: InstructionKind::InlineAssembly(InlineAssembly {
+                                template: "nop".to_owned(),
+                                inputs: vec![AssemblyInput {
+                                    register: AssemblyRegister::X,
+                                    value: ValueId(0),
+                                }],
+                                outputs: Vec::new(),
+                                clobbers: AssemblyClobbers::default(),
+                                bank_effect: false,
+                                calls: Vec::new(),
+                                stack_bytes: 0,
+                            }),
+                            effect: Effect::Volatile,
+                            span,
+                        },
+                        Instruction {
+                            result: None,
+                            kind: InstructionKind::StoreLocal {
+                                local: LocalId(0),
+                                value: ValueId(0),
+                            },
+                            effect: Effect::Write,
+                            span,
+                        },
+                    ],
+                    terminator: Some(Terminator::Return(None)),
+                }],
+                value_types: vec![byte],
+            }],
+        };
+
+        let generated = generate(&module).expect("code generation");
+        assert_eq!(
+            generated
+                .assembly
+                .lines()
+                .filter(|line| line.trim_start().starts_with("lda "))
+                .count(),
+            1,
+            "the store does not consume N/Z, so A can be forwarded:\n{}",
+            generated.assembly
+        );
+        assert!(
+            generated
+                .optimization_report
+                .contains("Flag-dead loads removed: 1")
+        );
+    }
+
+    #[test]
+    fn branches_directly_from_single_use_comparisons() {
+        let byte = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8));
+        let void = Type::scalar(TypeKind::Void);
+        let span = SourceSpan::new(SourceId::new(0), 0, 1);
+        let mut module = Module {
+            globals: Vec::new(),
+            global_data: Vec::new(),
+            functions: vec![Function {
+                id: FunctionId(0),
+                name: "compare".to_owned(),
+                placement: BankPlacement::Fixed,
+                return_type: void,
+                parameters: vec![LocalId(0), LocalId(1)],
+                locals: vec![
+                    Local {
+                        id: LocalId(0),
+                        name: "left".to_owned(),
+                        ty: byte.clone(),
+                        parameter: true,
+                    },
+                    Local {
+                        id: LocalId(1),
+                        name: "right".to_owned(),
+                        ty: byte.clone(),
+                        parameter: true,
+                    },
+                ],
+                entry: Some(BlockId(0)),
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        instructions: vec![
+                            Instruction {
+                                result: Some(ValueId(0)),
+                                kind: InstructionKind::LoadLocal(LocalId(0)),
+                                effect: Effect::Read,
+                                span,
+                            },
+                            Instruction {
+                                result: Some(ValueId(1)),
+                                kind: InstructionKind::LoadLocal(LocalId(1)),
+                                effect: Effect::Read,
+                                span,
+                            },
+                            Instruction {
+                                result: Some(ValueId(2)),
+                                kind: InstructionKind::Binary {
+                                    operator: BinaryOperator::Equal,
+                                    left: ValueId(0),
+                                    right: ValueId(1),
+                                },
+                                effect: Effect::Pure,
+                                span,
+                            },
+                        ],
+                        terminator: Some(Terminator::Branch {
+                            condition: ValueId(2),
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        }),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        instructions: Vec::new(),
+                        terminator: Some(Terminator::Return(None)),
+                    },
+                ],
+                value_types: vec![byte.clone(), byte.clone(), byte],
+            }],
+        };
+
+        let generated = generate(&module).expect("code generation");
+        assert_eq!(generated.assembly.matches("cmp $").count(), 1);
+        assert!(!generated.assembly.contains(".__nesc_compare_"));
+        assert!(!generated.assembly.contains("lda #$01"));
+        assert!(!generated.assembly.contains("lda #$00"));
+        assert!(
+            generated
+                .optimization_report
+                .contains("Condition materializations removed: 1")
+        );
+
+        module.functions[0].blocks[0].terminator = Some(Terminator::Branch {
+            condition: ValueId(2),
+            then_block: BlockId(1),
+            else_block: BlockId(1),
+        });
+        let generated = generate(&module).expect("redundant comparison code generation");
+        assert!(!generated.assembly.contains("cmp $"));
+        assert!(
+            generated
+                .optimization_report
+                .contains("Redundant comparisons removed: 1")
         );
     }
 
