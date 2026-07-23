@@ -876,10 +876,36 @@ impl<'a> Builder<'a> {
                 let right_span = right.span;
                 let left = self.lower_expression(left)?;
                 let right = self.lower_expression(right)?;
+                let comparison = matches!(
+                    operator,
+                    BinaryOperator::Equal
+                        | BinaryOperator::NotEqual
+                        | BinaryOperator::Less
+                        | BinaryOperator::LessEqual
+                        | BinaryOperator::Greater
+                        | BinaryOperator::GreaterEqual
+                );
                 let (left, right) = if ty.kind != TypeKind::Bool && ty.pointer_depth == 0 {
                     (
                         self.cast_if_needed(left, &left_type, &ty, left_span),
                         self.cast_if_needed(right, &right_type, &ty, right_span),
+                    )
+                } else if comparison
+                    && left_type.pointer_depth == 0
+                    && right_type.pointer_depth == 0
+                    && left_type.is_integer()
+                    && right_type.is_integer()
+                    && (type_size(&left_type) != type_size(&right_type)
+                        || element_is_signed(&left_type) != element_is_signed(&right_type))
+                {
+                    // Codegen compares operands byte-for-byte, so mismatched
+                    // widths or signedness must first meet on the usual
+                    // arithmetic conversion type. Same-width same-signedness
+                    // pairs skip this and keep narrow compares.
+                    let common = comparison_operand_type(&left_type, &right_type);
+                    (
+                        self.cast_if_needed(left, &left_type, &common, left_span),
+                        self.cast_if_needed(right, &right_type, &common, right_span),
                     )
                 } else {
                     (left, right)
@@ -1901,6 +1927,55 @@ fn compare(
     } else {
         u64::from(unsigned_compare(&lhs, &rhs))
     }
+}
+
+/// Mirrors the frontend's integer promotion: 8-bit and boolean operands
+/// promote to `i16` before arithmetic and mixed comparisons.
+fn promote_integer(ty: &Type) -> Type {
+    match ty.kind {
+        TypeKind::Bool | TypeKind::Integer(IntegerType::U8 | IntegerType::I8) => {
+            Type::scalar(TypeKind::Integer(IntegerType::I16))
+        }
+        kind => Type::scalar(kind),
+    }
+}
+
+/// Mirrors the frontend's usual arithmetic conversion so mismatched
+/// comparison operands share one width and signedness in MIR.
+fn comparison_operand_type(left: &Type, right: &Type) -> Type {
+    let left = promote_integer(left);
+    let right = promote_integer(right);
+    let (TypeKind::Integer(left_integer), TypeKind::Integer(right_integer)) =
+        (left.kind, right.kind)
+    else {
+        return left;
+    };
+    let width = left_integer.width().max(right_integer.width());
+    let signed = if left_integer.is_signed() == right_integer.is_signed() {
+        left_integer.is_signed()
+    } else {
+        let unsigned_width = if left_integer.is_signed() {
+            right_integer.width()
+        } else {
+            left_integer.width()
+        };
+        let signed_width = if left_integer.is_signed() {
+            left_integer.width()
+        } else {
+            right_integer.width()
+        };
+        signed_width > unsigned_width
+    };
+    Type::scalar(TypeKind::Integer(match (width, signed) {
+        (8, false) => IntegerType::U8,
+        (8, true) => IntegerType::I8,
+        (16, false) => IntegerType::U16,
+        (24, false) => IntegerType::U24,
+        (24, true) => IntegerType::I24,
+        (32, false) => IntegerType::U32,
+        (32, true) => IntegerType::I32,
+        _ => IntegerType::I16,
+    }))
 }
 
 fn expression_is_signed(expression: &Expression) -> bool {
