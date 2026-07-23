@@ -2020,17 +2020,21 @@ NES_MAIN int main(void) {
                 .filter(|pixel| *pixel == 0x16)
                 .count()
         };
-        let tank_pixels = machine
-            .framebuffer()
-            .iter()
-            .filter(|pixel| **pixel == 0x1a)
-            .count();
+        let color_pixels = |machine: &nesc_emulator::Machine, color: u8| {
+            machine
+                .framebuffer()
+                .iter()
+                .filter(|pixel| **pixel == color)
+                .count()
+        };
+        let tank_pixels = color_pixels(&machine, 0x1a);
         assert!(tank_pixels > 100, "tank body missing: {tank_pixels}");
+        assert!(color_pixels(&machine, 0x10) > 50, "enemy tank body missing");
         // 4 brick tiles x 48 brick-colored pixels (2 of 8 rows are mortar).
         assert_eq!(brick_pixels(&machine), 192, "brick wall cell missing");
         assert_eq!(
             machine.framebuffer_checksum(),
-            24_889_159_808,
+            24_848_316_630,
             "golden stage frame diverged"
         );
 
@@ -2053,10 +2057,24 @@ NES_MAIN int main(void) {
             64,
             "tank should be blocked flush against the wall"
         );
+
+        // Fire again through the destroyed cell: the shell crosses the gap
+        // and destroys the patrolling enemy, which flips the backdrop to the
+        // victory green.
+        machine.set_controller(0, 0x80).expect("press A again");
+        machine.run_frames(2, limits).expect("second fire frames");
+        machine.set_controller(0, 0x00).expect("release again");
+        machine.run_frames(30, limits).expect("victory frames");
+
+        assert_eq!(color_pixels(&machine, 0x10), 0, "enemy should be destroyed");
+        assert!(
+            color_pixels(&machine, 0x1a) > 30_000,
+            "victory backdrop should fill the screen"
+        );
         assert_eq!(
             machine.framebuffer_checksum(),
-            24_848_210_752,
-            "golden post-playthrough frame diverged"
+            39_000_219_172,
+            "golden victory frame diverged"
         );
     }
 
