@@ -289,6 +289,7 @@ pub fn generate_with_config(
             long_branches.extend(overflowing);
             continue;
         }
+        emitter.append_rodata_assembly(module);
         emitter.finish_layout_report();
         emitter.object.validate().map_err(|errors| {
             errors
@@ -412,6 +413,7 @@ struct Emitter {
     function_sections: Vec<Option<SectionId>>,
     function_symbols: Vec<SymbolId>,
     block_symbols: HashMap<(u32, u32), SymbolId>,
+    rodata_symbols: HashMap<u32, SymbolId>,
     helper_symbols: HashMap<String, SymbolId>,
     constants: HashMap<(u32, u32), u64>,
     unavoidable_helpers: BTreeSet<String>,
@@ -529,6 +531,42 @@ impl Emitter {
                 }
             }
         }
+        let mut rodata_symbols = HashMap::new();
+        if module.global_data.iter().any(Option::is_some) {
+            let rodata = object
+                .add_section(".rodata", SectionKind::ReadOnlyData, 1)
+                .map_err(|error| {
+                    vec![CodegenError {
+                        message: error.to_string(),
+                        span: None,
+                    }]
+                })?;
+            for (index, data) in module.global_data.iter().enumerate() {
+                let Some(constant) = data else {
+                    continue;
+                };
+                let offset = object.sections[rodata.0 as usize].bytes.len();
+                let symbol = object
+                    .add_symbol(
+                        format!("__nesc_rodata_{index}"),
+                        Some(rodata),
+                        offset as u32,
+                        SymbolKind::Label,
+                        Binding::Local,
+                    )
+                    .map_err(|error| {
+                        vec![CodegenError {
+                            message: error.to_string(),
+                            span: None,
+                        }]
+                    })?;
+                object
+                    .section_bytes_mut(rodata)
+                    .expect("rodata section exists")
+                    .extend_from_slice(&constant.bytes);
+                rodata_symbols.insert(index as u32, symbol);
+            }
+        }
         let unavoidable_helpers = required_arithmetic_helpers(module, &constants);
         Ok(Self {
             object,
@@ -536,6 +574,7 @@ impl Emitter {
             function_sections,
             function_symbols,
             block_symbols,
+            rodata_symbols,
             helper_symbols: HashMap::new(),
             constants,
             unavoidable_helpers,
@@ -610,17 +649,26 @@ impl Emitter {
             }
             InstructionKind::LoadGlobal(global) => {
                 if let Some(result) = instruction.result {
-                    self.copy_location(
-                        self.global_location(*global),
-                        self.value_location(function, result),
-                    );
+                    let destination = self.value_location(function, result);
+                    if let Some(symbol) = self.rodata_symbols.get(&global.0).copied() {
+                        self.load_rodata(symbol, destination);
+                    } else {
+                        self.copy_location(self.global_location(*global), destination);
+                    }
                 }
             }
             InstructionKind::StoreGlobal { global, value } => {
-                self.copy_location(
-                    self.value_location(function, *value),
-                    self.global_location(*global),
-                );
+                if self.rodata_symbols.contains_key(&global.0) {
+                    self.error(
+                        "cannot store to a const global placed in PRG-ROM",
+                        instruction.span,
+                    );
+                } else {
+                    self.copy_location(
+                        self.value_location(function, *value),
+                        self.global_location(*global),
+                    );
+                }
             }
             InstructionKind::AddressOfLocal(local) => {
                 if let Some(result) = instruction.result {
@@ -632,10 +680,15 @@ impl Emitter {
             }
             InstructionKind::AddressOfGlobal(global) => {
                 if let Some(result) = instruction.result {
-                    self.write_constant(
-                        self.value_location(function, result),
-                        u64::from(self.global_location(*global).address),
-                    );
+                    let destination = self.value_location(function, result);
+                    if let Some(symbol) = self.rodata_symbols.get(&global.0).copied() {
+                        self.write_symbol_address(symbol, destination);
+                    } else {
+                        self.write_constant(
+                            destination,
+                            u64::from(self.global_location(*global).address),
+                        );
+                    }
                 }
             }
             InstructionKind::BoundsCheck { index, length } => {
@@ -1918,6 +1971,93 @@ impl Emitter {
         self.store_location(CpuRegister::A, 0x85, 0x8d, "sta", location, offset);
     }
 
+    /// Appends a readable listing of PRG-ROM constant payloads to the
+    /// generated assembly text.
+    fn append_rodata_assembly(&mut self, module: &Module) {
+        if self.rodata_symbols.is_empty() {
+            return;
+        }
+        self.assembly.push_str("\n.segment \"RODATA\"\n");
+        let mut indices = self.rodata_symbols.keys().copied().collect::<Vec<_>>();
+        indices.sort_unstable();
+        for index in indices {
+            let Some(Some(constant)) = module.global_data.get(index as usize) else {
+                continue;
+            };
+            self.assembly.push_str(&format!("__nesc_rodata_{index}:"));
+            for chunk in constant.bytes.chunks(8) {
+                self.assembly.push_str("\n    .byte ");
+                self.assembly.push_str(
+                    &chunk
+                        .iter()
+                        .map(|byte| format!("${byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            self.assembly.push('\n');
+        }
+    }
+
+    /// Copies a PRG-ROM constant into RAM storage byte by byte through
+    /// symbol-relocated absolute loads.
+    fn load_rodata(&mut self, symbol: SymbolId, destination: Location) {
+        for offset in 0..destination.size {
+            self.lda_absolute_symbol(symbol, offset);
+            self.sta_location(destination, offset);
+        }
+    }
+
+    fn lda_absolute_symbol(&mut self, symbol: SymbolId, addend: u16) {
+        let name = self.object.symbols[symbol.0 as usize].name.clone();
+        let assembly = if addend == 0 {
+            format!("lda {name}")
+        } else {
+            format!("lda {name}+{addend}")
+        };
+        self.emit_byte(0xad, &assembly);
+        let offset = self.code_len();
+        self.emit_bytes(&[0, 0], "");
+        self.object.add_relocation(Relocation {
+            section: self.code,
+            offset: offset as u32,
+            kind: RelocationKind::Absolute16,
+            symbol,
+            addend: i32::from(addend),
+        });
+        self.registers.invalidate_register(CpuRegister::A);
+        self.registers.nz_from = Some(CpuRegister::A);
+    }
+
+    /// Writes the link-time address of a PRG-ROM symbol into a little-endian
+    /// pointer location through byte relocations.
+    fn write_symbol_address(&mut self, symbol: SymbolId, destination: Location) {
+        let name = self.object.symbols[symbol.0 as usize].name.clone();
+        let parts = [
+            (RelocationKind::AbsoluteLow8, '<'),
+            (RelocationKind::AbsoluteHigh8, '>'),
+        ];
+        for offset in 0..destination.size {
+            if let Some((kind, prefix)) = parts.get(usize::from(offset)).copied() {
+                self.emit_byte(0xa9, &format!("lda #{prefix}{name}"));
+                let operand = self.code_len();
+                self.emit_byte(0, "");
+                self.object.add_relocation(Relocation {
+                    section: self.code,
+                    offset: operand as u32,
+                    kind,
+                    symbol,
+                    addend: 0,
+                });
+                self.registers.invalidate_register(CpuRegister::A);
+                self.registers.nz_from = Some(CpuRegister::A);
+            } else {
+                self.lda_immediate(0);
+            }
+            self.sta_location(destination, offset);
+        }
+    }
+
     fn ldx_location(&mut self, location: Location, offset: u16) {
         self.load_location(CpuRegister::X, 0xa6, 0xae, "ldx", location, offset);
     }
@@ -2251,6 +2391,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "main".to_owned(),
@@ -2316,6 +2457,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![
                 Function {
                     id: FunctionId(0),
@@ -2382,6 +2524,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "main".to_owned(),
@@ -2431,6 +2574,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![
                 Function {
                     id: FunctionId(0),
@@ -2554,6 +2698,7 @@ mod tests {
         };
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "main".to_owned(),
@@ -2606,6 +2751,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "multiply".to_owned(),
@@ -2675,6 +2821,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "multiply".to_owned(),
@@ -2774,6 +2921,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "hot_layout".to_owned(),
@@ -2863,6 +3011,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "long_branch".to_owned(),

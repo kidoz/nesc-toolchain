@@ -569,6 +569,7 @@ mod tests {
         let ty = Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::I16));
         let mut module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "main".to_owned(),
@@ -658,10 +659,12 @@ mod tests {
         };
         let mut basic = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![function.clone()],
         };
         let mut balanced = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![function],
         };
 
@@ -680,6 +683,7 @@ mod tests {
         let span = nesc_mir::SourceSpan::new(nesc_mir::SourceId::new(0), 0, 1);
         let mut module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "main".to_owned(),
@@ -768,6 +772,7 @@ mod tests {
         let span = nesc_mir::SourceSpan::new(nesc_mir::SourceId::new(0), 0, 1);
         let mut module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "choose".to_owned(),
@@ -879,6 +884,7 @@ mod tests {
         let span = nesc_mir::SourceSpan::new(nesc_mir::SourceId::new(0), 0, 1);
         let mut module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "address_taken".to_owned(),

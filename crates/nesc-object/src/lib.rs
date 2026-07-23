@@ -92,6 +92,10 @@ pub enum RelocationKind {
     Absolute16,
     /// Signed branch displacement relative to the byte after the relocation.
     Relative8,
+    /// Low byte of a 16-bit absolute address.
+    AbsoluteLow8,
+    /// High byte of a 16-bit absolute address.
+    AbsoluteHigh8,
 }
 
 /// Symbolic patch within a section.
@@ -261,7 +265,9 @@ impl Object {
         for relocation in &self.relocations {
             let width = match relocation.kind {
                 RelocationKind::Absolute16 => 2,
-                RelocationKind::Relative8 => 1,
+                RelocationKind::Relative8
+                | RelocationKind::AbsoluteLow8
+                | RelocationKind::AbsoluteHigh8 => 1,
             };
             match self.sections.get(relocation.section.0 as usize) {
                 Some(section)

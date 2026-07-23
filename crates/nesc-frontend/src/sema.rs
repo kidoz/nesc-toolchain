@@ -443,12 +443,52 @@ impl Checker<'_> {
                             loop_depth: 0,
                             test_function: false,
                         };
-                        let actual = function_checker.expression(initializer);
-                        function_checker.require_conversion(
-                            initializer,
-                            actual.as_ref(),
-                            &variable.ty,
-                        );
+                        if matches!(initializer.kind, ExpressionKind::Array(_)) {
+                            if !variable.ty.is_const
+                                || variable.ty.pointer_depth > 0
+                                || variable.ty.array_lengths.is_empty()
+                            {
+                                function_checker.error(
+                                    "E1353",
+                                    format!(
+                                        "aggregate initializer for `{}` requires a `const` \
+                                         fixed-size array global",
+                                        variable.name
+                                    ),
+                                    initializer.span,
+                                    "invalid aggregate initializer",
+                                );
+                            } else {
+                                let mut element = variable.ty.clone();
+                                element.array_lengths = Vec::new();
+                                function_checker.aggregate_initializer(
+                                    &variable.ty.array_lengths,
+                                    &element,
+                                    initializer,
+                                );
+                            }
+                        } else {
+                            let actual = function_checker.expression(initializer);
+                            function_checker.require_conversion(
+                                initializer,
+                                actual.as_ref(),
+                                &variable.ty,
+                            );
+                            if variable.ty.is_const
+                                && !constant_expression(&self.symbols, initializer)
+                            {
+                                self.error(
+                                    "E1319",
+                                    format!(
+                                        "`const` global `{}` requires a constant expression \
+                                         initializer",
+                                        variable.name
+                                    ),
+                                    initializer.span,
+                                    "not a compile-time constant",
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -720,6 +760,66 @@ impl FunctionChecker<'_, '_> {
         }
     }
 
+    /// Validates one dimension of a `const` global aggregate initializer:
+    /// shape against the array lengths, element conversion, and constness.
+    /// Shorter initializer lists zero-fill the remaining elements.
+    fn aggregate_initializer(
+        &mut self,
+        dimensions: &[u32],
+        element: &Type,
+        expression: &mut Expression,
+    ) {
+        let span = expression.span;
+        match dimensions.split_first() {
+            Some((&length, rest)) => {
+                if let ExpressionKind::Array(elements) = &mut expression.kind {
+                    if elements.len() > length as usize {
+                        self.error(
+                            "E1354",
+                            format!(
+                                "initializer supplies {} elements for an array of {length}",
+                                elements.len()
+                            ),
+                            span,
+                            "too many initializer elements",
+                        );
+                    }
+                    for nested in elements.iter_mut().take(length as usize) {
+                        self.aggregate_initializer(rest, element, nested);
+                    }
+                } else {
+                    self.error(
+                        "E1353",
+                        "array dimension requires a brace-enclosed initializer list",
+                        span,
+                        "expected `{ … }` here",
+                    );
+                }
+            }
+            None => {
+                if matches!(expression.kind, ExpressionKind::Array(_)) {
+                    self.error(
+                        "E1353",
+                        "initializer nests deeper than the array type",
+                        span,
+                        "unexpected `{ … }`",
+                    );
+                    return;
+                }
+                let actual = self.expression(expression);
+                self.require_conversion(expression, actual.as_ref(), element);
+                if !constant_expression(self.symbols, expression) {
+                    self.error(
+                        "E1319",
+                        "`const` array initializer elements must be constant expressions",
+                        span,
+                        "not a compile-time constant",
+                    );
+                }
+            }
+        }
+    }
+
     fn condition(&mut self, expression: &mut Expression) {
         let ty = self.expression(expression);
         if ty
@@ -758,6 +858,18 @@ impl FunctionChecker<'_, '_> {
                 Some(ty)
             }
             ExpressionKind::Name(name) => self.lookup_name(name, expression.span),
+            ExpressionKind::Array(elements) => {
+                for element in elements.iter_mut() {
+                    self.expression(element);
+                }
+                self.error(
+                    "E1353",
+                    "aggregate initializers are only allowed on `const` global arrays",
+                    expression.span,
+                    "invalid aggregate expression",
+                );
+                None
+            }
             ExpressionKind::Unary { operator, operand } => {
                 let operand_type = self.expression(operand);
                 self.unary_type(*operator, operand, operand_type)
@@ -1294,6 +1406,45 @@ fn target_distinct_mismatch(left: &Type, right: &Type) -> bool {
     }
 }
 
+/// Returns whether an expression folds to a compile-time constant usable in a
+/// PRG-ROM `const` global initializer.
+fn constant_expression(symbols: &BTreeMap<String, Symbol>, expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Integer(_) | ExpressionKind::Boolean(_) | ExpressionKind::Character(_) => {
+            true
+        }
+        ExpressionKind::Name(name) => matches!(
+            symbols.get(name),
+            Some(Symbol {
+                kind: SymbolKind::Constant(_),
+                ..
+            })
+        ),
+        ExpressionKind::Unary { operator, operand } => {
+            matches!(
+                operator,
+                UnaryOperator::Plus
+                    | UnaryOperator::Negate
+                    | UnaryOperator::BitwiseNot
+                    | UnaryOperator::LogicalNot
+            ) && constant_expression(symbols, operand)
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            *operator != BinaryOperator::Assign
+                && constant_expression(symbols, left)
+                && constant_expression(symbols, right)
+        }
+        ExpressionKind::Cast {
+            expression: inner, ..
+        } => constant_expression(symbols, inner),
+        _ => false,
+    }
+}
+
 fn is_assignable(expression: &Expression) -> bool {
     matches!(
         expression.kind,
@@ -1418,6 +1569,67 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code() == "E1204")
         );
+    }
+
+    #[test]
+    fn rejects_non_constant_const_global_initializer() {
+        let source = "u8 seed;\nconst u8 copy = seed;\nNES_MAIN int main(void) { return 0; }";
+        let mut sources = SourceMap::new();
+        let id = sources.add(PathBuf::from("test.c"), source.to_owned());
+        let file = PreprocessedFile::new(id, source.to_owned());
+        let mut diagnostics = Vec::new();
+        let tokens = crate::lexer::lex(&file, &sources, &mut diagnostics);
+        let program = crate::parser::parse(tokens, &sources, &mut diagnostics).expect("program");
+        let result = super::check(program, sources, &BTreeMap::new(), false, &mut diagnostics);
+        assert!(result.is_err());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "E1319")
+        );
+    }
+
+    #[test]
+    fn accepts_constant_expression_const_global_initializer() {
+        let source = "const u8 mask = (u8)(0x30 + 0x0F);\nNES_MAIN int main(void) { return 0; }";
+        let mut sources = SourceMap::new();
+        let id = sources.add(PathBuf::from("test.c"), source.to_owned());
+        let file = PreprocessedFile::new(id, source.to_owned());
+        let mut diagnostics = Vec::new();
+        let tokens = crate::lexer::lex(&file, &sources, &mut diagnostics);
+        let program = crate::parser::parse(tokens, &sources, &mut diagnostics).expect("program");
+        let result = super::check(program, sources, &BTreeMap::new(), false, &mut diagnostics);
+        assert!(result.is_ok(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn rejects_misshapen_aggregate_initializers() {
+        let check_source = |source: &str| {
+            let mut sources = SourceMap::new();
+            let id = sources.add(PathBuf::from("test.c"), source.to_owned());
+            let file = PreprocessedFile::new(id, source.to_owned());
+            let mut diagnostics = Vec::new();
+            let tokens = crate::lexer::lex(&file, &sources, &mut diagnostics);
+            let program =
+                crate::parser::parse(tokens, &sources, &mut diagnostics).expect("program");
+            let result = super::check(program, sources, &BTreeMap::new(), false, &mut diagnostics);
+            (result.is_ok(), diagnostics)
+        };
+
+        let (ok, diagnostics) =
+            check_source("u8 table[2] = {1u8, 2u8};\nNES_MAIN int main(void) { return 0; }");
+        assert!(!ok);
+        assert!(diagnostics.iter().any(|d| d.code() == "E1353"));
+
+        let (ok, diagnostics) = check_source(
+            "const u8 table[2] = {1u8, 2u8, 3u8};\nNES_MAIN int main(void) { return 0; }",
+        );
+        assert!(!ok);
+        assert!(diagnostics.iter().any(|d| d.code() == "E1354"));
+
+        let (ok, diagnostics) =
+            check_source("const u8 table[3] = {1u8, 2u8,};\nNES_MAIN int main(void) { return 0; }");
+        assert!(ok, "{diagnostics:?}");
     }
 
     #[test]

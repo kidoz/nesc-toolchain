@@ -45,6 +45,16 @@ pub struct Module {
     pub functions: Vec<Function>,
     /// Global object types indexed by `GlobalId`.
     pub globals: Vec<Type>,
+    /// Folded `const` initializer payloads indexed by `GlobalId`; `None` for
+    /// RAM-resident globals.
+    pub global_data: Vec<Option<GlobalConstant>>,
+}
+
+/// Folded initializer for a `const` global placed in PRG-ROM.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalConstant {
+    /// Little-endian encoded bytes covering the complete object.
+    pub bytes: Vec<u8>,
 }
 
 /// Mapper-aware placement requirement retained through machine-code emission.
@@ -363,6 +373,21 @@ pub fn lower_with_config(
         .map(|global| global.variable.ty.clone())
         .collect::<Vec<_>>();
     let mut errors = Vec::new();
+    let mut global_data = Vec::with_capacity(hir.globals.len());
+    for global in &hir.globals {
+        let variable = &global.variable;
+        if variable.ty.is_const && variable.initializer.is_some() {
+            match fold_global_constant(hir, variable) {
+                Ok(constant) => global_data.push(Some(constant)),
+                Err(error) => {
+                    errors.push(error);
+                    global_data.push(None);
+                }
+            }
+        } else {
+            global_data.push(None);
+        }
+    }
     let mut functions = Vec::with_capacity(hir.functions.len());
     for function in &hir.functions {
         let placement = match function_placement(function) {
@@ -407,7 +432,11 @@ pub fn lower_with_config(
         functions.push(builder.function);
     }
     if errors.is_empty() {
-        Ok(Module { functions, globals })
+        Ok(Module {
+            functions,
+            globals,
+            global_data,
+        })
     } else {
         Err(errors)
     }
@@ -758,6 +787,13 @@ impl<'a> Builder<'a> {
                 ty,
             )),
             ExpressionKind::Name(name) => self.load_name(name, expression.span, ty),
+            ExpressionKind::Array(_) => {
+                self.unsupported(
+                    "aggregate initializers cannot be lowered as expressions",
+                    expression.span,
+                );
+                None
+            }
             ExpressionKind::Unary { operator, operand } => {
                 if matches!(
                     operator,
@@ -1578,6 +1614,304 @@ fn pointee_size(pointer: &Type) -> u16 {
     type_size(&pointee)
 }
 
+/// Folds a `const` global initializer into little-endian PRG-ROM bytes.
+fn fold_global_constant(
+    hir: &HirModule,
+    variable: &nesc_hir::Variable,
+) -> Result<GlobalConstant, LoweringError> {
+    let initializer = variable
+        .initializer
+        .as_ref()
+        .expect("caller checked the initializer");
+    if variable.ty.pointer_depth > 0 {
+        return Err(LoweringError {
+            message: format!(
+                "const pointer global `{}` cannot be placed in PRG-ROM",
+                variable.name
+            ),
+            span: variable.span,
+        });
+    }
+    let mut element = variable.ty.clone();
+    element.array_lengths = Vec::new();
+    let bytes = fold_initializer(hir, initializer, &variable.ty.array_lengths, &element)?;
+    Ok(GlobalConstant { bytes })
+}
+
+/// Folds one initializer dimension, zero-filling short initializer lists.
+fn fold_initializer(
+    hir: &HirModule,
+    expression: &Expression,
+    dimensions: &[u32],
+    element: &Type,
+) -> Result<Vec<u8>, LoweringError> {
+    let Some((&length, rest)) = dimensions.split_first() else {
+        if matches!(expression.kind, ExpressionKind::Array(_)) {
+            return Err(LoweringError {
+                message: "initializer nests deeper than the array type".to_owned(),
+                span: expression.span,
+            });
+        }
+        return fold_constant_element(hir, expression, element);
+    };
+    let ExpressionKind::Array(elements) = &expression.kind else {
+        return Err(LoweringError {
+            message: "array dimension requires a brace-enclosed initializer list".to_owned(),
+            span: expression.span,
+        });
+    };
+    if elements.len() > length as usize {
+        return Err(LoweringError {
+            message: format!(
+                "initializer supplies {} elements for an array of {length}",
+                elements.len()
+            ),
+            span: expression.span,
+        });
+    }
+    let mut nested_type = element.clone();
+    nested_type.array_lengths = rest.to_vec();
+    let stride = usize::from(type_size(&nested_type));
+    let mut bytes = Vec::with_capacity(length as usize * stride);
+    for nested in elements {
+        bytes.extend(fold_initializer(hir, nested, rest, element)?);
+    }
+    bytes.resize(length as usize * stride, 0);
+    Ok(bytes)
+}
+
+/// Folds one scalar initializer element and encodes it for the element type.
+fn fold_constant_element(
+    hir: &HirModule,
+    expression: &Expression,
+    element: &Type,
+) -> Result<Vec<u8>, LoweringError> {
+    let Some(bits) = element.integer_width() else {
+        return Err(LoweringError {
+            message: "const initializer element has no integer width".to_owned(),
+            span: expression.span,
+        });
+    };
+    let value = fold_constant_expression(hir, expression)?;
+    let extended = sign_extended(value, expression.ty.as_ref());
+    let representable = if element_is_signed(element) {
+        let bound = 1i64 << (u32::from(bits) - 1);
+        (-bound..bound).contains(&extended)
+    } else if bits >= 64 {
+        extended >= 0
+    } else {
+        (0..(1i64 << u32::from(bits))).contains(&extended)
+    };
+    if !representable {
+        return Err(LoweringError {
+            message: format!("constant initializer value does not fit an {bits}-bit element"),
+            span: expression.span,
+        });
+    }
+    let width = usize::from(bits.div_ceil(8).max(1));
+    Ok((0..width)
+        .map(|index| (extended as u64 >> (index * 8)) as u8)
+        .collect())
+}
+
+/// Evaluates a constant expression, truncating at every node to its own type
+/// so folding matches the target's fixed-width arithmetic.
+fn fold_constant_expression(
+    hir: &HirModule,
+    expression: &Expression,
+) -> Result<u64, LoweringError> {
+    let raw = match &expression.kind {
+        ExpressionKind::Integer(literal) => literal.value,
+        ExpressionKind::Boolean(value) => u64::from(*value),
+        ExpressionKind::Character(value) => u64::from(*value),
+        ExpressionKind::Name(name) => match hir.constants.get(name) {
+            Some((value, _)) => *value,
+            None => {
+                return Err(LoweringError {
+                    message: format!("`{name}` is not a compile-time constant"),
+                    span: expression.span,
+                });
+            }
+        },
+        ExpressionKind::Unary { operator, operand } => {
+            let value = fold_constant_expression(hir, operand)?;
+            match operator {
+                UnaryOperator::Plus => value,
+                UnaryOperator::Negate => value.wrapping_neg(),
+                UnaryOperator::BitwiseNot => !value,
+                UnaryOperator::LogicalNot => u64::from(value == 0),
+                _ => {
+                    return Err(LoweringError {
+                        message: "operator is not supported in constant initializers".to_owned(),
+                        span: expression.span,
+                    });
+                }
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let lhs = fold_constant_expression(hir, left)?;
+            let rhs = fold_constant_expression(hir, right)?;
+            fold_constant_binary(*operator, left, lhs, right, rhs, expression.span)?
+        }
+        ExpressionKind::Cast {
+            expression: inner, ..
+        } => fold_constant_expression(hir, inner)?,
+        _ => {
+            return Err(LoweringError {
+                message: "expression is not supported in constant initializers".to_owned(),
+                span: expression.span,
+            });
+        }
+    };
+    Ok(truncate_to_type(raw, expression.ty.as_ref()))
+}
+
+fn fold_constant_binary(
+    operator: BinaryOperator,
+    left: &Expression,
+    lhs: u64,
+    right: &Expression,
+    rhs: u64,
+    span: SourceSpan,
+) -> Result<u64, LoweringError> {
+    let signed = expression_is_signed(left) || expression_is_signed(right);
+    let lhs_extended = sign_extended(lhs, left.ty.as_ref());
+    let rhs_extended = sign_extended(rhs, right.ty.as_ref());
+    Ok(match operator {
+        BinaryOperator::Add => lhs.wrapping_add(rhs),
+        BinaryOperator::Subtract => lhs.wrapping_sub(rhs),
+        BinaryOperator::Multiply => lhs.wrapping_mul(rhs),
+        BinaryOperator::Divide | BinaryOperator::Remainder => {
+            if rhs_extended == 0 {
+                return Err(LoweringError {
+                    message: "constant initializer divides by zero".to_owned(),
+                    span,
+                });
+            }
+            match (operator, signed) {
+                (BinaryOperator::Divide, true) => lhs_extended.wrapping_div(rhs_extended) as u64,
+                (BinaryOperator::Divide, false) => lhs / rhs,
+                (_, true) => lhs_extended.wrapping_rem(rhs_extended) as u64,
+                (_, false) => lhs % rhs,
+            }
+        }
+        BinaryOperator::ShiftLeft => lhs.wrapping_shl(rhs as u32 & 63),
+        BinaryOperator::ShiftRight => {
+            if expression_is_signed(left) {
+                (lhs_extended >> (rhs as u32 & 63)) as u64
+            } else {
+                lhs >> (rhs as u32 & 63)
+            }
+        }
+        BinaryOperator::BitwiseAnd => lhs & rhs,
+        BinaryOperator::BitwiseXor => lhs ^ rhs,
+        BinaryOperator::BitwiseOr => lhs | rhs,
+        BinaryOperator::Less => compare(
+            signed,
+            lhs_extended,
+            rhs_extended,
+            lhs,
+            rhs,
+            i64::lt,
+            u64::lt,
+        ),
+        BinaryOperator::LessEqual => compare(
+            signed,
+            lhs_extended,
+            rhs_extended,
+            lhs,
+            rhs,
+            i64::le,
+            u64::le,
+        ),
+        BinaryOperator::Greater => compare(
+            signed,
+            lhs_extended,
+            rhs_extended,
+            lhs,
+            rhs,
+            i64::gt,
+            u64::gt,
+        ),
+        BinaryOperator::GreaterEqual => compare(
+            signed,
+            lhs_extended,
+            rhs_extended,
+            lhs,
+            rhs,
+            i64::ge,
+            u64::ge,
+        ),
+        BinaryOperator::Equal => u64::from(lhs_extended == rhs_extended),
+        BinaryOperator::NotEqual => u64::from(lhs_extended != rhs_extended),
+        BinaryOperator::LogicalAnd => u64::from(lhs != 0 && rhs != 0),
+        BinaryOperator::LogicalOr => u64::from(lhs != 0 || rhs != 0),
+        BinaryOperator::Assign => {
+            return Err(LoweringError {
+                message: "assignment is not supported in constant initializers".to_owned(),
+                span,
+            });
+        }
+    })
+}
+
+fn compare(
+    signed: bool,
+    lhs_extended: i64,
+    rhs_extended: i64,
+    lhs: u64,
+    rhs: u64,
+    signed_compare: fn(&i64, &i64) -> bool,
+    unsigned_compare: fn(&u64, &u64) -> bool,
+) -> u64 {
+    if signed {
+        u64::from(signed_compare(&lhs_extended, &rhs_extended))
+    } else {
+        u64::from(unsigned_compare(&lhs, &rhs))
+    }
+}
+
+fn expression_is_signed(expression: &Expression) -> bool {
+    expression.ty.as_ref().is_some_and(element_is_signed)
+}
+
+fn element_is_signed(ty: &Type) -> bool {
+    ty.pointer_depth == 0 && matches!(ty.kind, TypeKind::Integer(integer) if integer.is_signed())
+}
+
+/// Interprets truncated bits as a mathematical value using the type's width
+/// and signedness; unknown types pass through unchanged.
+fn sign_extended(value: u64, ty: Option<&Type>) -> i64 {
+    let Some(ty) = ty else { return value as i64 };
+    let Some(bits) = ty.integer_width() else {
+        return value as i64;
+    };
+    if bits >= 64 {
+        return value as i64;
+    }
+    if element_is_signed(ty) {
+        let shift = 64 - u32::from(bits);
+        ((value << shift) as i64) >> shift
+    } else {
+        value as i64
+    }
+}
+
+fn truncate_to_type(value: u64, ty: Option<&Type>) -> u64 {
+    let Some(bits) = ty.and_then(Type::integer_width) else {
+        return value;
+    };
+    if bits >= 64 {
+        value
+    } else {
+        value & ((1u64 << bits) - 1)
+    }
+}
+
 fn verify_function(module: &Module, function: &Function, errors: &mut Vec<VerificationError>) {
     if function.blocks.is_empty() {
         if function.entry.is_some() {
@@ -2013,7 +2347,8 @@ mod tests {
     use nesc_frontend::{FrontendConfig, check};
 
     use super::{
-        AssemblyOutputTarget, AssemblyRegister, InstructionKind, Terminator, lower, verify,
+        AssemblyOutputTarget, AssemblyRegister, GlobalConstant, InstructionKind, Terminator, lower,
+        verify,
     };
 
     #[test]
@@ -2069,6 +2404,114 @@ mod tests {
         assert!(assembly.bank_effect);
         assert_eq!(assembly.calls, [super::FunctionId(0)]);
         assert_eq!(assembly.stack_bytes, 1);
+    }
+
+    #[test]
+    fn folds_scalar_const_globals_into_rodata_payloads() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("main.c");
+        fs::write(
+            &source,
+            r"
+                #define BASE 0x30
+                const u8 answer = 42u8;
+                const u16 word = 0x1234u16;
+                const u8 masked = (u8)(BASE + 0x0F);
+                u8 ram_global;
+                NES_MAIN int main(void) {
+                    ram_global = answer;
+                    return ram_global;
+                }
+            ",
+        )
+        .expect("source");
+        let checked = check(&FrontendConfig::new(source)).expect("frontend");
+        let hir = nesc_hir::lower(checked);
+        let mir = lower(&hir).expect("MIR lowering");
+        verify(&mir).expect("valid MIR");
+        assert_eq!(mir.global_data[0], Some(GlobalConstant { bytes: vec![42] }));
+        assert_eq!(
+            mir.global_data[1],
+            Some(GlobalConstant {
+                bytes: vec![0x34, 0x12]
+            })
+        );
+        assert_eq!(
+            mir.global_data[2],
+            Some(GlobalConstant { bytes: vec![0x3f] })
+        );
+        assert_eq!(mir.global_data[3], None);
+    }
+
+    #[test]
+    fn folds_const_array_globals_with_zero_fill_and_endianness() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("main.c");
+        fs::write(
+            &source,
+            r"
+                const u8 table[4] = {10u8, 20u8, 30u8};
+                const u16 words[2] = {0x1234u16, 0xabcdu16};
+                const u8 grid[2][3] = {{1u8, 2u8, 3u8}, {4u8, 5u8,},};
+                NES_MAIN int main(void) {
+                    return 0;
+                }
+            ",
+        )
+        .expect("source");
+        let checked = check(&FrontendConfig::new(source)).expect("frontend");
+        let hir = nesc_hir::lower(checked);
+        let mir = lower(&hir).expect("MIR lowering");
+        verify(&mir).expect("valid MIR");
+        assert_eq!(
+            mir.global_data[0],
+            Some(GlobalConstant {
+                bytes: vec![10, 20, 30, 0]
+            })
+        );
+        assert_eq!(
+            mir.global_data[1],
+            Some(GlobalConstant {
+                bytes: vec![0x34, 0x12, 0xcd, 0xab]
+            })
+        );
+        assert_eq!(
+            mir.global_data[2],
+            Some(GlobalConstant {
+                bytes: vec![1, 2, 3, 4, 5, 0]
+            })
+        );
+    }
+
+    #[test]
+    fn folds_negative_const_globals_as_two_complement_bytes() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("main.c");
+        fs::write(
+            &source,
+            r"
+                const i16 offset = -300i16;
+                const u8 inverted = (u8)~0x0Fu8;
+                NES_MAIN int main(void) {
+                    return 0;
+                }
+            ",
+        )
+        .expect("source");
+        let checked = check(&FrontendConfig::new(source)).expect("frontend");
+        let hir = nesc_hir::lower(checked);
+        let mir = lower(&hir).expect("MIR lowering");
+        verify(&mir).expect("valid MIR");
+        assert_eq!(
+            mir.global_data[0],
+            Some(GlobalConstant {
+                bytes: vec![0xd4, 0xfe]
+            })
+        );
+        assert_eq!(
+            mir.global_data[1],
+            Some(GlobalConstant { bytes: vec![0xf0] })
+        );
     }
 
     #[test]

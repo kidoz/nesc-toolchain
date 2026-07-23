@@ -1674,6 +1674,94 @@ NES_TEST("failure values") {
     }
 
     #[test]
+    fn builds_and_executes_prg_rom_const_data_reads() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("rom-data");
+        create_project("rom-data", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"#include <nes.h>
+
+const u8 base_color = 0x20u8;
+const u8 shades[4] = {1u8, 2u8, 0x0Au8, 4u8};
+
+NES_MAIN int main(void) {
+    u8 color = (u8)(base_color + shades[2u8]);
+    nes_wait_vblank();
+    nes_set_background_color(color);
+    while (true) { nes_wait_frame(); }
+}
+"#,
+        )
+        .expect("ROM data source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let artifacts = build_project(&project, &CompilerConfig::bundled_sdk()).expect("build");
+        assert!(artifacts.map.contains(".rodata"), "{}", artifacts.map);
+        assert!(artifacts.assembly.contains("__nesc_rodata_"));
+        let boot = nesc_emulator::verify_compiler_boot(
+            &artifacts.rom,
+            &artifacts.symbol_addresses,
+            0x2a,
+            200_000,
+        )
+        .expect("ROM data boot oracle");
+        assert_eq!(boot.background_color, 0x2a);
+    }
+
+    #[test]
+    fn executes_tests_reading_prg_rom_const_tables() {
+        let temporary = tempdir().expect("temporary directory");
+        let project_path = temporary.path().join("rom-data-tests");
+        create_project("rom-data-tests", &project_path).expect("project");
+        fs::write(
+            project_path.join("src/main.c"),
+            r#"const u8 answer = 42u8;
+const u8 table[3] = {10u8, 20u8, 30u8};
+const u16 word = 0x1234u16;
+
+NES_TEST("rom scalar") {
+    NES_ASSERT_EQ(answer, 42u8);
+}
+
+NES_TEST("rom array") {
+    NES_ASSERT_EQ(table[1u8], 20u8);
+    NES_ASSERT_EQ(word, 0x1234u16);
+}
+
+NES_TEST("rom table sum") {
+    u8 total = 0u8;
+    u8 i;
+    for (i = 0u8; i < 3u8; i++) {
+        total = (u8)(total + table[i]);
+    }
+    NES_ASSERT_EQ(total, 60u8);
+}
+"#,
+        )
+        .expect("ROM data test source");
+        let project = Project::load(project_path.join("NesC.toml")).expect("manifest");
+        let tests = build_tests(&project, &CompilerConfig::bundled_sdk()).expect("test builds");
+        assert_eq!(tests.len(), 3);
+        for test in &tests {
+            let run = nesc_emulator::run_test_rom(
+                &test.artifacts.rom,
+                &test.artifacts.symbol_addresses,
+                nesc_emulator::RunLimits {
+                    instruction_limit: 100_000,
+                    cycle_limit: 1_000_000,
+                },
+            )
+            .expect("test execution");
+            assert_eq!(
+                run.outcome,
+                nesc_emulator::TestOutcome::Passed,
+                "test `{}` failed",
+                test.definition.name
+            );
+        }
+    }
+
+    #[test]
     fn stages_sprites_in_shadow_oam_and_dmas_them_into_sprite_memory() {
         let temporary = tempdir().expect("temporary directory");
         let project_path = temporary.path().join("sprite-dma");

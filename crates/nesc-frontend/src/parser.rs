@@ -99,7 +99,7 @@ impl Parser<'_> {
 
         self.array_suffixes(&mut ty)?;
         let initializer = if self.consume(&TokenKind::Equal).is_some() {
-            Some(self.expression()?)
+            Some(self.initializer()?)
         } else {
             None
         };
@@ -901,7 +901,7 @@ impl Parser<'_> {
         let (name, _) = self.declarator(&mut ty, true)?;
         self.array_suffixes(&mut ty)?;
         let initializer = if self.consume(&TokenKind::Equal).is_some() {
-            Some(self.expression()?)
+            Some(self.initializer()?)
         } else {
             None
         };
@@ -1239,6 +1239,38 @@ impl Parser<'_> {
             }
         }
         Some(expression)
+    }
+
+    /// Parses a declaration initializer: a brace-enclosed aggregate list with
+    /// optional trailing comma, or an ordinary expression.
+    fn initializer(&mut self) -> Option<Expression> {
+        if !self.at(&TokenKind::LeftBrace) {
+            return self.expression();
+        }
+        let start = self.advance().span;
+        let mut elements = Vec::new();
+        if !self.at(&TokenKind::RightBrace) {
+            loop {
+                elements.push(self.initializer()?);
+                if self.consume(&TokenKind::Comma).is_none() {
+                    break;
+                }
+                if self.at(&TokenKind::RightBrace) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(
+            &TokenKind::RightBrace,
+            "E1202",
+            "expected `}` after initializer list",
+        )?;
+        Some(Expression {
+            id: self.node_id(),
+            kind: ExpressionKind::Array(elements),
+            ty: None,
+            span: start.through(end.span),
+        })
     }
 
     fn primary(&mut self) -> Option<Expression> {

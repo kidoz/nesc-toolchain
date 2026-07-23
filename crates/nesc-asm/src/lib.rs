@@ -581,7 +581,9 @@ pub fn assemble_module(
                         })?;
                         match kind {
                             RelocationKind::Absolute16 => output.extend_from_slice(&[0, 0]),
-                            RelocationKind::Relative8 => output.push(0),
+                            RelocationKind::Relative8
+                            | RelocationKind::AbsoluteLow8
+                            | RelocationKind::AbsoluteHigh8 => output.push(0),
                         }
                         object.add_relocation(Relocation {
                             section,

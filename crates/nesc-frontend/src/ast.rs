@@ -475,6 +475,8 @@ pub enum ExpressionKind {
     String(String),
     /// Name reference.
     Name(String),
+    /// Brace-enclosed aggregate initializer list.
+    Array(Vec<Expression>),
     /// Prefix operation.
     Unary {
         /// Operation.

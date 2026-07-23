@@ -167,6 +167,11 @@ pub(crate) fn allocate(
         .collect::<HashMap<_, _>>();
     let mut requests = Vec::new();
     for (index, ty) in module.globals.iter().enumerate() {
+        // Globals with folded constant payloads live in PRG-ROM and never
+        // receive RAM storage.
+        if module.global_data.get(index).is_some_and(Option::is_some) {
+            continue;
+        }
         requests.push(Request {
             key: RequestKey::Global(GlobalId(index as u32)),
             name: format!("global.{index}"),
@@ -825,6 +830,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "weighted".to_owned(),
@@ -923,6 +929,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "reuse".to_owned(),
@@ -997,6 +1004,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "locals".to_owned(),
@@ -1095,6 +1103,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "pinned".to_owned(),
@@ -1171,6 +1180,7 @@ mod tests {
         }
         let module = Module {
             globals: vec![ty.clone()],
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "aggregate".to_owned(),
@@ -1264,6 +1274,7 @@ mod tests {
         };
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![function(0, "main"), function(1, "nmi")],
         };
         let allocation = allocate(
@@ -1288,6 +1299,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: Vec::new(),
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "overlap".to_owned(),
@@ -1350,6 +1362,7 @@ mod tests {
         let span = SourceSpan::new(SourceId::new(0), 0, 1);
         let module = Module {
             globals: vec![ty.clone(), ty.clone()],
+            global_data: Vec::new(),
             functions: vec![Function {
                 id: FunctionId(0),
                 name: "weighted".to_owned(),
@@ -1430,6 +1443,7 @@ mod tests {
     fn respects_available_and_reserved_ranges() {
         let module = Module {
             functions: Vec::new(),
+            global_data: Vec::new(),
             globals: vec![
                 Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U16)),
                 Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
@@ -1451,6 +1465,7 @@ mod tests {
         array.array_lengths.push(32);
         let module = Module {
             functions: Vec::new(),
+            global_data: Vec::new(),
             globals: vec![
                 array,
                 Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
@@ -1476,6 +1491,7 @@ mod tests {
         array.array_lengths.push(0x0400);
         let module = Module {
             functions: Vec::new(),
+            global_data: Vec::new(),
             globals: vec![
                 array,
                 Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
@@ -1499,6 +1515,7 @@ mod tests {
         // Force spilling into internal RAM by making zero page unavailable.
         let module = Module {
             functions: Vec::new(),
+            global_data: Vec::new(),
             globals: vec![
                 Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U8)),
                 Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U16)),
@@ -1534,6 +1551,7 @@ mod tests {
             .push(u32::from(RUNTIME_SCRATCH_START - SHADOW_OAM_END - 1));
         let module = Module {
             functions: Vec::new(),
+            global_data: Vec::new(),
             globals: vec![
                 filler,
                 Type::scalar(TypeKind::Integer(nesc_mir::IntegerType::U16)),

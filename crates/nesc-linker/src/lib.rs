@@ -261,6 +261,21 @@ fn link_fixed_prg(objects: &[Object], config: LinkConfig) -> Result<LinkedImage,
                         symbol.name
                     ))),
                 },
+                RelocationKind::AbsoluteLow8 | RelocationKind::AbsoluteHigh8 => {
+                    match u16::try_from(target) {
+                        Ok(target) => {
+                            prg[patch] = if relocation.kind == RelocationKind::AbsoluteLow8 {
+                                target as u8
+                            } else {
+                                (target >> 8) as u8
+                            };
+                        }
+                        Err(_) => errors.push(LinkError(format!(
+                            "absolute relocation to `{}` exceeds 16 bits",
+                            symbol.name
+                        ))),
+                    }
+                }
                 RelocationKind::Relative8 => {
                     let operand_address = i32::from(base) + patch as i32;
                     let displacement = target - (operand_address + 1);
@@ -539,6 +554,21 @@ fn link_uxrom(objects: &[Object], config: LinkConfig) -> Result<LinkedImage, Vec
                         symbol.name
                     ))),
                 },
+                RelocationKind::AbsoluteLow8 | RelocationKind::AbsoluteHigh8 => {
+                    match u16::try_from(target) {
+                        Ok(target) => {
+                            prg[patch] = if relocation.kind == RelocationKind::AbsoluteLow8 {
+                                target as u8
+                            } else {
+                                (target >> 8) as u8
+                            };
+                        }
+                        Err(_) => errors.push(LinkError(format!(
+                            "absolute relocation to `{}` exceeds 16 bits",
+                            symbol.name
+                        ))),
+                    }
+                }
                 RelocationKind::Relative8 => {
                     if source.bank != target_bank {
                         errors.push(LinkError(format!(
