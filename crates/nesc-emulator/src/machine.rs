@@ -2588,9 +2588,12 @@ impl Machine {
     }
 
     fn sprite_row(&self, y: u8, target: u16) -> Option<u8> {
-        let height = if self.ppu_ctrl & 0x20 == 0 { 8 } else { 16 };
-        let row = (target as u8).wrapping_sub(y.wrapping_add(1));
-        (row < height).then_some(row)
+        let height: u16 = if self.ppu_ctrl & 0x20 == 0 { 8 } else { 16 };
+        // OAM Y is the top scanline minus one, and the range test must not
+        // wrap: a sprite parked at $EF..$FF sits past the visible frame
+        // instead of bleeding into the top scanlines.
+        let row = target.checked_sub(u16::from(y) + 1)?;
+        (row < height).then_some(row as u8)
     }
 
     fn sprite_target_scanline(&self) -> u16 {
@@ -3553,6 +3556,21 @@ mod hardware_tests {
         );
     }
 
+    fn clock_to_scanline_dot(machine: &mut Machine, target_scanline: u16, target_dot: u16) {
+        machine.ppu_scanline = machine.pre_render_scanline();
+        machine.ppu_dot = 0;
+        for _ in 0..1_400 {
+            if machine.ppu_scanline == target_scanline && machine.ppu_dot == target_dot {
+                return;
+            }
+            machine.clock_ppu_dot();
+        }
+        panic!(
+            "PPU did not reach scanline {target_scanline} dot {target_dot}; stopped at {:?}",
+            machine.ppu_position()
+        );
+    }
+
     #[test]
     fn implements_scroll_and_address_write_latches() {
         let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
@@ -3803,13 +3821,15 @@ mod hardware_tests {
     #[test]
     fn evaluates_fetches_and_activates_sprites_at_exact_windows() {
         let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        // Sprites at OAM Y = 0 are in range while scanline 0 evaluates the
+        // sprite set for scanline 1.
         for index in 0..9 {
-            machine.oam[index * 4] = 0xff;
+            machine.oam[index * 4] = 0;
             machine.oam[index * 4 + 1] = 2;
             machine.oam[index * 4 + 3] = (index * 8) as u8;
         }
         machine.ppu_mask = 0x10;
-        machine.ppu_scanline = machine.pre_render_scanline();
+        machine.ppu_scanline = 0;
         machine.ppu_dot = 0;
 
         while machine.ppu_dot < 64 {
@@ -3821,10 +3841,12 @@ mod hardware_tests {
         while machine.ppu_dot < 66 {
             machine.clock_ppu_dot();
         }
-        assert_eq!(machine.ppu_oam_bus, 0xff);
+        // Evaluation is now reading sprite 0's Y byte (0), and $2004 reads
+        // mirror the evaluation bus.
+        assert_eq!(machine.ppu_oam_bus, 0);
         assert_eq!(
             machine.read_ppu_register(0x2004).expect("evaluation bus"),
-            0xff
+            0
         );
 
         while machine.ppu_dot < 130 {
@@ -3841,7 +3863,7 @@ mod hardware_tests {
         assert_eq!(machine.next_scanline_sprites[0].pattern_low, 0xff);
         assert_eq!(machine.next_scanline_sprites[0].x, 0);
 
-        while !(machine.ppu_scanline == 0 && machine.ppu_dot == 0) {
+        while !(machine.ppu_scanline == 1 && machine.ppu_dot == 0) {
             machine.clock_ppu_dot();
         }
         assert_eq!(machine.scanline_sprite_count, 8);
@@ -3851,14 +3873,18 @@ mod hardware_tests {
     #[test]
     fn reproduces_the_sprite_overflow_diagonal_scan_bug() {
         let mut machine = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
+        // Eight in-range sprites (Y = 0 while scanline 0 evaluates for
+        // scanline 1) fill secondary OAM; sprite 8 is out of range, so the
+        // buggy diagonal scan misreads sprite 9's tile byte as an in-range Y
+        // coordinate.
         for index in 0..8 {
-            machine.oam[index * 4] = 0xff;
+            machine.oam[index * 4] = 0;
         }
-        machine.oam[8 * 4] = 0;
-        machine.oam[9 * 4] = 0;
-        machine.oam[9 * 4 + 1] = 0xff;
+        machine.oam[8 * 4] = 0xff;
+        machine.oam[9 * 4] = 0xff;
+        machine.oam[9 * 4 + 1] = 0;
         machine.ppu_mask = 0x08;
-        machine.ppu_scanline = machine.pre_render_scanline();
+        machine.ppu_scanline = 0;
         machine.ppu_dot = 0;
 
         while machine.ppu_dot < 132 {
@@ -3910,7 +3936,7 @@ mod hardware_tests {
         machine.write_ppu(0x2000, 1).expect("background tile");
         machine.write_ppu(0x3f01, 0x11).expect("background palette");
         machine.write_ppu(0x3f11, 0x2a).expect("sprite palette");
-        machine.oam[0] = 0xff;
+        machine.oam[0] = 0;
         machine.oam[1] = 2;
         machine.oam[2] = 0;
         machine.oam[3] = 0;
@@ -3918,19 +3944,19 @@ mod hardware_tests {
             .write_ppu_register(0x2001, 0x1e)
             .expect("background and sprite rendering");
 
-        clock_first_rendered_scanline(&mut machine, 3);
+        clock_to_scanline_dot(&mut machine, 1, 3);
 
-        assert_eq!(&machine.framebuffer()[..3], &[0x2a; 3]);
+        assert_eq!(&machine.framebuffer()[256..259], &[0x2a; 3]);
         assert_ne!(machine.ppu_status & 0x40, 0, "sprite zero hit");
 
         let mut overflow = machine_with_chr(0, Mirroring::Horizontal, solid_tiles());
         for index in 0..9 {
-            overflow.oam[index * 4] = 0xff;
+            overflow.oam[index * 4] = 0;
             overflow.oam[index * 4 + 1] = 2;
             overflow.oam[index * 4 + 3] = (index * 8) as u8;
         }
         overflow.ppu_mask = 0x14;
-        clock_first_rendered_scanline(&mut overflow, 1);
+        clock_to_scanline_dot(&mut overflow, 1, 1);
         assert_ne!(overflow.ppu_status & 0x20, 0, "sprite overflow");
     }
 
